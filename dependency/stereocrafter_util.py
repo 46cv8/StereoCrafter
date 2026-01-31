@@ -14,6 +14,8 @@ import subprocess
 import cv2
 import gc
 import time
+import re
+
 
 VERSION = "26-01-20.3"
 
@@ -1248,7 +1250,6 @@ def encode_frames_to_mp4(
     logger.info(f"Done processing {os.path.basename(final_output_mp4_path)}")
     return True
 
-
 def get_video_stream_info(video_path: str) -> Optional[dict]:
     """
     Extracts comprehensive video stream metadata using ffprobe.
@@ -1303,7 +1304,14 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
             encoding="utf-8",
             timeout=500,
         )
-        data = json.loads(result.stdout)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            # logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
+            # Hackish fix for ffprobe version 4.4.2-0ubuntu0.22.04.1 returning bad side_data_list with missing "," that causes this error.
+            # "Expecting ',' delimiter: line 13 column 40 (char 229)"
+            repaired = re.sub(r'("type"\s*:\s*"[^"]+")(\s+)("side_data_list"\s*:)', r'\1,\2\3', result.stdout)
+            data = json.loads(repaired)
 
         stream_info = {}
         if "streams" in data and len(data["streams"]) > 0:
@@ -1367,7 +1375,7 @@ def get_video_stream_info(video_path: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse ffprobe output for {video_path}: {e}")
-        logger.debug(f"Raw ffprobe stdout: {result.stdout}")
+        logger.error(f"Raw ffprobe stdout: {result.stdout}")
         return None
     except Exception as e:
         logger.error(
