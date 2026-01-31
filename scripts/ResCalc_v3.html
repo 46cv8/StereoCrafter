@@ -136,7 +136,7 @@
         </div>
 
         <div class="results-section">
-            <label for="resultsOutput"><strong>Calculated Resolutions (6GB to 32GB VRAM):</strong></label>
+            <label for="resultsOutput"><strong>Calculated Resolutions (6GB to 512GB VRAM):</strong></label>
             <textarea id="resultsOutput" readonly></textarea>
         </div>
     </div>
@@ -239,10 +239,10 @@
             uniqueResolutions.sort((a, b) => a.vram - b.vram);
             
             // --- FIX: Filter the results based on VRAM range ---
-            const filteredResolutions = uniqueResolutions.filter(res => res.vram >= 6 && res.vram <= 32);
+            const filteredResolutions = uniqueResolutions.filter(res => res.vram >= 6 && res.vram <= 512);
 
             if (filteredResolutions.length === 0) {
-                resultsOutput.value = "No resolutions found within the 6GB to 32GB VRAM range with the current settings.";
+                resultsOutput.value = "No resolutions found within the 6GB to 512GB VRAM range with the current settings.";
             } else {
                 resultsOutput.value = filteredResolutions.map(res => {
                     return `${res.width}x${res.height} | Est. VRAM: ${res.vram.toFixed(2)} GB | Tile Size: ${res.tileW}x${res.height} | Discrepancy: ${(res.discrepancy * 100).toFixed(2)}%`;
