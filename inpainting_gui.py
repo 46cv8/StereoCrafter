@@ -852,6 +852,18 @@ class InpaintingGUI(ThemedTk):
                 os.remove(chunk_path)
             except OSError:
                 logger.debug(f"Failed to remove chunk checkpoint: {chunk_path}")
+
+    def _cleanup_all_checkpoints(self, base_video_name: str):
+        """Removes all resume checkpoints for a video after successful completion."""
+        self._cleanup_chunk_checkpoints(base_video_name)
+
+        prefinalize_path = self._get_prefinalize_checkpoint_path(base_video_name)
+        for path in (prefinalize_path, f"{prefinalize_path}.tmp"):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    logger.debug(f"Failed to remove pre-finalize checkpoint: {path}")
     
     def _finalize_output_frames(
         self,
@@ -2297,6 +2309,7 @@ class InpaintingGUI(ThemedTk):
             shutil.rmtree(temp_png_dir, ignore_errors=True)
             return False, None
 
+        self._cleanup_all_checkpoints(base_video_name)
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
         return True, hires_video_path
 
