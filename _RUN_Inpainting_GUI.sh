@@ -80,5 +80,17 @@ PY
 echo "================================================="
 
 # ---- 5) Run the script ----
-exec "$PYTHON" inpainting_gui.py
+set +e
+"$PYTHON" inpainting_gui.py
+EXIT_CODE=$?
+set -e
 
+if [[ "$EXIT_CODE" -eq 137 ]]; then
+  echo "ERROR: inpainting_gui.py exited with code 137 (SIGKILL)."
+  echo "Likely cause: host RAM exhaustion (OOM killer)."
+  echo "Check your output folder for:"
+  echo "  - inpainting_runtime.log"
+  echo "  - inpaint_runtime_status_<video>.json"
+fi
+
+exit "$EXIT_CODE"

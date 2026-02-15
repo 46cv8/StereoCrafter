@@ -3,6 +3,7 @@ import glob
 import json
 import shutil
 import threading
+import gc
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Toplevel, Label
 from ttkthemes import ThemedTk
@@ -18,6 +19,11 @@ import time
 import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from dependency.stereocrafter_util import (
     Tooltip, logger, get_video_stream_info, draw_progress_bar,
@@ -83,6 +89,9 @@ class InpaintingGUI(ThemedTk):
         self.video_bias_var = tk.StringVar(value="N/A")
 
         self.mask_param_widgets = [] 
+        self._file_log_handler: Optional[logging.FileHandler] = None
+        self._file_log_path: Optional[str] = None
+        self._runtime_status_path: Optional[str] = None
 
         self.create_widgets()
         self.style = ttk.Style()
@@ -326,7 +335,7 @@ class InpaintingGUI(ThemedTk):
             return inpainted_frames
 
         try:
-            # Keep everything on CPU and blend in place frame-by-frame to avoid a full-size temporary tensor.
+            # Keep everything on CPU and blend in place, frame by frame, to avoid full-size temporary tensors.
             inpainted_frames_cpu = inpainted_frames.cpu()
             original_warped_frames_cpu = original_warped_frames.cpu()
             mask_cpu = mask.cpu()
@@ -350,15 +359,13 @@ class InpaintingGUI(ThemedTk):
                 frame_mask_inv = 1.0 - frame_mask
                 inpainted_frames_cpu[t].mul_(frame_mask)
                 inpainted_frames_cpu[t].add_(original_warped_frames_cpu[t] * frame_mask_inv)
-            
-            logger.debug("Applied post-inpainting blending.")
 
-            # --- MODIFIED: TEMPORARY DEBUG CODE START (now conditional) ---
-            if self.debug_mode_var.get():
+            logger.debug("Applied post-inpainting blending (in-place).")
+
+            if debug_count > 0:
                 debug_output_dir = os.path.join(self.output_folder_var.get(), "debug_blend")
                 os.makedirs(debug_output_dir, exist_ok=True)
-                # MODIFIED: Use base_video_name directly
-                video_basename_for_debug_blend = os.path.splitext(base_video_name)[0] 
+                video_basename_for_debug_blend = os.path.splitext(base_video_name)[0]
 
                 for t in range(debug_count):
                     original_warped_img = (debug_original_samples[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
@@ -371,7 +378,6 @@ class InpaintingGUI(ThemedTk):
                     cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_mask.png"), mask_img)
                     cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_blended.png"), cv2.cvtColor(blended_img, cv2.COLOR_RGB2BGR))
                 logger.debug(f"Saved debug blend frames to {debug_output_dir}")
-            # --- END MODIFIED TEMPORARY DEBUG CODE ---
 
             return inpainted_frames_cpu
         except Exception as e:
@@ -511,7 +517,253 @@ class InpaintingGUI(ThemedTk):
                  logging.root.setLevel(logging.INFO) # Reset to a less verbose default
 
         set_util_logger_level(level) # Call the function from stereocrafter_util.py
+        self._ensure_file_logging(level)
         logger.info(f"Logging level set to {logging.getLevelName(level)}.")
+
+    def _ensure_file_logging(self, level: int):
+        """Ensures all runtime logs are written to a persistent file in the output folder."""
+        output_dir = self.output_folder_var.get().strip() or "."
+        os.makedirs(output_dir, exist_ok=True)
+        target_log_path = os.path.join(output_dir, "inpainting_runtime.log")
+
+        if self._file_log_handler and self._file_log_path != target_log_path:
+            logger.removeHandler(self._file_log_handler)
+            self._file_log_handler.close()
+            self._file_log_handler = None
+
+        if self._file_log_handler is None:
+            self._file_log_handler = logging.FileHandler(target_log_path, mode="a", encoding="utf-8")
+            self._file_log_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(message)s", datefmt="%H:%M:%S")
+            )
+            logger.addHandler(self._file_log_handler)
+            self._file_log_path = target_log_path
+            logger.info(f"Runtime log file: {target_log_path}")
+
+        self._file_log_handler.setLevel(level)
+
+    def _collect_resource_snapshot(self) -> dict:
+        """Collects process/system memory details for debugging abrupt OOM kills."""
+        snapshot = {"pid": os.getpid(), "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+        if psutil is not None:
+            proc = psutil.Process(os.getpid())
+            mem = proc.memory_info()
+            vmem = psutil.virtual_memory()
+            snapshot["host_memory"] = {
+                "rss_gib": round(mem.rss / (1024 ** 3), 3),
+                "vms_gib": round(mem.vms / (1024 ** 3), 3),
+                "available_gib": round(vmem.available / (1024 ** 3), 3),
+                "total_gib": round(vmem.total / (1024 ** 3), 3),
+            }
+        else:
+            host_memory = {}
+            try:
+                with open("/proc/self/status", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            host_memory["rss_gib"] = round((int(line.split()[1]) * 1024) / (1024 ** 3), 3)
+                        elif line.startswith("VmHWM:"):
+                            host_memory["peak_rss_gib"] = round((int(line.split()[1]) * 1024) / (1024 ** 3), 3)
+            except Exception:
+                pass
+
+            try:
+                with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            host_memory["total_gib"] = round((int(line.split()[1]) * 1024) / (1024 ** 3), 3)
+                        elif line.startswith("MemAvailable:"):
+                            host_memory["available_gib"] = round((int(line.split()[1]) * 1024) / (1024 ** 3), 3)
+            except Exception:
+                pass
+
+            if host_memory:
+                snapshot["host_memory"] = host_memory
+
+        if torch.cuda.is_available():
+            cuda_devices = []
+            for device_idx in range(torch.cuda.device_count()):
+                cuda_devices.append(
+                    {
+                        "device": device_idx,
+                        "allocated_gib": round(torch.cuda.memory_allocated(device_idx) / (1024 ** 3), 3),
+                        "reserved_gib": round(torch.cuda.memory_reserved(device_idx) / (1024 ** 3), 3),
+                        "max_allocated_gib": round(torch.cuda.max_memory_allocated(device_idx) / (1024 ** 3), 3),
+                    }
+                )
+            snapshot["cuda_memory"] = cuda_devices
+
+        return snapshot
+
+    def _write_runtime_status(self, base_video_name: str, stage: str, extra: Optional[dict] = None):
+        """
+        Writes an atomic status snapshot so we can inspect the last successful stage
+        even if the process is terminated with SIGKILL.
+        """
+        output_dir = self.output_folder_var.get().strip() or "."
+        os.makedirs(output_dir, exist_ok=True)
+        video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
+        self._runtime_status_path = os.path.join(output_dir, f"inpaint_runtime_status_{video_stem}.json")
+        payload = {
+            "video": base_video_name,
+            "stage": stage,
+            "extra": extra or {},
+            "resources": self._collect_resource_snapshot(),
+        }
+
+        tmp_path = f"{self._runtime_status_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._runtime_status_path)
+        except Exception as e:
+            logger.debug(f"Failed to write runtime status file {self._runtime_status_path}: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _log_resource_snapshot(
+        self,
+        stage: str,
+        base_video_name: str,
+        extra: Optional[dict] = None,
+        level: int = logging.INFO,
+    ):
+        """Logs a concise resource summary and also persists it to a JSON status file."""
+        snapshot = self._collect_resource_snapshot()
+        host = snapshot.get("host_memory", {})
+        host_summary = (
+            f"RSS={host.get('rss_gib', 'n/a')} GiB, "
+            f"Avail={host.get('available_gib', 'n/a')} GiB, "
+            f"Total={host.get('total_gib', 'n/a')} GiB"
+        )
+        logger.log(level, f"[DIAG] {base_video_name} | {stage} | {host_summary}")
+        if snapshot.get("cuda_memory"):
+            for dev in snapshot["cuda_memory"]:
+                logger.log(
+                    level,
+                    f"[DIAG] CUDA:{dev['device']} alloc={dev['allocated_gib']} GiB "
+                    f"reserved={dev['reserved_gib']} GiB max_alloc={dev['max_allocated_gib']} GiB",
+                )
+        self._write_runtime_status(base_video_name, stage, extra=extra)
+
+    def _get_prefinalize_checkpoint_path(self, base_video_name: str) -> str:
+        """Returns the checkpoint path used to resume directly before finalization."""
+        output_dir = self.output_folder_var.get().strip() or "."
+        resume_dir = os.path.join(output_dir, "_inpaint_resume")
+        os.makedirs(resume_dir, exist_ok=True)
+        video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
+        return os.path.join(resume_dir, f"{video_stem}.prefinalize.pt")
+
+    def _build_prefinalize_signature(
+        self,
+        input_video_path: str,
+        hires_video_path: Optional[str],
+        is_dual_input: bool,
+        frames_chunk: int,
+        overlap: int,
+        tile_num: int,
+        num_inference_steps: int,
+        original_input_blend_strength: float,
+        process_length: int,
+    ) -> dict:
+        """Builds a deterministic signature so stale resume files are ignored."""
+        def _identity(path: Optional[str]) -> dict:
+            if not path:
+                return {"path": None, "size": None, "mtime_ns": None}
+            abs_path = os.path.abspath(path)
+            if not os.path.exists(abs_path):
+                return {"path": abs_path, "size": None, "mtime_ns": None}
+            try:
+                stat = os.stat(abs_path)
+                return {"path": abs_path, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+            except OSError:
+                return {"path": abs_path, "size": None, "mtime_ns": None}
+
+        return {
+            "version": 1,
+            "input": _identity(input_video_path),
+            "hires_input": _identity(hires_video_path),
+            "is_dual_input": bool(is_dual_input),
+            "frames_chunk": int(frames_chunk),
+            "frame_overlap": int(overlap),
+            "tile_num": int(tile_num),
+            "num_inference_steps": int(num_inference_steps),
+            "original_input_blend_strength": float(original_input_blend_strength),
+            "process_length": int(process_length),
+            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
+            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
+            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
+            "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
+        }
+
+    def _load_prefinalize_checkpoint(self, checkpoint_path: str, expected_signature: dict) -> Optional[dict]:
+        """Attempts to load a pre-finalize checkpoint. Returns None if unavailable or stale."""
+        if not os.path.exists(checkpoint_path):
+            return None
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as e:
+            logger.warning(f"Failed to load resume checkpoint {checkpoint_path}: {e}")
+            return None
+
+        stored_signature = checkpoint.get("signature")
+        if stored_signature != expected_signature:
+            logger.info(f"Resume checkpoint ignored (signature mismatch): {checkpoint_path}")
+            return None
+
+        required_keys = (
+            "frames_output_final",
+            "frames_mask_processed",
+            "frames_warped_original",
+            "fps",
+            "video_stream_info",
+        )
+        for key in required_keys:
+            if key not in checkpoint:
+                logger.warning(f"Resume checkpoint missing key '{key}', ignoring: {checkpoint_path}")
+                return None
+        return checkpoint
+
+    def _save_prefinalize_checkpoint(
+        self,
+        checkpoint_path: str,
+        signature: dict,
+        frames_output_final: torch.Tensor,
+        frames_mask_processed: torch.Tensor,
+        frames_warped_original: torch.Tensor,
+        frames_left_original: Optional[torch.Tensor],
+        fps: float,
+        video_stream_info: Optional[dict],
+    ):
+        """Saves tensors needed to resume from pre-finalize stage."""
+        payload = {
+            "signature": signature,
+            "frames_output_final": frames_output_final.detach().cpu(),
+            "frames_mask_processed": frames_mask_processed.detach().cpu(),
+            "frames_warped_original": frames_warped_original.detach().cpu(),
+            "frames_left_original": frames_left_original.detach().cpu() if frames_left_original is not None else None,
+            "fps": float(fps),
+            "video_stream_info": video_stream_info,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp_path = f"{checkpoint_path}.tmp"
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, checkpoint_path)
+            logger.info(f"Saved resume checkpoint: {checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save resume checkpoint {checkpoint_path}: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
     
     def _finalize_output_frames(
         self,
@@ -538,100 +790,191 @@ class InpaintingGUI(ThemedTk):
             hires_video_path = hires_data["hires_video_path"]
 
             logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
-
-            hires_reader = VideoReader(hires_video_path, ctx=cpu(0))
-            chunk_size = max(1, int(self.frames_chunk_var.get()))
-
-            lowres_inpainted = frames_output_final
-            lowres_mask = frames_mask_processed
-
-            frames_output_hires = torch.empty(
-                (num_frames_original, lowres_inpainted.shape[1], hires_H, hires_W),
-                dtype=lowres_inpainted.dtype,
-                device=lowres_inpainted.device,
+            self._log_resource_snapshot(
+                stage="hires_blend_start",
+                base_video_name=base_video_name,
+                extra={"resolution": f"{hires_W}x{hires_H}", "frames": num_frames_original},
+                level=logging.INFO,
             )
-            frames_mask_hires = torch.empty(
-                (num_frames_original, lowres_mask.shape[1], hires_H, hires_W),
-                dtype=lowres_mask.dtype,
-                device=lowres_mask.device,
+            per_frame_pixels = hires_H * hires_W
+            bytes_per_float32 = 4
+            estimated_channels = (
+                frames_output_final.shape[1]
+                + frames_mask_processed.shape[1]
+                + frames_warpped_original_unpadded_normalized.shape[1]
+                + (frames_left_original_cropped.shape[1] if (not is_dual_input and frames_left_original_cropped is not None) else 0)
             )
-            frames_warped_hires = torch.empty(
-                (
-                    num_frames_original,
-                    frames_warpped_original_unpadded_normalized.shape[1],
-                    hires_H,
-                    hires_W,
-                ),
-                dtype=frames_warpped_original_unpadded_normalized.dtype,
-                device=frames_warpped_original_unpadded_normalized.device,
+            estimated_working_set_gib = (
+                num_frames_original * per_frame_pixels * estimated_channels * bytes_per_float32
+            ) / (1024 ** 3)
+            logger.info(
+                f"Hi-Res preflight estimate for {base_video_name}: "
+                f"~{estimated_working_set_gib:.2f} GiB float32 working set before temporary buffers."
             )
-            frames_left_hires = None
-            if not is_dual_input:
-                if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
-                    logger.error(f"Hi-Res blending needs left-eye frames for non-dual input {base_video_name}, but none were found.")
+
+            hires_reader = None
+            try:
+                hires_reader = VideoReader(hires_video_path, ctx=cpu(0))
+                chunk_size = max(1, int(self.frames_chunk_var.get()))
+                total_chunks = (num_frames_original + chunk_size - 1) // chunk_size
+
+                lowres_inpainted = frames_output_final
+                lowres_mask = frames_mask_processed
+
+                frames_output_hires = torch.empty(
+                    (num_frames_original, lowres_inpainted.shape[1], hires_H, hires_W),
+                    dtype=lowres_inpainted.dtype,
+                    device=lowres_inpainted.device,
+                )
+                frames_mask_hires = torch.empty(
+                    (num_frames_original, lowres_mask.shape[1], hires_H, hires_W),
+                    dtype=lowres_mask.dtype,
+                    device=lowres_mask.device,
+                )
+                frames_warped_hires = torch.empty(
+                    (
+                        num_frames_original,
+                        frames_warpped_original_unpadded_normalized.shape[1],
+                        hires_H,
+                        hires_W,
+                    ),
+                    dtype=frames_warpped_original_unpadded_normalized.dtype,
+                    device=frames_warpped_original_unpadded_normalized.device,
+                )
+                frames_left_hires = None
+                if not is_dual_input:
+                    if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
+                        logger.error(
+                            f"Hi-Res blending needs left-eye frames for non-dual input {base_video_name}, but none were found."
+                        )
+                        return None
+                    frames_left_hires = torch.empty(
+                        (num_frames_original, frames_left_original_cropped.shape[1], hires_H, hires_W),
+                        dtype=frames_left_original_cropped.dtype,
+                        device=frames_left_original_cropped.device,
+                    )
+
+                for chunk_index, i in enumerate(range(0, num_frames_original, chunk_size), start=1):
+                    start_idx, end_idx = i, min(i + chunk_size, num_frames_original)
+                    frame_indices = list(range(start_idx, end_idx))
+                    if not frame_indices:
+                        break
+
+                    logger.info(f"Hi-Res chunk {chunk_index}/{total_chunks}: frames {start_idx}-{end_idx}")
+                    self._write_runtime_status(
+                        base_video_name=base_video_name,
+                        stage="hires_chunk_start",
+                        extra={
+                            "chunk_index": chunk_index,
+                            "total_chunks": total_chunks,
+                            "start_idx": start_idx,
+                            "end_idx": end_idx,
+                        },
+                    )
+
+                    inpainted_chunk_hires = F.interpolate(
+                        lowres_inpainted[start_idx:end_idx],
+                        size=(hires_H, hires_W),
+                        mode="bicubic",
+                        align_corners=False,
+                    )
+                    mask_chunk_hires = F.interpolate(
+                        lowres_mask[start_idx:end_idx],
+                        size=(hires_H, hires_W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+
+                    hires_frames_np = hires_reader.get_batch(frame_indices).asnumpy()
+                    hires_frames_torch = torch.from_numpy(hires_frames_np).permute(0, 3, 1, 2).float()
+
+                    if is_dual_input:
+                        half_w_hires = hires_frames_torch.shape[3] // 2
+                        hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:] / 255.0
+                    else:
+                        half_h_hires = hires_frames_torch.shape[2] // 2
+                        half_w_hires = hires_frames_torch.shape[3] // 2
+                        hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
+                        hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
+                        if frames_left_hires is not None:
+                            frames_left_hires[start_idx:end_idx] = hires_left_chunk
+                        del hires_left_chunk
+
+                    frames_output_hires[start_idx:end_idx] = inpainted_chunk_hires
+                    frames_mask_hires[start_idx:end_idx] = mask_chunk_hires
+                    frames_warped_hires[start_idx:end_idx] = hires_warped_chunk
+
+                    del inpainted_chunk_hires, mask_chunk_hires, hires_frames_np, hires_frames_torch, hires_warped_chunk
+
+                    if chunk_index == 1 or chunk_index == total_chunks or chunk_index % 5 == 0:
+                        self._log_resource_snapshot(
+                            stage="hires_chunk_checkpoint",
+                            base_video_name=base_video_name,
+                            extra={"chunk_index": chunk_index, "total_chunks": total_chunks},
+                            level=logging.INFO,
+                        )
+
+                frames_output_final = frames_output_hires
+                frames_mask_processed = frames_mask_hires
+                frames_warpped_original_unpadded_normalized = frames_warped_hires
+                if not is_dual_input:
+                    frames_left_original_cropped = frames_left_hires
+
+                self._save_debug_image(frames_warpped_original_unpadded_normalized, "07a_hires_warped_input", base_video_name, 0)
+
+                del lowres_inpainted, lowres_mask
+                release_cuda_memory()
+                gc.collect()
+                self._log_resource_snapshot(
+                    stage="hires_blend_complete",
+                    base_video_name=base_video_name,
+                    level=logging.INFO,
+                )
+                logger.info("Hi-Res chunk processing complete.")
+            except (MemoryError, RuntimeError) as e:
+                error_text = str(e).lower()
+                if isinstance(e, MemoryError) or "out of memory" in error_text or "cannot allocate memory" in error_text:
+                    logger.error(
+                        f"Memory exhaustion during Hi-Res blending for {base_video_name}. "
+                        "This is typically host RAM OOM."
+                    )
+                    self._log_resource_snapshot(
+                        stage="hires_blend_memory_error",
+                        base_video_name=base_video_name,
+                        extra={"error": str(e)},
+                        level=logging.ERROR,
+                    )
                     return None
-                frames_left_hires = torch.empty(
-                    (num_frames_original, frames_left_original_cropped.shape[1], hires_H, hires_W),
-                    dtype=frames_left_original_cropped.dtype,
-                    device=frames_left_original_cropped.device,
+                logger.error(f"RuntimeError during Hi-Res blending for {base_video_name}: {e}", exc_info=True)
+                self._log_resource_snapshot(
+                    stage="hires_blend_runtime_error",
+                    base_video_name=base_video_name,
+                    extra={"error": str(e)},
+                    level=logging.ERROR,
                 )
-
-            for i in range(0, num_frames_original, chunk_size):
-                start_idx, end_idx = i, min(i + chunk_size, num_frames_original)
-                frame_indices = list(range(start_idx, end_idx))
-                if not frame_indices:
-                    break
-
-                inpainted_chunk_hires = F.interpolate(
-                    lowres_inpainted[start_idx:end_idx],
-                    size=(hires_H, hires_W),
-                    mode="bicubic",
-                    align_corners=False,
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected failure during Hi-Res blending for {base_video_name}: {e}", exc_info=True)
+                self._log_resource_snapshot(
+                    stage="hires_blend_exception",
+                    base_video_name=base_video_name,
+                    extra={"error": str(e)},
+                    level=logging.ERROR,
                 )
-                mask_chunk_hires = F.interpolate(
-                    lowres_mask[start_idx:end_idx],
-                    size=(hires_H, hires_W),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-
-                hires_frames_np = hires_reader.get_batch(frame_indices).asnumpy()
-                hires_frames_torch = torch.from_numpy(hires_frames_np).permute(0, 3, 1, 2).float()
-
-                if is_dual_input:
-                    half_w_hires = hires_frames_torch.shape[3] // 2
-                    hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:] / 255.0
-                else:
-                    half_h_hires = hires_frames_torch.shape[2] // 2
-                    half_w_hires = hires_frames_torch.shape[3] // 2
-                    hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
-                    hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
-                    if frames_left_hires is not None:
-                        frames_left_hires[start_idx:end_idx] = hires_left_chunk
-                    del hires_left_chunk
-
-                frames_output_hires[start_idx:end_idx] = inpainted_chunk_hires
-                frames_mask_hires[start_idx:end_idx] = mask_chunk_hires
-                frames_warped_hires[start_idx:end_idx] = hires_warped_chunk
-
-                del inpainted_chunk_hires, mask_chunk_hires, hires_frames_np, hires_frames_torch, hires_warped_chunk
-
-            frames_output_final = frames_output_hires
-            frames_mask_processed = frames_mask_hires
-            frames_warpped_original_unpadded_normalized = frames_warped_hires
-            if not is_dual_input:
-                frames_left_original_cropped = frames_left_hires
-
-            self._save_debug_image(frames_warpped_original_unpadded_normalized, "07a_hires_warped_input", base_video_name, 0)
-
-            del hires_reader, lowres_inpainted, lowres_mask
-            release_cuda_memory()
-            logger.info("Hi-Res chunk processing complete.")
+                return None
+            finally:
+                if hires_reader is not None:
+                    del hires_reader
 
         # The rest of the logic remains largely the same, but uses the now-guaranteed-to-be-set frames_output_final
         
         # --- Apply Color Transfer (if enabled) ---
         if self.enable_color_transfer.get():
+            self._log_resource_snapshot(
+                stage="color_transfer_start",
+                base_video_name=base_video_name,
+                level=logging.INFO,
+            )
             # ... (Color Transfer logic using frames_output_final, frames_mask_processed, etc.) ...
             # ... (Replace the large Color Transfer block in your code with its body using the simplified variable names) ...
             reference_frames_for_transfer: Optional[torch.Tensor] = None
@@ -666,7 +1009,7 @@ class InpaintingGUI(ThemedTk):
             if reference_frames_for_transfer is None or reference_frames_for_transfer.numel() == 0:
                 logger.warning("Color transfer skipped: No valid reference frames available.")
             else:
-                logger.debug("Applying color transfer from reference view to inpainted right view...")
+                logger.info("Applying color transfer from reference view to inpainted right view...")
                 target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
                 for t in range(frames_output_final.shape[0]):
                     ref_frame_resized = F.interpolate(
@@ -677,16 +1020,34 @@ class InpaintingGUI(ThemedTk):
                     target_frame_cpu = frames_output_final[t].cpu()
                     adjusted_frame = self._apply_color_transfer(ref_frame_resized, target_frame_cpu)
                     frames_output_final[t].copy_(adjusted_frame.to(frames_output_final.device))
+
+                    if (t + 1) % 50 == 0:
+                        self._log_resource_snapshot(
+                            stage="color_transfer_checkpoint",
+                            base_video_name=base_video_name,
+                            extra={"frame": t + 1, "total": int(frames_output_final.shape[0])},
+                            level=logging.INFO,
+                        )
                 
                 del reference_frames_for_transfer
                 self._save_debug_image(frames_output_final, "08_inpainted_color_transferred", base_video_name, 0)
-                logger.debug("Color transfer complete.")
+                self._log_resource_snapshot(
+                    stage="color_transfer_complete",
+                    base_video_name=base_video_name,
+                    level=logging.INFO,
+                )
+                logger.info("Color transfer complete.")
         # --- END Apply Color Transfer ---
 
 
         # --- Apply Post-Inpainting Blending (if enabled) ---
         if self.enable_post_inpainting_blend.get():
-            logger.debug("Applying post-inpainting blend...")
+            self._log_resource_snapshot(
+                stage="post_blend_start",
+                base_video_name=base_video_name,
+                level=logging.INFO,
+            )
+            logger.info("Applying post-inpainting blend...")
             frames_output_final = self._apply_post_inpainting_blend(
                 inpainted_frames=frames_output_final,
                 original_warped_frames=frames_warpped_original_unpadded_normalized,
@@ -694,10 +1055,16 @@ class InpaintingGUI(ThemedTk):
                 base_video_name=base_video_name 
             )
             self._save_debug_image(frames_output_final, "09_final_blended_right_eye", base_video_name, 0)
-            logger.debug("Post-inpainting blend complete.")
+            self._log_resource_snapshot(
+                stage="post_blend_complete",
+                base_video_name=base_video_name,
+                level=logging.INFO,
+            )
+            logger.info("Post-inpainting blend complete.")
 
         # These are no longer needed after optional post-blend and can be released before SBS concat.
         del frames_mask_processed, frames_warpped_original_unpadded_normalized
+        gc.collect()
 
         # --- Final Concatenation ---
         final_output_frames_for_encoding: Optional[torch.Tensor] = None
@@ -1538,6 +1905,7 @@ class InpaintingGUI(ThemedTk):
         base_video_name = os.path.basename(input_video_path)
         video_name_without_ext = os.path.splitext(base_video_name)[0]
         is_dual_input = video_name_without_ext.endswith("_splatted2")
+        self._log_resource_snapshot(stage="video_start", base_video_name=base_video_name, level=logging.INFO)
 
         # 1. SETUP & HI-RES DETECTION
         # output_video_path is str (guaranteed), hires_data is dict (guaranteed)
@@ -1547,142 +1915,201 @@ class InpaintingGUI(ThemedTk):
         base_video_name = hires_data["base_video_name"]
         video_name_for_output = hires_data["video_name_for_output"]
         hires_video_path = hires_data["hires_video_path"] # Optional[str]
-        
-        # 2. INPUT PREPARATION (Low-Res)
-        prepared_inputs = self._prepare_video_inputs(
+        checkpoint_path = self._get_prefinalize_checkpoint_path(base_video_name)
+        resume_signature = self._build_prefinalize_signature(
             input_video_path=input_video_path,
-            base_video_name=base_video_name,
+            hires_video_path=hires_video_path,
             is_dual_input=is_dual_input,
             frames_chunk=frames_chunk,
-            tile_num=tile_num,
-            update_info_callback=update_info_callback,
             overlap=overlap,
+            tile_num=tile_num,
+            num_inference_steps=num_inference_steps,
             original_input_blend_strength=original_input_blend_strength,
-            process_length=process_length
+            process_length=process_length,
         )
+        resume_checkpoint = self._load_prefinalize_checkpoint(checkpoint_path, resume_signature)
 
-        if prepared_inputs is None:
-            return False, None # Preparation failed
-        
-        # Unpack, ensuring all torch.Tensor return values are not None
-        (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
-        num_frames_original, padded_H, padded_W, video_stream_info, fps,
-        frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
+        frames_output_final: torch.Tensor
+        frames_mask_processed_unpadded_original_length: torch.Tensor
+        frames_warpped_original_unpadded_normalized: torch.Tensor
+        frames_left_original_cropped: Optional[torch.Tensor]
+        video_stream_info: Optional[dict]
+        fps: float
 
-        # 3. INPAINTING CHUNKS (The main loop)
-        # This part of the loop remains the same, but the logic inside is simplified
-        total_frames_to_process_actual = num_frames_original        
-        stride = max(1, frames_chunk - overlap)
-        results = [] 
-        previous_chunk_output_frames: Optional[torch.Tensor] = None
-
-        for i in range(0, total_frames_to_process_actual, stride):
-            if stop_event and stop_event.is_set():
-                logger.info(f"Stopping processing of {input_video_path}")
-                return False, None
-            
-            # --- CHUNK SLICING AND PADDING LOGIC (Remains from your last correct version) ---
-            end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
-            original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
-            mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
-            actual_sliced_length = original_input_frames_slice.shape[0]
-
-            # Skip useless tail chunks that would contribute no new frames (only overlap)
-            if i > 0 and overlap > 0 and actual_sliced_length <= overlap:
-                logger.debug(
-                    f"Skipping tail chunk {i}-{end_idx_for_slicing} (length {actual_sliced_length}) "
-                    f"because it contributes no new frames (overlap={overlap})."
-                )
-                break
-            
-            padding_needed_for_pipeline_input = 0
-            # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
-            min_tail_frames = 3
-            target_length = max(6, overlap + min_tail_frames)
-            if actual_sliced_length < target_length:
-                padding_needed_for_pipeline_input = target_length - actual_sliced_length
-                logger.debug(
-                    f"End-of-video optimization: Short tail chunk ({actual_sliced_length} frames) "
-                    f"padded to minimum {target_length} (overlap={overlap})."
-                )
-
-            if padding_needed_for_pipeline_input > 0:
-                logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
-                last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
-                last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
-                repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
-                repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
-                input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
-                mask_frames_i = torch.cat([mask_frames_slice, repeated_mask], dim=0)
-            else:
-                input_frames_to_pipeline = original_input_frames_slice
-                mask_frames_i = mask_frames_slice
-            # --- END CHUNK SLICING AND PADDING LOGIC ---
-
-            # --- INPUT-LEVEL BLENDING (Remains from your last correct version) ---
-            if previous_chunk_output_frames is not None and overlap > 0:
-                # ... (Input-level blending logic) ...
-                overlap_actual = min(overlap, input_frames_to_pipeline.shape[0]) 
-                if overlap_actual > 0:
-                    prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
-                    if original_input_blend_strength > 0:
-                        orig_input_overlap_frames = input_frames_to_pipeline[:overlap_actual]
-                        original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
-                        blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + original_weights_scaled * orig_input_overlap_frames
-                        input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
-                        del orig_input_overlap_frames, original_weights_scaled, blended_input_overlap_frames
-                    else:
-                        input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
-                    del prev_gen_overlap_frames
-            # --- END INPUT-LEVEL BLENDING ---
-
-            # --- INFERENCE ---
-            logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
-            start_time = time.time()
-
-            with torch.no_grad():
-                video_latents = spatial_tiled_process(
-                    # ... (spatial_tiled_process arguments) ...
-                    cond_frames=input_frames_to_pipeline, mask_frames=mask_frames_i, process_func=pipeline, tile_num=tile_num,
-                    spatial_n_compress=8, min_guidance_scale=1.01, max_guidance_scale=1.01, decode_chunk_size=2,
-                    fps=7, motion_bucket_id=127, noise_aug_strength=0.0, num_inference_steps=num_inference_steps,
-                )
-                video_latents = video_latents.unsqueeze(0)
-                pipeline.vae.to(dtype=torch.float16)
-                decoded_frames = pipeline.decode_latents(video_latents, num_frames=video_latents.shape[1], decode_chunk_size=2)
-
-            # --- DECODING & CHUNK COLLECT ---
-            inference_duration = time.time() - start_time
-            logger.debug(f"Inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} completed in {inference_duration:.2f} seconds.")
-            
-            video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
-            current_chunk_generated = torch.stack([
-                torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0 for img in video_frames
-            ]).cpu()
-            self._save_debug_image(current_chunk_generated, f"07_inpainted_chunk_{i}", base_video_name, i)
-
-            # Append only the "new" frames
-            if i == 0:
-                results.append(current_chunk_generated[:actual_sliced_length])
-            else:
-                results.append(current_chunk_generated[overlap:actual_sliced_length])
-            
-            previous_chunk_output_frames = current_chunk_generated
-        # --- END INPAINTING CHUNKS ---
-
-        # 4. PREPARE FRAMES FOR FINALIZATION (Temporal/Spatial Cropping)
-        if not results:
-            logger.warning(f"No frames generated for {input_video_path}.")
+        if resume_checkpoint is not None:
+            logger.info(f"Resuming {base_video_name} from checkpoint: {checkpoint_path}")
+            frames_output_final = resume_checkpoint["frames_output_final"]
+            frames_mask_processed_unpadded_original_length = resume_checkpoint["frames_mask_processed"]
+            frames_warpped_original_unpadded_normalized = resume_checkpoint["frames_warped_original"]
+            frames_left_original_cropped = resume_checkpoint.get("frames_left_original")
+            video_stream_info = resume_checkpoint["video_stream_info"]
+            fps = float(resume_checkpoint["fps"])
             if update_info_callback:
-                self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength))
-            return False, None
+                self.after(
+                    0,
+                    lambda: update_info_callback(
+                        base_video_name,
+                        f"{int(frames_output_final.shape[3])}x{int(frames_output_final.shape[2])}",
+                        str(int(frames_output_final.shape[0])),
+                        overlap,
+                        original_input_blend_strength,
+                    ),
+                )
+            self._log_resource_snapshot(
+                stage="resume_checkpoint_loaded",
+                base_video_name=base_video_name,
+                extra={"checkpoint_path": checkpoint_path},
+                level=logging.INFO,
+            )
+        else:
+            # 2. INPUT PREPARATION (Low-Res)
+            prepared_inputs = self._prepare_video_inputs(
+                input_video_path=input_video_path,
+                base_video_name=base_video_name,
+                is_dual_input=is_dual_input,
+                frames_chunk=frames_chunk,
+                tile_num=tile_num,
+                update_info_callback=update_info_callback,
+                overlap=overlap,
+                original_input_blend_strength=original_input_blend_strength,
+                process_length=process_length
+            )
 
-        frames_output = torch.cat(results, dim=0).cpu()
-        if frames_output.numel() == 0 or frames_output.shape[2] < padded_H or frames_output.shape[3] < padded_W:
-            logger.error(f"Generated frames_output has invalid dimensions (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W}).")
-            return False, None
+            if prepared_inputs is None:
+                return False, None # Preparation failed
+            
+            # Unpack, ensuring all torch.Tensor return values are not None
+            (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+            num_frames_original, padded_H, padded_W, video_stream_info, fps,
+            frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
 
-        frames_output_final = frames_output[:, :, :padded_H, :padded_W][:num_frames_original]
+            # 3. INPAINTING CHUNKS (The main loop)
+            total_frames_to_process_actual = num_frames_original        
+            stride = max(1, frames_chunk - overlap)
+            results = [] 
+            previous_chunk_output_frames: Optional[torch.Tensor] = None
+
+            for i in range(0, total_frames_to_process_actual, stride):
+                if stop_event and stop_event.is_set():
+                    logger.info(f"Stopping processing of {input_video_path}")
+                    return False, None
+                
+                # --- CHUNK SLICING AND PADDING LOGIC (Remains from your last correct version) ---
+                end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
+                original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
+                mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
+                actual_sliced_length = original_input_frames_slice.shape[0]
+
+                # Skip useless tail chunks that would contribute no new frames (only overlap)
+                if i > 0 and overlap > 0 and actual_sliced_length <= overlap:
+                    logger.debug(
+                        f"Skipping tail chunk {i}-{end_idx_for_slicing} (length {actual_sliced_length}) "
+                        f"because it contributes no new frames (overlap={overlap})."
+                    )
+                    break
+                
+                padding_needed_for_pipeline_input = 0
+                # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
+                min_tail_frames = 3
+                target_length = max(6, overlap + min_tail_frames)
+                if actual_sliced_length < target_length:
+                    padding_needed_for_pipeline_input = target_length - actual_sliced_length
+                    logger.debug(
+                        f"End-of-video optimization: Short tail chunk ({actual_sliced_length} frames) "
+                        f"padded to minimum {target_length} (overlap={overlap})."
+                    )
+
+                if padding_needed_for_pipeline_input > 0:
+                    logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
+                    last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+                    last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+                    repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
+                    repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
+                    input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
+                    mask_frames_i = torch.cat([mask_frames_slice, repeated_mask], dim=0)
+                else:
+                    input_frames_to_pipeline = original_input_frames_slice
+                    mask_frames_i = mask_frames_slice
+                # --- END CHUNK SLICING AND PADDING LOGIC ---
+
+                # --- INPUT-LEVEL BLENDING (Remains from your last correct version) ---
+                if previous_chunk_output_frames is not None and overlap > 0:
+                    overlap_actual = min(overlap, input_frames_to_pipeline.shape[0]) 
+                    if overlap_actual > 0:
+                        prev_gen_overlap_frames = previous_chunk_output_frames[-overlap_actual:]
+                        if original_input_blend_strength > 0:
+                            orig_input_overlap_frames = input_frames_to_pipeline[:overlap_actual]
+                            original_weights_scaled = torch.linspace(0.0, 1.0, overlap_actual, device=prev_gen_overlap_frames.device).view(-1, 1, 1, 1) * original_input_blend_strength
+                            blended_input_overlap_frames = (1 - original_weights_scaled) * prev_gen_overlap_frames + original_weights_scaled * orig_input_overlap_frames
+                            input_frames_to_pipeline[:overlap_actual] = blended_input_overlap_frames
+                            del orig_input_overlap_frames, original_weights_scaled, blended_input_overlap_frames
+                        else:
+                            input_frames_to_pipeline[:overlap_actual] = prev_gen_overlap_frames
+                        del prev_gen_overlap_frames
+                # --- END INPUT-LEVEL BLENDING ---
+
+                # --- INFERENCE ---
+                logger.info(f"Starting inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} (Temporal length: {input_frames_to_pipeline.shape[0]})...")
+                start_time = time.time()
+
+                with torch.no_grad():
+                    video_latents = spatial_tiled_process(
+                        cond_frames=input_frames_to_pipeline, mask_frames=mask_frames_i, process_func=pipeline, tile_num=tile_num,
+                        spatial_n_compress=8, min_guidance_scale=1.01, max_guidance_scale=1.01, decode_chunk_size=2,
+                        fps=7, motion_bucket_id=127, noise_aug_strength=0.0, num_inference_steps=num_inference_steps,
+                    )
+                    video_latents = video_latents.unsqueeze(0)
+                    pipeline.vae.to(dtype=torch.float16)
+                    decoded_frames = pipeline.decode_latents(video_latents, num_frames=video_latents.shape[1], decode_chunk_size=2)
+
+                # --- DECODING & CHUNK COLLECT ---
+                inference_duration = time.time() - start_time
+                logger.debug(f"Inference for chunk {i}-{i+input_frames_to_pipeline.shape[0]} completed in {inference_duration:.2f} seconds.")
+                
+                video_frames = tensor2vid(decoded_frames, pipeline.image_processor, output_type="pil")[0]
+                current_chunk_generated = torch.stack([
+                    torch.tensor(np.array(img)).permute(2, 0, 1).float() / 255.0 for img in video_frames
+                ]).cpu()
+                self._save_debug_image(current_chunk_generated, f"07_inpainted_chunk_{i}", base_video_name, i)
+
+                # Append only the "new" frames
+                if i == 0:
+                    results.append(current_chunk_generated[:actual_sliced_length])
+                else:
+                    results.append(current_chunk_generated[overlap:actual_sliced_length])
+                
+                previous_chunk_output_frames = current_chunk_generated
+            # --- END INPAINTING CHUNKS ---
+
+            # 4. PREPARE FRAMES FOR FINALIZATION (Temporal/Spatial Cropping)
+            if not results:
+                logger.warning(f"No frames generated for {input_video_path}.")
+                if update_info_callback:
+                    self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (No Output)", overlap, original_input_blend_strength))
+                return False, None
+
+            frames_output = torch.cat(results, dim=0).cpu()
+            if frames_output.numel() == 0 or frames_output.shape[2] < padded_H or frames_output.shape[3] < padded_W:
+                logger.error(f"Generated frames_output has invalid dimensions (actual {frames_output.shape[2]}x{frames_output.shape[3]} vs target {padded_H}x{padded_W}).")
+                return False, None
+
+            frames_output_final = frames_output[:, :, :padded_H, :padded_W][:num_frames_original]
+            self._log_resource_snapshot(
+                stage="pre_finalize",
+                base_video_name=base_video_name,
+                extra={"num_frames": int(frames_output_final.shape[0]), "resolution": f"{int(padded_W)}x{int(padded_H)}"},
+                level=logging.INFO,
+            )
+            self._save_prefinalize_checkpoint(
+                checkpoint_path=checkpoint_path,
+                signature=resume_signature,
+                frames_output_final=frames_output_final,
+                frames_mask_processed=frames_mask_processed_unpadded_original_length,
+                frames_warped_original=frames_warpped_original_unpadded_normalized,
+                frames_left_original=frames_left_original_cropped,
+                fps=fps,
+                video_stream_info=video_stream_info,
+            )
         
         # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         final_output_frames_for_encoding = self._finalize_output_frames(
@@ -1700,6 +2127,15 @@ class InpaintingGUI(ThemedTk):
             if update_info_callback:
                 self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength))
             return False, None
+        self._log_resource_snapshot(
+            stage="post_finalize",
+            base_video_name=base_video_name,
+            extra={
+                "num_frames": int(final_output_frames_for_encoding.shape[0]),
+                "resolution": f"{int(final_output_frames_for_encoding.shape[3])}x{int(final_output_frames_for_encoding.shape[2])}",
+            },
+            level=logging.INFO,
+        )
             
         # 6. ENCODING
         temp_png_dir = os.path.join(save_dir, f"temp_inpainted_pngs_{video_name_for_output}_{os.getpid()}")
@@ -2042,6 +2478,7 @@ class InpaintingGUI(ThemedTk):
         if not os.path.isdir(input_folder) or not os.path.isdir(output_folder):
             messagebox.showerror("Error", "Invalid input or output folder")
             return
+        self._configure_logging()
 
         self.processed_count.set(0)
         self.total_videos.set(0)

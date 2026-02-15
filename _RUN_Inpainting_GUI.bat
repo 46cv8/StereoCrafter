@@ -31,3 +31,12 @@ if %GPU_COUNT% GTR 1 (
 
 :: 4. Run your python script
 python inpainting_gui.py
+set "EXIT_CODE=%ERRORLEVEL%"
+
+if %EXIT_CODE% EQU 137 (
+    echo ERROR: inpainting_gui.py exited with code 137 (SIGKILL equivalent).
+    echo Likely cause: host RAM exhaustion.
+    echo Check your output folder for inpainting_runtime.log and inpaint_runtime_status_*.json
+)
+
+exit /b %EXIT_CODE%
