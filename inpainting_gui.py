@@ -70,13 +70,28 @@ class InpaintingGUI(ThemedTk):
         self.hires_blend_folder_var = tk.StringVar(value=self.app_config.get("hires_blend_folder", "./output_splatted_hires"))
         
         # --- NEW: Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
+        self.inpaint_mask_initial_threshold_var = tk.StringVar(
+            value=str(self.app_config.get("inpaint_mask_initial_threshold", self.app_config.get("mask_initial_threshold", 0.3)))
+        )
+        self.inpaint_mask_morph_kernel_size_var = tk.StringVar(
+            value=str(self.app_config.get("inpaint_mask_morph_kernel_size", self.app_config.get("mask_morph_kernel_size", 0.0)))
+        )
+        self.inpaint_mask_dilate_kernel_size_var = tk.StringVar(
+            value=str(self.app_config.get("inpaint_mask_dilate_kernel_size", self.app_config.get("mask_dilate_kernel_size", 5)))
+        )
+        self.inpaint_mask_blur_kernel_size_var = tk.StringVar(
+            value=str(self.app_config.get("inpaint_mask_blur_kernel_size", self.app_config.get("mask_blur_kernel_size", 10)))
+        )
+
         self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
         self.mask_morph_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_morph_kernel_size", 0.0)))
         self.mask_dilate_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size", 5)))        
         self.mask_blur_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size", 10)))
+        self.blend_mask_source_var = tk.StringVar(value=str(self.app_config.get("blend_mask_source", "hybrid")).lower())
 
         self.enable_post_inpainting_blend = tk.BooleanVar(value=self.app_config.get("enable_post_inpainting_blend", False))
         self.enable_color_transfer = tk.BooleanVar(value=self.app_config.get("enable_color_transfer", True))
+        self.keep_inpaint_cache_var = tk.BooleanVar(value=self.app_config.get("keep_inpaint_cache", False))
         
         self.processed_count = tk.IntVar(value=0)
         self.total_videos = tk.IntVar(value=0)
@@ -304,7 +319,116 @@ class InpaintingGUI(ThemedTk):
         except Exception as e:
             logger.error(f"Error during morphological closing: {e}. Skipping closing.", exc_info=True)
             return mask
-        
+
+    def _resolve_mask_processing_params(
+        self,
+        threshold_raw: str,
+        morph_kernel_raw: str,
+        dilate_kernel_raw: str,
+        blur_kernel_raw: str,
+        context_label: str,
+    ) -> Tuple[float, int, int, int]:
+        """Parses and validates mask processing params for inference/blend mask pipelines."""
+        try:
+            threshold = float(threshold_raw)
+            if not (0.0 <= threshold <= 1.0):
+                logger.warning(f"{context_label}: invalid threshold {threshold}; using 0.1")
+                threshold = 0.1
+        except ValueError:
+            logger.error(f"{context_label}: invalid threshold '{threshold_raw}'; using 0.1", exc_info=True)
+            threshold = 0.1
+
+        try:
+            morph_kernel = int(float(morph_kernel_raw))
+        except ValueError:
+            logger.error(f"{context_label}: invalid morph kernel '{morph_kernel_raw}'; using 0", exc_info=True)
+            morph_kernel = 0
+
+        try:
+            dilate_kernel = int(dilate_kernel_raw)
+        except ValueError:
+            logger.error(f"{context_label}: invalid dilate kernel '{dilate_kernel_raw}'; using 0", exc_info=True)
+            dilate_kernel = 0
+
+        try:
+            blur_kernel = int(blur_kernel_raw)
+        except ValueError:
+            logger.error(f"{context_label}: invalid blur kernel '{blur_kernel_raw}'; using 0", exc_info=True)
+            blur_kernel = 0
+
+        return threshold, morph_kernel, dilate_kernel, blur_kernel
+
+    def _process_mask_frames(
+        self,
+        frames_mask_raw: torch.Tensor,
+        threshold: float,
+        morph_kernel_size: int,
+        dilate_kernel_size: int,
+        blur_kernel_size: int,
+        base_video_name: str,
+        debug_prefix: Optional[str] = None,
+        save_debug: bool = True,
+    ) -> torch.Tensor:
+        """Converts RGB mask frames to grayscale and applies threshold/morph/dilate/blur in order."""
+        if frames_mask_raw.dim() != 4:
+            raise ValueError(f"Expected mask tensor [T, C, H, W], got shape {tuple(frames_mask_raw.shape)}")
+
+        mask_raw = frames_mask_raw.detach()
+        if mask_raw.dtype != torch.uint8:
+            mask_raw = mask_raw.float()
+            if mask_raw.numel() > 0 and float(mask_raw.max().item()) <= 1.0:
+                mask_raw = mask_raw * 255.0
+            mask_raw = torch.clamp(mask_raw, 0.0, 255.0).to(torch.uint8)
+
+        processed_masks_grayscale = []
+        for t in range(mask_raw.shape[0]):
+            frame_np = mask_raw[t].permute(1, 2, 0).cpu().numpy()
+            if save_debug and debug_prefix:
+                self._save_debug_image(
+                    frame_np.astype(np.float32) / 255.0,
+                    f"{debug_prefix}_01_mask_raw_color",
+                    base_video_name,
+                    t,
+                )
+
+            if frame_np.ndim == 2:
+                frame_np_gray = frame_np
+            elif frame_np.shape[2] == 1:
+                frame_np_gray = frame_np[:, :, 0]
+            else:
+                frame_np_gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+
+            frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
+            if frame_tensor_gray.dim() == 2:
+                frame_tensor_gray = frame_tensor_gray.unsqueeze(0)
+            processed_masks_grayscale.append(frame_tensor_gray)
+
+        current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
+        if save_debug and debug_prefix:
+            self._save_debug_image(current_processed_mask, f"{debug_prefix}_02_mask_initial_grayscale", base_video_name, 0)
+
+        if threshold != 0.0:
+            current_processed_mask = (current_processed_mask > threshold).float()
+            if save_debug and debug_prefix:
+                self._save_debug_image(current_processed_mask, f"{debug_prefix}_03_mask_binarized", base_video_name, 0)
+
+        if morph_kernel_size != 0:
+            current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
+            if save_debug and debug_prefix:
+                self._save_debug_image(current_processed_mask, f"{debug_prefix}_04_mask_morph_closed", base_video_name, 0)
+
+        if dilate_kernel_size != 0:
+            current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size)
+            if save_debug and debug_prefix:
+                self._save_debug_image(current_processed_mask, f"{debug_prefix}_05_mask_dilated", base_video_name, 0)
+
+        if blur_kernel_size != 0:
+            current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size)
+            if save_debug and debug_prefix:
+                self._save_debug_image(current_processed_mask, f"{debug_prefix}_06_mask_final_blurred", base_video_name, 0)
+
+        return current_processed_mask
+
     def _apply_post_inpainting_blend(
         self,
         inpainted_frames: torch.Tensor,       # Generated frames from pipeline
@@ -686,9 +810,8 @@ class InpaintingGUI(ThemedTk):
                 return {"path": abs_path, "size": None, "mtime_ns": None}
 
         return {
-            "version": 1,
+            "version": 3,
             "input": _identity(input_video_path),
-            "hires_input": _identity(hires_video_path),
             "is_dual_input": bool(is_dual_input),
             "frames_chunk": int(frames_chunk),
             "frame_overlap": int(overlap),
@@ -696,10 +819,10 @@ class InpaintingGUI(ThemedTk):
             "num_inference_steps": int(num_inference_steps),
             "original_input_blend_strength": float(original_input_blend_strength),
             "process_length": int(process_length),
-            "mask_initial_threshold": self.mask_initial_threshold_var.get(),
-            "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
-            "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
-            "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
+            "inpaint_mask_initial_threshold": self.inpaint_mask_initial_threshold_var.get(),
+            "inpaint_mask_morph_kernel_size": self.inpaint_mask_morph_kernel_size_var.get(),
+            "inpaint_mask_dilate_kernel_size": self.inpaint_mask_dilate_kernel_size_var.get(),
+            "inpaint_mask_blur_kernel_size": self.inpaint_mask_blur_kernel_size_var.get(),
         }
 
     def _load_prefinalize_checkpoint(self, checkpoint_path: str, expected_signature: dict) -> Optional[dict]:
@@ -866,10 +989,19 @@ class InpaintingGUI(ThemedTk):
         if removed > 0:
             logger.info(f"Removed {removed} chunk checkpoint(s) for {video_stem}.")
 
-    def _cleanup_all_checkpoints(self, base_video_name: str, checkpoint_path: Optional[str] = None):
+    def _cleanup_all_checkpoints(
+        self,
+        base_video_name: str,
+        checkpoint_path: Optional[str] = None,
+        keep_prefinalize: bool = False,
+    ):
         """Removes all resume checkpoints for a video after successful completion."""
         prefinalize_path = checkpoint_path or self._get_prefinalize_checkpoint_path(base_video_name)
         self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=prefinalize_path)
+
+        if keep_prefinalize:
+            logger.info(f"Keeping pre-finalize checkpoint for re-merge: {prefinalize_path}")
+            return
 
         removed_prefinalize = 0
         for path in (prefinalize_path, f"{prefinalize_path}.tmp"):
@@ -900,6 +1032,23 @@ class InpaintingGUI(ThemedTk):
         frames_mask_processed = mask_frames
         frames_warpped_original_unpadded_normalized = original_warped_frames
         frames_left_original_cropped = original_left_frames
+        blend_mask_source = str(self.blend_mask_source_var.get()).strip().lower()
+        if blend_mask_source not in ("lowres", "hires", "hybrid"):
+            logger.warning(f"Invalid blend_mask_source '{blend_mask_source}', defaulting to 'hybrid'.")
+            blend_mask_source = "hybrid"
+        blend_mask_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = self._resolve_mask_processing_params(
+            threshold_raw=self.mask_initial_threshold_var.get(),
+            morph_kernel_raw=self.mask_morph_kernel_size_var.get(),
+            dilate_kernel_raw=self.mask_dilate_kernel_size_var.get(),
+            blur_kernel_raw=self.mask_blur_kernel_size_var.get(),
+            context_label="blend_mask",
+        )
+        if not hires_data["is_hires_blend_enabled"] and blend_mask_source != "lowres":
+            logger.info(
+                f"Blend mask source '{blend_mask_source}' requested but no hi-res match was found; "
+                "using low-res blend mask."
+            )
+            blend_mask_source = "lowres"
         
         if hires_data["is_hires_blend_enabled"]:
             hires_H, hires_W = hires_data["hires_H"], hires_data["hires_W"]
@@ -907,6 +1056,7 @@ class InpaintingGUI(ThemedTk):
             hires_video_path = hires_data["hires_video_path"]
 
             logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
+            logger.info(f"Hi-Res blend mask source: {blend_mask_source}")
             self._log_resource_snapshot(
                 stage="hires_blend_start",
                 base_video_name=base_video_name,
@@ -995,7 +1145,7 @@ class InpaintingGUI(ThemedTk):
                         mode="bicubic",
                         align_corners=False,
                     )
-                    mask_chunk_hires = F.interpolate(
+                    lowres_mask_chunk_hires = F.interpolate(
                         lowres_mask[start_idx:end_idx],
                         size=(hires_H, hires_W),
                         mode="bilinear",
@@ -1004,24 +1154,73 @@ class InpaintingGUI(ThemedTk):
 
                     hires_frames_np = hires_reader.get_batch(frame_indices).asnumpy()
                     hires_frames_torch = torch.from_numpy(hires_frames_np).permute(0, 3, 1, 2).float()
+                    hires_mask_chunk_processed = None
 
                     if is_dual_input:
                         half_w_hires = hires_frames_torch.shape[3] // 2
+                        if blend_mask_source in ("hires", "hybrid"):
+                            hires_mask_chunk_raw = hires_frames_torch[:, :, :, :half_w_hires]
+                            hires_mask_chunk_processed = self._process_mask_frames(
+                                frames_mask_raw=hires_mask_chunk_raw,
+                                threshold=blend_mask_threshold,
+                                morph_kernel_size=blend_mask_morph,
+                                dilate_kernel_size=blend_mask_dilate,
+                                blur_kernel_size=blend_mask_blur,
+                                base_video_name=base_video_name,
+                                debug_prefix=None,
+                                save_debug=False,
+                            )
                         hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:] / 255.0
                     else:
                         half_h_hires = hires_frames_torch.shape[2] // 2
                         half_w_hires = hires_frames_torch.shape[3] // 2
+                        if blend_mask_source in ("hires", "hybrid"):
+                            hires_mask_chunk_raw = hires_frames_torch[:, :, half_h_hires:, :half_w_hires]
+                            hires_mask_chunk_processed = self._process_mask_frames(
+                                frames_mask_raw=hires_mask_chunk_raw,
+                                threshold=blend_mask_threshold,
+                                morph_kernel_size=blend_mask_morph,
+                                dilate_kernel_size=blend_mask_dilate,
+                                blur_kernel_size=blend_mask_blur,
+                                base_video_name=base_video_name,
+                                debug_prefix=None,
+                                save_debug=False,
+                            )
                         hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
                         hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
                         if frames_left_hires is not None:
                             frames_left_hires[start_idx:end_idx] = hires_left_chunk
                         del hires_left_chunk
 
+                    if blend_mask_source == "lowres":
+                        mask_chunk_hires = lowres_mask_chunk_hires
+                    elif hires_mask_chunk_processed is None:
+                        logger.warning(
+                            f"Blend mask source '{blend_mask_source}' requested but hi-res mask unavailable; "
+                            f"falling back to low-res mask for chunk {chunk_index}/{total_chunks}."
+                        )
+                        mask_chunk_hires = lowres_mask_chunk_hires
+                    elif blend_mask_source == "hires":
+                        mask_chunk_hires = hires_mask_chunk_processed.to(
+                            device=lowres_mask_chunk_hires.device,
+                            dtype=lowres_mask_chunk_hires.dtype,
+                        )
+                    else:  # hybrid
+                        hires_mask_chunk_processed = hires_mask_chunk_processed.to(
+                            device=lowres_mask_chunk_hires.device,
+                            dtype=lowres_mask_chunk_hires.dtype,
+                        )
+                        mask_chunk_hires = torch.where(
+                            hires_mask_chunk_processed > 0,
+                            hires_mask_chunk_processed,
+                            lowres_mask_chunk_hires,
+                        )
+
                     frames_output_hires[start_idx:end_idx] = inpainted_chunk_hires
                     frames_mask_hires[start_idx:end_idx] = mask_chunk_hires
                     frames_warped_hires[start_idx:end_idx] = hires_warped_chunk
 
-                    del inpainted_chunk_hires, mask_chunk_hires, hires_frames_np, hires_frames_torch, hires_warped_chunk
+                    del inpainted_chunk_hires, lowres_mask_chunk_hires, mask_chunk_hires, hires_frames_np, hires_frames_torch, hires_warped_chunk, hires_mask_chunk_processed
 
                     if chunk_index == 1 or chunk_index == total_chunks or chunk_index % 5 == 0:
                         self._log_resource_snapshot(
@@ -1348,11 +1547,19 @@ class InpaintingGUI(ThemedTk):
             "output_crf": self.output_crf_var.get(),
             "offload_type": self.offload_type_var.get(),
 
+            # Inference mask processing (applied before model inpainting)
+            "inpaint_mask_initial_threshold": self.inpaint_mask_initial_threshold_var.get(),
+            "inpaint_mask_morph_kernel_size": self.inpaint_mask_morph_kernel_size_var.get(),
+            "inpaint_mask_dilate_kernel_size": self.inpaint_mask_dilate_kernel_size_var.get(),
+            "inpaint_mask_blur_kernel_size": self.inpaint_mask_blur_kernel_size_var.get(),
+
             # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
             "mask_initial_threshold": self.mask_initial_threshold_var.get(),
             "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
             "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
             "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
+            "blend_mask_source": self.blend_mask_source_var.get(),
+            "keep_inpaint_cache": self.keep_inpaint_cache_var.get(),
             
             "enable_post_inpainting_blend": self.enable_post_inpainting_blend.get(),
             "enable_color_transfer": self.enable_color_transfer.get(),
@@ -1372,7 +1579,7 @@ class InpaintingGUI(ThemedTk):
         process_length: int = -1
     ) -> Optional[Tuple[
         torch.Tensor,                  # frames_warpped_padded
-        torch.Tensor,                  # frames_mask_padded
+        torch.Tensor,                  # frames_inpaint_mask_padded
         Optional[torch.Tensor],        # frames_left_original_cropped
         int,                           # num_frames_original
         int,                           # padded_H
@@ -1380,13 +1587,13 @@ class InpaintingGUI(ThemedTk):
         Optional[dict],                # video_stream_info
         float,                         # fps
         torch.Tensor,                  # frames_warpped_original_unpadded_normalized
-        torch.Tensor                   # frames_mask_processed_unpadded_original_length
+        torch.Tensor                   # frames_blend_mask_processed_unpadded_original_length
     ]]:
         """
         Helper method to prepare video inputs: loads frames, applies padding,
         validates dimensions, splits views, normalizes, and prepares for tiling.
 
-        Returns: (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+        Returns: (frames_warpped_padded, frames_inpaint_mask_padded, frames_left_original_cropped,
                   num_frames_original, padded_H, padded_W, video_stream_info)
                  or None if an error occurs.
         """
@@ -1515,92 +1722,49 @@ class InpaintingGUI(ThemedTk):
         self._save_debug_image(frames_warpped_normalized, "01a_warped_input", base_video_name, 0)
         # --- END FIX ---
 
-        processed_masks_grayscale = []
-        for t in range(frames_mask_raw.shape[0]):
-            # --- FIX: Convert float tensor (0-1) to uint8 (0-255) for OpenCV ---
-            frame_np_rgb = frames_mask_raw[t].permute(1, 2, 0).cpu().numpy()
-            self._save_debug_image(frame_np_rgb.astype(np.float32) / 255.0, "01_mask_raw_color", base_video_name, t)
-            # --- END FIX ---
-            frame_np_gray = cv2.cvtColor(frame_np_rgb, cv2.COLOR_RGB2GRAY)
-            frame_tensor_gray = torch.from_numpy(frame_np_gray).float() / 255.0
-            # --- FIX: Ensure the grayscale tensor has a channel dimension ---
-            # The output from cvtColor is (H, W), but we need (1, H, W) for stacking.
-            if frame_tensor_gray.dim() == 2:
-                frame_tensor_gray = frame_tensor_gray.unsqueeze(0)
-            # --- END FIX ---
-            processed_masks_grayscale.append(frame_tensor_gray)
-        current_processed_mask = torch.stack(processed_masks_grayscale).to(frames_mask_raw.device)
-        logger.debug(f"Mask: Initial grayscale (OpenCV, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-        self._save_debug_image(current_processed_mask, "02_mask_initial_grayscale", base_video_name, 0)
+        inpaint_mask_threshold, inpaint_mask_morph, inpaint_mask_dilate, inpaint_mask_blur = self._resolve_mask_processing_params(
+            threshold_raw=self.inpaint_mask_initial_threshold_var.get(),
+            morph_kernel_raw=self.inpaint_mask_morph_kernel_size_var.get(),
+            dilate_kernel_raw=self.inpaint_mask_dilate_kernel_size_var.get(),
+            blur_kernel_raw=self.inpaint_mask_blur_kernel_size_var.get(),
+            context_label="inpaint_mask",
+        )
+        blend_mask_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = self._resolve_mask_processing_params(
+            threshold_raw=self.mask_initial_threshold_var.get(),
+            morph_kernel_raw=self.mask_morph_kernel_size_var.get(),
+            dilate_kernel_raw=self.mask_dilate_kernel_size_var.get(),
+            blur_kernel_raw=self.mask_blur_kernel_size_var.get(),
+            context_label="blend_mask",
+        )
 
-        # --- Granular Mask Processing Steps (Direct Binarization Pipeline) ---
-
-       # 1. Binarization (Direct Thresholding)
-        try:
-            binarize_threshold = float(self.mask_initial_threshold_var.get())
-            if binarize_threshold != 0.0: # Step enabled if threshold is not 0
-                if not (0.0 <= binarize_threshold <= 1.0):
-                    logger.warning(f"Invalid binarize threshold ({binarize_threshold}). Using default 0.1.")
-                    binarize_threshold = 0.1
-                current_processed_mask = (current_processed_mask > binarize_threshold).float()
-                logger.debug(f"Mask: Binarized (threshold > {binarize_threshold}, min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "03_mask_binarized", base_video_name, 0)
-            else:
-                logger.debug("Mask: Binarization step skipped (threshold is 0). Using grayscale (might be unsuitable for subsequent steps).")
-        except ValueError:
-            logger.error(f"Invalid value for binarize threshold: {self.mask_initial_threshold_var.get()}. Falling back to 0.1.", exc_info=True)
-            current_processed_mask = (current_processed_mask > 0.1).float() # Fallback to default behavior if error
-
-        # 2. Morphological Closing
-        try:
-            morph_kernel_size = int(float(self.mask_morph_kernel_size_var.get()))
-            if morph_kernel_size != 0: # Step enabled if kernel size is not 0
-                current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
-                logger.debug(f"Mask: After morphological closing (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "04_mask_morph_closed", base_video_name, 0)
-            else:
-                logger.debug("Mask: Morphological closing step skipped (kernel size is 0).")
-        except ValueError:
-            logger.error(f"Invalid value for mask_morph_kernel_size: {self.mask_morph_kernel_size_var.get()}. Skipping morphological closing.", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error during morphological closing step: {e}. Skipping.", exc_info=True)
-
-        # 3. Mask Dilation
-        try:
-            dilate_kernel_size = int(self.mask_dilate_kernel_size_var.get())
-            if dilate_kernel_size != 0: # Step enabled if kernel size is not 0
-                current_processed_mask = self._apply_mask_dilation(current_processed_mask, dilate_kernel_size)
-                logger.debug(f"Mask: After dilation (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "05_mask_dilated", base_video_name, 0)
-            else:
-                logger.debug("Mask: Dilation step skipped (kernel size is 0).")
-        except ValueError:
-            logger.error(f"Invalid value for mask_dilate_kernel_size: {self.mask_dilate_kernel_size_var.get()}. Skipping dilation.", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error during mask dilation step: {e}. Skipping.", exc_info=True)
-
-        # 4. Mask Gaussian Blur
-        try:
-            blur_kernel_size = int(self.mask_blur_kernel_size_var.get()) # NEW: Parse blur kernel size
-            if blur_kernel_size != 0: # Step enabled if kernel size is not 0
-                current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size) # NEW: Pass kernel size
-                logger.debug(f"Mask: After blur (min={current_processed_mask.min().item():.2f}, max={current_processed_mask.max().item():.2f})")
-                self._save_debug_image(current_processed_mask, "06_mask_final_blurred", base_video_name, 0)
-            else:
-                logger.debug("Mask: Gaussian blur step skipped (kernel size is 0).")
-        except ValueError:
-            logger.error(f"Invalid value for mask_blur_kernel_size: {self.mask_blur_kernel_size_var.get()}. Skipping blur.", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error during mask blur step: {e}. Skipping.", exc_info=True)
-        # --- END NEW Granular Mask Processing Steps ---
+        inpaint_processed_mask = self._process_mask_frames(
+            frames_mask_raw=frames_mask_raw,
+            threshold=inpaint_mask_threshold,
+            morph_kernel_size=inpaint_mask_morph,
+            dilate_kernel_size=inpaint_mask_dilate,
+            blur_kernel_size=inpaint_mask_blur,
+            base_video_name=base_video_name,
+            debug_prefix="inpaint_mask",
+            save_debug=self.debug_mode_var.get(),
+        )
+        blend_processed_mask = self._process_mask_frames(
+            frames_mask_raw=frames_mask_raw,
+            threshold=blend_mask_threshold,
+            morph_kernel_size=blend_mask_morph,
+            dilate_kernel_size=blend_mask_dilate,
+            blur_kernel_size=blend_mask_blur,
+            base_video_name=base_video_name,
+            debug_prefix="blend_mask",
+            save_debug=self.debug_mode_var.get(),
+        )
 
         # --- Store original-length, unpadded versions for post-blending ---
         frames_warpped_original_unpadded_normalized = frames_warpped_normalized[:num_frames_original].clone()
-        frames_mask_processed_unpadded_original_length = current_processed_mask[:num_frames_original].clone()
+        frames_blend_mask_processed_unpadded_original_length = blend_processed_mask[:num_frames_original].clone()
 
         # --- Pad for Tiling (for pipeline input) ---
         frames_warpped_padded = pad_for_tiling(frames_warpped_normalized, tile_num, tile_overlap=(128, 128))
-        frames_mask_padded = pad_for_tiling(current_processed_mask, tile_num, tile_overlap=(128, 128))
+        frames_inpaint_mask_padded = pad_for_tiling(inpaint_processed_mask, tile_num, tile_overlap=(128, 128))
         
         padded_H, padded_W = frames_warpped_padded.shape[2], frames_warpped_padded.shape[3]
 
@@ -1609,9 +1773,9 @@ class InpaintingGUI(ThemedTk):
             display_frames_info = f"{actual_frames_to_process_count} (out of {total_frames_in_video})" if process_length != -1 else str(total_frames_in_video)
             self.after(0, lambda: update_info_callback(base_video_name, f"{output_display_w}x{output_display_h}", display_frames_info, overlap, original_input_blend_strength))
 
-        return (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+        return (frames_warpped_padded, frames_inpaint_mask_padded, frames_left_original_cropped,
                 num_frames_original, padded_H, padded_W, video_stream_info, fps,
-                frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length)
+                frames_warpped_original_unpadded_normalized, frames_blend_mask_processed_unpadded_original_length)
         # This function primarily affects the GUI state.
         logger.debug(f"Blend parameters state set to: {state}")
     
@@ -1745,6 +1909,11 @@ class InpaintingGUI(ThemedTk):
         """Callback for the Enable Color Transfer checkbox. Saves config."""
         self.save_config() # Simply save the config to persist the checkbox state
         logger.debug(f"Color Transfer state changed to: {self.enable_color_transfer.get()}")
+
+    def _toggle_keep_inpaint_cache_state(self):
+        """Callback for cache-retention checkbox."""
+        self.save_config()
+        logger.debug(f"Keep inpaint cache state changed to: {self.keep_inpaint_cache_var.get()}")
     
     def _toggle_debug_mode(self):
         """Toggles debug mode on/off and updates logging."""
@@ -1876,7 +2045,38 @@ class InpaintingGUI(ThemedTk):
         Tooltip(offload_label, self.help_data.get("offload_type", ""))
         offload_options = ["model", "sequential", "none"]
         ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
-        # current_row += 1 # No need to increment here, param_frame is done
+        current_row += 1
+
+        # Row 4: Inpaint Mask Threshold (Left) & Inpaint Mask Dilation (Right)
+        inpaint_bin_thresh_label = ttk.Label(param_frame, text="Inpaint Mask Thresh:")
+        inpaint_bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_bin_thresh_label, self.help_data.get("inpaint_mask_initial_threshold", ""))
+        ttk.Entry(param_frame, textvariable=self.inpaint_mask_initial_threshold_var, width=10).grid(
+            row=current_row, column=1, sticky="w", padx=5
+        )
+
+        inpaint_dilate_kernel_label = ttk.Label(param_frame, text="Inpaint Dilate Kernel:")
+        inpaint_dilate_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_dilate_kernel_label, self.help_data.get("inpaint_mask_dilate_kernel_size", ""))
+        ttk.Entry(param_frame, textvariable=self.inpaint_mask_dilate_kernel_size_var, width=10).grid(
+            row=current_row, column=3, sticky="w", padx=5
+        )
+        current_row += 1
+
+        # Row 5: Inpaint Morph Close (Left) & Inpaint Blur Kernel (Right)
+        inpaint_morph_kernel_label = ttk.Label(param_frame, text="Inpaint Morph Close:")
+        inpaint_morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_morph_kernel_label, self.help_data.get("inpaint_mask_morph_kernel_size", ""))
+        ttk.Entry(param_frame, textvariable=self.inpaint_mask_morph_kernel_size_var, width=10).grid(
+            row=current_row, column=1, sticky="w", padx=5
+        )
+
+        inpaint_blur_kernel_label = ttk.Label(param_frame, text="Inpaint Blur Kernel:")
+        inpaint_blur_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_blur_kernel_label, self.help_data.get("inpaint_mask_blur_kernel_size", ""))
+        ttk.Entry(param_frame, textvariable=self.inpaint_mask_blur_kernel_size_var, width=10).grid(
+            row=current_row, column=3, sticky="w", padx=5
+        )
 
 
         # --- POST-PROCESSING FRAME ---
@@ -1905,7 +2105,34 @@ class InpaintingGUI(ThemedTk):
         Tooltip(color_transfer_check, self.help_data.get("enable_color_transfer", ""))
         current_row += 1
 
-        # Row 1: Mask Binarization Threshold (Left) & Morphological Closing Kernel Size (Right)
+        keep_cache_check = ttk.Checkbutton(
+            post_process_frame,
+            text="Keep Inpaint Cache For Re-Merge",
+            variable=self.keep_inpaint_cache_var,
+            command=self._toggle_keep_inpaint_cache_state,
+        )
+        keep_cache_check.grid(row=current_row, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+        Tooltip(keep_cache_check, self.help_data.get("keep_inpaint_cache", ""))
+        current_row += 1
+
+        # Row 1: Blend Mask Source
+        blend_mask_source_label = ttk.Label(post_process_frame, text="Blend Mask Source:")
+        blend_mask_source_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(blend_mask_source_label, self.help_data.get("blend_mask_source", ""))
+        blend_mask_source_menu = ttk.OptionMenu(
+            post_process_frame,
+            self.blend_mask_source_var,
+            self.blend_mask_source_var.get(),
+            "hybrid",
+            "hires",
+            "lowres",
+            command=lambda *_: self.save_config(),
+        )
+        blend_mask_source_menu.grid(row=current_row, column=1, sticky="w", padx=5)
+        self.mask_param_widgets.append(blend_mask_source_menu)
+        current_row += 1
+
+        # Row 2: Blend Mask Binarization Threshold (Left) & Blend Mask Dilation (Right)
         bin_thresh_label = ttk.Label(post_process_frame, text="Mask Binarize Thresh:")
         bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(bin_thresh_label, self.help_data.get("mask_initial_threshold", ""))
@@ -1921,7 +2148,7 @@ class InpaintingGUI(ThemedTk):
         self.mask_param_widgets.append(dilate_kernel_entry) # Store reference
         current_row += 1
 
-        # Row 2: Mask Dilation Kernel (Left) & Mask Blur Kernel Size (Right)
+        # Row 3: Blend Morph Close (Left) & Blend Blur Kernel (Right)
         morph_kernel_label = ttk.Label(post_process_frame, text="Morph Close Kernel:")
         morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(morph_kernel_label, self.help_data.get("mask_morph_kernel_size", ""))
@@ -2045,9 +2272,19 @@ class InpaintingGUI(ThemedTk):
             process_length=process_length,
         )
         resume_checkpoint = self._load_prefinalize_checkpoint(checkpoint_path, resume_signature)
+        inpaint_mask_threshold_for_pipeline, _, _, _ = self._resolve_mask_processing_params(
+            threshold_raw=self.inpaint_mask_initial_threshold_var.get(),
+            morph_kernel_raw=self.inpaint_mask_morph_kernel_size_var.get(),
+            dilate_kernel_raw=self.inpaint_mask_dilate_kernel_size_var.get(),
+            blur_kernel_raw=self.inpaint_mask_blur_kernel_size_var.get(),
+            context_label="inpaint_mask_pipeline",
+        )
+        pipeline_mask_binarize_threshold = (
+            None if inpaint_mask_threshold_for_pipeline == 0.0 else inpaint_mask_threshold_for_pipeline
+        )
 
         frames_output_final: torch.Tensor
-        frames_mask_processed_unpadded_original_length: torch.Tensor
+        frames_blend_mask_processed_unpadded_original_length: torch.Tensor
         frames_warpped_original_unpadded_normalized: torch.Tensor
         frames_left_original_cropped: Optional[torch.Tensor]
         video_stream_info: Optional[dict]
@@ -2056,7 +2293,7 @@ class InpaintingGUI(ThemedTk):
         if resume_checkpoint is not None:
             logger.info(f"Resuming {base_video_name} from checkpoint: {checkpoint_path}")
             frames_output_final = resume_checkpoint["frames_output_final"]
-            frames_mask_processed_unpadded_original_length = resume_checkpoint["frames_mask_processed"]
+            frames_blend_mask_processed_unpadded_original_length = resume_checkpoint["frames_mask_processed"]
             frames_warpped_original_unpadded_normalized = resume_checkpoint["frames_warped_original"]
             frames_left_original_cropped = resume_checkpoint.get("frames_left_original")
             video_stream_info = resume_checkpoint["video_stream_info"]
@@ -2078,6 +2315,52 @@ class InpaintingGUI(ThemedTk):
                 extra={"checkpoint_path": checkpoint_path},
                 level=logging.INFO,
             )
+            # Recompute blend mask using current blend parameters so blend-only sweeps can reuse cached inpaint frames.
+            try:
+                recomputed_inputs = self._prepare_video_inputs(
+                    input_video_path=input_video_path,
+                    base_video_name=base_video_name,
+                    is_dual_input=is_dual_input,
+                    frames_chunk=frames_chunk,
+                    tile_num=tile_num,
+                    update_info_callback=None,
+                    overlap=overlap,
+                    original_input_blend_strength=original_input_blend_strength,
+                    process_length=process_length,
+                )
+                if recomputed_inputs is not None:
+                    (
+                        tmp_frames_warped_padded,
+                        tmp_frames_inpaint_mask_padded,
+                        tmp_frames_left_original_cropped,
+                        _tmp_num_frames_original,
+                        _tmp_padded_H,
+                        _tmp_padded_W,
+                        _tmp_video_stream_info,
+                        _tmp_fps,
+                        tmp_frames_warped_original_unpadded_normalized,
+                        recomputed_blend_mask,
+                    ) = recomputed_inputs
+                    if recomputed_blend_mask.shape == frames_blend_mask_processed_unpadded_original_length.shape:
+                        frames_blend_mask_processed_unpadded_original_length = recomputed_blend_mask
+                        logger.info("Recomputed blend mask using current blend settings.")
+                    else:
+                        logger.warning(
+                            "Recomputed blend mask shape mismatch; using cached blend mask from checkpoint."
+                        )
+
+                    del (
+                        tmp_frames_warped_padded,
+                        tmp_frames_inpaint_mask_padded,
+                        tmp_frames_left_original_cropped,
+                        tmp_frames_warped_original_unpadded_normalized,
+                    )
+                    release_cuda_memory()
+                    gc.collect()
+                else:
+                    logger.warning("Blend mask recomputation failed; using cached blend mask from checkpoint.")
+            except Exception as e:
+                logger.warning(f"Blend mask recomputation failed with exception; using cached blend mask: {e}")
             self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
         else:
             # 2. INPUT PREPARATION (Low-Res)
@@ -2097,9 +2380,9 @@ class InpaintingGUI(ThemedTk):
                 return False, None # Preparation failed
             
             # Unpack, ensuring all torch.Tensor return values are not None
-            (frames_warpped_padded, frames_mask_padded, frames_left_original_cropped,
+            (frames_warpped_padded, frames_inpaint_mask_padded, frames_left_original_cropped,
             num_frames_original, padded_H, padded_W, video_stream_info, fps,
-            frames_warpped_original_unpadded_normalized, frames_mask_processed_unpadded_original_length) = prepared_inputs
+            frames_warpped_original_unpadded_normalized, frames_blend_mask_processed_unpadded_original_length) = prepared_inputs
 
             # 3. INPAINTING CHUNKS (The main loop)
             total_frames_to_process_actual = num_frames_original        
@@ -2139,7 +2422,7 @@ class InpaintingGUI(ThemedTk):
 
                 # --- CHUNK SLICING AND PADDING LOGIC ---
                 original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
-                mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
+                mask_frames_slice = frames_inpaint_mask_padded[i:end_idx_for_slicing].clone()
                 
                 padding_needed_for_pipeline_input = 0
                 # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
@@ -2155,7 +2438,7 @@ class InpaintingGUI(ThemedTk):
                 if padding_needed_for_pipeline_input > 0:
                     logger.debug(f"Dynamically padding input for chunk starting at frame {i}: {actual_sliced_length} frames sliced, {padding_needed_for_pipeline_input} frames needed.")
                     last_original_frame_warpped = frames_warpped_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
-                    last_original_frame_mask = frames_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
+                    last_original_frame_mask = frames_inpaint_mask_padded[total_frames_to_process_actual - 1].unsqueeze(0).clone()
                     repeated_warpped = last_original_frame_warpped.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
                     repeated_mask = last_original_frame_mask.repeat(padding_needed_for_pipeline_input, 1, 1, 1)
                     input_frames_to_pipeline = torch.cat([original_input_frames_slice, repeated_warpped], dim=0)
@@ -2190,6 +2473,7 @@ class InpaintingGUI(ThemedTk):
                         cond_frames=input_frames_to_pipeline, mask_frames=mask_frames_i, process_func=pipeline, tile_num=tile_num,
                         spatial_n_compress=8, min_guidance_scale=1.01, max_guidance_scale=1.01, decode_chunk_size=2,
                         fps=7, motion_bucket_id=127, noise_aug_strength=0.0, num_inference_steps=num_inference_steps,
+                        mask_binarize_threshold=pipeline_mask_binarize_threshold,
                     )
                     video_latents = video_latents.unsqueeze(0)
                     pipeline.vae.to(dtype=torch.float16)
@@ -2246,7 +2530,7 @@ class InpaintingGUI(ThemedTk):
                 checkpoint_path=checkpoint_path,
                 signature=resume_signature,
                 frames_output_final=frames_output_final,
-                frames_mask_processed=frames_mask_processed_unpadded_original_length,
+                frames_mask_processed=frames_blend_mask_processed_unpadded_original_length,
                 frames_warped_original=frames_warpped_original_unpadded_normalized,
                 frames_left_original=frames_left_original_cropped,
                 fps=fps,
@@ -2257,7 +2541,7 @@ class InpaintingGUI(ThemedTk):
         # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         final_output_frames_for_encoding = self._finalize_output_frames(
             inpainted_frames=frames_output_final,
-            mask_frames=frames_mask_processed_unpadded_original_length,
+            mask_frames=frames_blend_mask_processed_unpadded_original_length,
             original_warped_frames=frames_warpped_original_unpadded_normalized,
             original_left_frames=frames_left_original_cropped,
             hires_data=hires_data,
@@ -2326,7 +2610,11 @@ class InpaintingGUI(ThemedTk):
             shutil.rmtree(temp_png_dir, ignore_errors=True)
             return False, None
 
-        self._cleanup_all_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
+        self._cleanup_all_checkpoints(
+            base_video_name,
+            checkpoint_path=checkpoint_path,
+            keep_prefinalize=self.keep_inpaint_cache_var.get(),
+        )
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
         return True, hires_video_path
 
@@ -2363,10 +2651,17 @@ class InpaintingGUI(ThemedTk):
         self.original_input_blend_strength_var.set("0.5")
         self.offload_type_var.set("model")
 
+        self.inpaint_mask_initial_threshold_var.set("0.3")
+        self.inpaint_mask_morph_kernel_size_var.set("0.0")
+        self.inpaint_mask_dilate_kernel_size_var.set("5")
+        self.inpaint_mask_blur_kernel_size_var.set("7")
+
         self.mask_initial_threshold_var.set("0.3")
         self.mask_morph_kernel_size_var.set("0.0")
         self.mask_dilate_kernel_size_var.set("5")
         self.mask_blur_kernel_size_var.set("7")
+        self.blend_mask_source_var.set("hybrid")
+        self.keep_inpaint_cache_var.set(False)
 
         self.enable_post_inpainting_blend.set(False) # Default state is OFF
         self.enable_color_transfer.set(True) # Default state is ON
