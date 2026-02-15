@@ -841,29 +841,46 @@ class InpaintingGUI(ThemedTk):
             except OSError:
                 pass
 
-    def _cleanup_chunk_checkpoints(self, base_video_name: str):
+    def _cleanup_chunk_checkpoints(self, base_video_name: str, checkpoint_path: Optional[str] = None):
         """Removes per-chunk checkpoints once a full pre-finalize checkpoint exists."""
-        output_dir = self.output_folder_var.get().strip() or "."
-        resume_dir = os.path.join(output_dir, "_inpaint_resume")
-        video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
+        if checkpoint_path:
+            resume_dir = os.path.dirname(checkpoint_path)
+            video_stem = os.path.basename(checkpoint_path)
+            if video_stem.endswith(".prefinalize.pt"):
+                video_stem = video_stem[:-len(".prefinalize.pt")]
+            else:
+                video_stem = os.path.splitext(video_stem)[0]
+        else:
+            output_dir = self.output_folder_var.get().strip() or "."
+            resume_dir = os.path.join(output_dir, "_inpaint_resume")
+            video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
+
         chunk_glob = os.path.join(resume_dir, f"{video_stem}.chunk_*.pt")
+        removed = 0
         for chunk_path in glob.glob(chunk_glob):
             try:
                 os.remove(chunk_path)
-            except OSError:
-                logger.debug(f"Failed to remove chunk checkpoint: {chunk_path}")
+                removed += 1
+            except OSError as e:
+                logger.warning(f"Failed to remove chunk checkpoint {chunk_path}: {e}")
+        if removed > 0:
+            logger.info(f"Removed {removed} chunk checkpoint(s) for {video_stem}.")
 
-    def _cleanup_all_checkpoints(self, base_video_name: str):
+    def _cleanup_all_checkpoints(self, base_video_name: str, checkpoint_path: Optional[str] = None):
         """Removes all resume checkpoints for a video after successful completion."""
-        self._cleanup_chunk_checkpoints(base_video_name)
+        prefinalize_path = checkpoint_path or self._get_prefinalize_checkpoint_path(base_video_name)
+        self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=prefinalize_path)
 
-        prefinalize_path = self._get_prefinalize_checkpoint_path(base_video_name)
+        removed_prefinalize = 0
         for path in (prefinalize_path, f"{prefinalize_path}.tmp"):
             if os.path.exists(path):
                 try:
                     os.remove(path)
-                except OSError:
-                    logger.debug(f"Failed to remove pre-finalize checkpoint: {path}")
+                    removed_prefinalize += 1
+                except OSError as e:
+                    logger.warning(f"Failed to remove pre-finalize checkpoint {path}: {e}")
+        if removed_prefinalize > 0:
+            logger.info(f"Removed pre-finalize checkpoint for {os.path.basename(prefinalize_path)}.")
     
     def _finalize_output_frames(
         self,
@@ -2061,7 +2078,7 @@ class InpaintingGUI(ThemedTk):
                 extra={"checkpoint_path": checkpoint_path},
                 level=logging.INFO,
             )
-            self._cleanup_chunk_checkpoints(base_video_name)
+            self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
         else:
             # 2. INPUT PREPARATION (Low-Res)
             prepared_inputs = self._prepare_video_inputs(
@@ -2235,7 +2252,7 @@ class InpaintingGUI(ThemedTk):
                 fps=fps,
                 video_stream_info=video_stream_info,
             )
-            self._cleanup_chunk_checkpoints(base_video_name)
+            self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
         
         # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         final_output_frames_for_encoding = self._finalize_output_frames(
@@ -2309,7 +2326,7 @@ class InpaintingGUI(ThemedTk):
             shutil.rmtree(temp_png_dir, ignore_errors=True)
             return False, None
 
-        self._cleanup_all_checkpoints(base_video_name)
+        self._cleanup_all_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
         logger.info(f"Done processing {input_video_path} -> {output_video_path}")
         return True, hires_video_path
 
