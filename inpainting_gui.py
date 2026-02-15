@@ -764,6 +764,94 @@ class InpaintingGUI(ThemedTk):
                     os.remove(tmp_path)
             except OSError:
                 pass
+
+    def _get_chunk_checkpoint_path(self, base_video_name: str, chunk_start_idx: int) -> str:
+        """Returns per-chunk checkpoint path used for mid-inference resume."""
+        output_dir = self.output_folder_var.get().strip() or "."
+        resume_dir = os.path.join(output_dir, "_inpaint_resume")
+        os.makedirs(resume_dir, exist_ok=True)
+        video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
+        return os.path.join(resume_dir, f"{video_stem}.chunk_{chunk_start_idx:06d}.pt")
+
+    def _load_chunk_checkpoint(
+        self,
+        checkpoint_path: str,
+        expected_signature: dict,
+        chunk_start_idx: int,
+        expected_append_length: int,
+    ) -> Optional[dict]:
+        """Loads a chunk checkpoint if signature/shape are valid."""
+        if not os.path.exists(checkpoint_path):
+            return None
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as e:
+            logger.warning(f"Failed to load chunk checkpoint {checkpoint_path}: {e}")
+            return None
+
+        if checkpoint.get("signature") != expected_signature:
+            logger.info(f"Chunk checkpoint ignored (signature mismatch): {checkpoint_path}")
+            return None
+
+        if checkpoint.get("chunk_start_idx") != int(chunk_start_idx):
+            logger.info(f"Chunk checkpoint ignored (index mismatch): {checkpoint_path}")
+            return None
+
+        current_chunk_generated = checkpoint.get("current_chunk_generated")
+        append_frames = checkpoint.get("append_frames")
+        if current_chunk_generated is None or append_frames is None:
+            logger.warning(f"Chunk checkpoint missing tensor payloads: {checkpoint_path}")
+            return None
+
+        if append_frames.shape[0] != expected_append_length:
+            logger.info(
+                f"Chunk checkpoint ignored (append length mismatch {append_frames.shape[0]} vs {expected_append_length}): "
+                f"{checkpoint_path}"
+            )
+            return None
+
+        return checkpoint
+
+    def _save_chunk_checkpoint(
+        self,
+        checkpoint_path: str,
+        signature: dict,
+        chunk_start_idx: int,
+        current_chunk_generated: torch.Tensor,
+        append_frames: torch.Tensor,
+    ):
+        """Saves a completed inference chunk for crash-safe resume."""
+        payload = {
+            "signature": signature,
+            "chunk_start_idx": int(chunk_start_idx),
+            "current_chunk_generated": current_chunk_generated.detach().cpu(),
+            "append_frames": append_frames.detach().cpu(),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp_path = f"{checkpoint_path}.tmp"
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, checkpoint_path)
+            logger.debug(f"Saved chunk checkpoint: {checkpoint_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save chunk checkpoint {checkpoint_path}: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _cleanup_chunk_checkpoints(self, base_video_name: str):
+        """Removes per-chunk checkpoints once a full pre-finalize checkpoint exists."""
+        output_dir = self.output_folder_var.get().strip() or "."
+        resume_dir = os.path.join(output_dir, "_inpaint_resume")
+        video_stem = os.path.splitext(os.path.basename(base_video_name))[0]
+        chunk_glob = os.path.join(resume_dir, f"{video_stem}.chunk_*.pt")
+        for chunk_path in glob.glob(chunk_glob):
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                logger.debug(f"Failed to remove chunk checkpoint: {chunk_path}")
     
     def _finalize_output_frames(
         self,
@@ -1961,6 +2049,7 @@ class InpaintingGUI(ThemedTk):
                 extra={"checkpoint_path": checkpoint_path},
                 level=logging.INFO,
             )
+            self._cleanup_chunk_checkpoints(base_video_name)
         else:
             # 2. INPUT PREPARATION (Low-Res)
             prepared_inputs = self._prepare_video_inputs(
@@ -1993,12 +2082,9 @@ class InpaintingGUI(ThemedTk):
                 if stop_event and stop_event.is_set():
                     logger.info(f"Stopping processing of {input_video_path}")
                     return False, None
-                
-                # --- CHUNK SLICING AND PADDING LOGIC (Remains from your last correct version) ---
+
                 end_idx_for_slicing = min(i + frames_chunk, total_frames_to_process_actual)
-                original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
-                mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
-                actual_sliced_length = original_input_frames_slice.shape[0]
+                actual_sliced_length = end_idx_for_slicing - i
 
                 # Skip useless tail chunks that would contribute no new frames (only overlap)
                 if i > 0 and overlap > 0 and actual_sliced_length <= overlap:
@@ -2007,6 +2093,24 @@ class InpaintingGUI(ThemedTk):
                         f"because it contributes no new frames (overlap={overlap})."
                     )
                     break
+
+                expected_append_length = actual_sliced_length if i == 0 else max(0, actual_sliced_length - overlap)
+                chunk_checkpoint_path = self._get_chunk_checkpoint_path(base_video_name, i)
+                cached_chunk = self._load_chunk_checkpoint(
+                    checkpoint_path=chunk_checkpoint_path,
+                    expected_signature=resume_signature,
+                    chunk_start_idx=i,
+                    expected_append_length=expected_append_length,
+                )
+                if cached_chunk is not None:
+                    results.append(cached_chunk["append_frames"])
+                    previous_chunk_output_frames = cached_chunk["current_chunk_generated"]
+                    logger.info(f"Reused cached inference chunk {i}-{end_idx_for_slicing} from {chunk_checkpoint_path}")
+                    continue
+
+                # --- CHUNK SLICING AND PADDING LOGIC ---
+                original_input_frames_slice = frames_warpped_padded[i:end_idx_for_slicing].clone()
+                mask_frames_slice = frames_mask_padded[i:end_idx_for_slicing].clone()
                 
                 padding_needed_for_pipeline_input = 0
                 # Overlap-aware tail padding: ensure at least (overlap + 3) frames (and at least 6 total) for pipeline stability
@@ -2074,9 +2178,18 @@ class InpaintingGUI(ThemedTk):
 
                 # Append only the "new" frames
                 if i == 0:
-                    results.append(current_chunk_generated[:actual_sliced_length])
+                    append_chunk = current_chunk_generated[:actual_sliced_length].clone()
                 else:
-                    results.append(current_chunk_generated[overlap:actual_sliced_length])
+                    append_chunk = current_chunk_generated[overlap:actual_sliced_length].clone()
+                results.append(append_chunk)
+
+                self._save_chunk_checkpoint(
+                    checkpoint_path=chunk_checkpoint_path,
+                    signature=resume_signature,
+                    chunk_start_idx=i,
+                    current_chunk_generated=current_chunk_generated,
+                    append_frames=append_chunk,
+                )
                 
                 previous_chunk_output_frames = current_chunk_generated
             # --- END INPAINTING CHUNKS ---
@@ -2110,6 +2223,7 @@ class InpaintingGUI(ThemedTk):
                 fps=fps,
                 video_stream_info=video_stream_info,
             )
+            self._cleanup_chunk_checkpoints(base_video_name)
         
         # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
         final_output_frames_for_encoding = self._finalize_output_frames(
