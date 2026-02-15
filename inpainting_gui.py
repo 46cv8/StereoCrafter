@@ -326,20 +326,30 @@ class InpaintingGUI(ThemedTk):
             return inpainted_frames
 
         try:
-            # Ensure tensors are on CPU for blending if not already (they should be after previous steps)
+            # Keep everything on CPU and blend in place frame-by-frame to avoid a full-size temporary tensor.
             inpainted_frames_cpu = inpainted_frames.cpu()
             original_warped_frames_cpu = original_warped_frames.cpu()
             mask_cpu = mask.cpu()
 
-            # Ensure mask is single channel for broadcasting if needed (though it should be [T, 1, H, W])
             if mask_cpu.shape[1] != 1:
                 logger.warning(f"Mask has {mask_cpu.shape[1]} channels for blending, expecting 1. Using mean for blending if necessary.")
                 mask_blend = mask_cpu.mean(dim=1, keepdim=True)
             else:
                 mask_blend = mask_cpu
-            
-            # Blend: original content where mask is 0, inpainted content where mask is 1, smooth blend in between
-            blended_frames = original_warped_frames_cpu * (1 - mask_blend) + inpainted_frames_cpu * mask_blend
+
+            debug_count = min(5, inpainted_frames_cpu.shape[0]) if self.debug_mode_var.get() else 0
+            debug_original_samples = []
+            debug_inpainted_samples = []
+            if debug_count > 0:
+                for t in range(debug_count):
+                    debug_original_samples.append(original_warped_frames_cpu[t].clone())
+                    debug_inpainted_samples.append(inpainted_frames_cpu[t].clone())
+
+            for t in range(inpainted_frames_cpu.shape[0]):
+                frame_mask = mask_blend[t]
+                frame_mask_inv = 1.0 - frame_mask
+                inpainted_frames_cpu[t].mul_(frame_mask)
+                inpainted_frames_cpu[t].add_(original_warped_frames_cpu[t] * frame_mask_inv)
             
             logger.debug("Applied post-inpainting blending.")
 
@@ -350,11 +360,11 @@ class InpaintingGUI(ThemedTk):
                 # MODIFIED: Use base_video_name directly
                 video_basename_for_debug_blend = os.path.splitext(base_video_name)[0] 
 
-                for t in range(min(5, inpainted_frames_cpu.shape[0])):
-                    original_warped_img = (original_warped_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    inpainted_img = (inpainted_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                for t in range(debug_count):
+                    original_warped_img = (debug_original_samples[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    inpainted_img = (debug_inpainted_samples[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                     mask_img = (mask_blend[t].squeeze(0).numpy() * 255).astype(np.uint8)
-                    blended_img = (blended_frames[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    blended_img = (inpainted_frames_cpu[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
                     cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_original_warped.png"), cv2.cvtColor(original_warped_img, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(os.path.join(debug_output_dir, f"{video_basename_for_debug_blend}_frame_{t:04d}_inpainted.png"), cv2.cvtColor(inpainted_img, cv2.COLOR_RGB2BGR))
@@ -363,7 +373,7 @@ class InpaintingGUI(ThemedTk):
                 logger.debug(f"Saved debug blend frames to {debug_output_dir}")
             # --- END MODIFIED TEMPORARY DEBUG CODE ---
 
-            return blended_frames
+            return inpainted_frames_cpu
         except Exception as e:
             logger.error(f"Error during post-inpainting blending: {e}. Returning original inpainted frames.", exc_info=True)
             return inpainted_frames
@@ -529,66 +539,94 @@ class InpaintingGUI(ThemedTk):
 
             logger.info(f"Starting Hi-Res Blending at {hires_W}x{hires_H}...")
 
-            # --- NEW: CHUNKED HI-RES PROCESSING ---
             hires_reader = VideoReader(hires_video_path, ctx=cpu(0))
-            chunk_size = int(self.frames_chunk_var.get())
-            
-            final_hires_output_chunks = []
-            final_hires_left_chunks = []
+            chunk_size = max(1, int(self.frames_chunk_var.get()))
+
+            lowres_inpainted = frames_output_final
+            lowres_mask = frames_mask_processed
+
+            frames_output_hires = torch.empty(
+                (num_frames_original, lowres_inpainted.shape[1], hires_H, hires_W),
+                dtype=lowres_inpainted.dtype,
+                device=lowres_inpainted.device,
+            )
+            frames_mask_hires = torch.empty(
+                (num_frames_original, lowres_mask.shape[1], hires_H, hires_W),
+                dtype=lowres_mask.dtype,
+                device=lowres_mask.device,
+            )
+            frames_warped_hires = torch.empty(
+                (
+                    num_frames_original,
+                    frames_warpped_original_unpadded_normalized.shape[1],
+                    hires_H,
+                    hires_W,
+                ),
+                dtype=frames_warpped_original_unpadded_normalized.dtype,
+                device=frames_warpped_original_unpadded_normalized.device,
+            )
+            frames_left_hires = None
+            if not is_dual_input:
+                if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
+                    logger.error(f"Hi-Res blending needs left-eye frames for non-dual input {base_video_name}, but none were found.")
+                    return None
+                frames_left_hires = torch.empty(
+                    (num_frames_original, frames_left_original_cropped.shape[1], hires_H, hires_W),
+                    dtype=frames_left_original_cropped.dtype,
+                    device=frames_left_original_cropped.device,
+                )
 
             for i in range(0, num_frames_original, chunk_size):
                 start_idx, end_idx = i, min(i + chunk_size, num_frames_original)
                 frame_indices = list(range(start_idx, end_idx))
-                if not frame_indices: break
+                if not frame_indices:
+                    break
 
-                logger.debug(f"Processing Hi-Res chunk: frames {start_idx}-{end_idx}")
+                inpainted_chunk_hires = F.interpolate(
+                    lowres_inpainted[start_idx:end_idx],
+                    size=(hires_H, hires_W),
+                    mode="bicubic",
+                    align_corners=False,
+                )
+                mask_chunk_hires = F.interpolate(
+                    lowres_mask[start_idx:end_idx],
+                    size=(hires_H, hires_W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
-                # 1. Get chunks of low-res data
-                inpainted_chunk = frames_output_final[start_idx:end_idx]
-                mask_chunk = frames_mask_processed[start_idx:end_idx]
-
-                # 2. Upscale low-res chunks
-                inpainted_chunk_hires = F.interpolate(inpainted_chunk, size=(hires_H, hires_W), mode='bicubic', align_corners=False)
-                mask_chunk_hires = F.interpolate(mask_chunk, size=(hires_H, hires_W), mode='bilinear', align_corners=False)
-
-                # 3. Load corresponding hi-res chunk
                 hires_frames_np = hires_reader.get_batch(frame_indices).asnumpy()
                 hires_frames_torch = torch.from_numpy(hires_frames_np).permute(0, 3, 1, 2).float()
 
-                # 4. Split hi-res chunk and normalize
                 if is_dual_input:
                     half_w_hires = hires_frames_torch.shape[3] // 2
-                    hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:].float() / 255.0
-                    hires_left_chunk = None
-                else: # Quad input
-                    half_h_hires, half_w_hires = hires_frames_torch.shape[2] // 2, hires_frames_torch.shape[3] // 2
-                    hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires].float() / 255.0
-                    hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:].float() / 255.0
-                    final_hires_left_chunks.append(hires_left_chunk)
+                    hires_warped_chunk = hires_frames_torch[:, :, :, half_w_hires:] / 255.0
+                else:
+                    half_h_hires = hires_frames_torch.shape[2] // 2
+                    half_w_hires = hires_frames_torch.shape[3] // 2
+                    hires_left_chunk = hires_frames_torch[:, :, :half_h_hires, :half_w_hires] / 255.0
+                    hires_warped_chunk = hires_frames_torch[:, :, half_h_hires:, half_w_hires:] / 255.0
+                    if frames_left_hires is not None:
+                        frames_left_hires[start_idx:end_idx] = hires_left_chunk
+                    del hires_left_chunk
 
-                # 5. Store processed chunks
-                final_hires_output_chunks.append({
-                    "inpainted": inpainted_chunk_hires,
-                    "mask": mask_chunk_hires,
-                    "warped": hires_warped_chunk
-                })
+                frames_output_hires[start_idx:end_idx] = inpainted_chunk_hires
+                frames_mask_hires[start_idx:end_idx] = mask_chunk_hires
+                frames_warped_hires[start_idx:end_idx] = hires_warped_chunk
 
-            # 6. Concatenate all processed chunks back into single tensors
-            frames_output_final = torch.cat([d["inpainted"] for d in final_hires_output_chunks], dim=0)
-            frames_mask_processed = torch.cat([d["mask"] for d in final_hires_output_chunks], dim=0)
-            frames_warpped_original_unpadded_normalized = torch.cat([d["warped"] for d in final_hires_output_chunks], dim=0)
-            
+                del inpainted_chunk_hires, mask_chunk_hires, hires_frames_np, hires_frames_torch, hires_warped_chunk
+
+            frames_output_final = frames_output_hires
+            frames_mask_processed = frames_mask_hires
+            frames_warpped_original_unpadded_normalized = frames_warped_hires
             if not is_dual_input:
-                frames_left_original_cropped = torch.cat(final_hires_left_chunks, dim=0)
-            
-            # Save a debug image of the first hi-res warped chunk
-            if final_hires_output_chunks:
-                 self._save_debug_image(final_hires_output_chunks[0]["warped"], "07a_hires_warped_input", base_video_name, 0)
+                frames_left_original_cropped = frames_left_hires
 
-            del hires_reader, final_hires_output_chunks, final_hires_left_chunks
+            self._save_debug_image(frames_warpped_original_unpadded_normalized, "07a_hires_warped_input", base_video_name, 0)
+
+            del hires_reader, lowres_inpainted, lowres_mask
             release_cuda_memory()
             logger.info("Hi-Res chunk processing complete.")
-            # --- END CHUNKED HI-RES PROCESSING ---
 
         # The rest of the logic remains largely the same, but uses the now-guaranteed-to-be-set frames_output_final
         
@@ -630,7 +668,6 @@ class InpaintingGUI(ThemedTk):
             else:
                 logger.debug("Applying color transfer from reference view to inpainted right view...")
                 target_H, target_W = frames_output_final.shape[2], frames_output_final.shape[3]
-                adjusted_frames_output = []
                 for t in range(frames_output_final.shape[0]):
                     ref_frame_resized = F.interpolate(
                         reference_frames_for_transfer[t].unsqueeze(0),
@@ -639,9 +676,9 @@ class InpaintingGUI(ThemedTk):
                     ).squeeze(0).cpu()
                     target_frame_cpu = frames_output_final[t].cpu()
                     adjusted_frame = self._apply_color_transfer(ref_frame_resized, target_frame_cpu)
-                    adjusted_frames_output.append(adjusted_frame.to(frames_output_final.device))
+                    frames_output_final[t].copy_(adjusted_frame.to(frames_output_final.device))
                 
-                frames_output_final = torch.stack(adjusted_frames_output)
+                del reference_frames_for_transfer
                 self._save_debug_image(frames_output_final, "08_inpainted_color_transferred", base_video_name, 0)
                 logger.debug("Color transfer complete.")
         # --- END Apply Color Transfer ---
@@ -658,6 +695,9 @@ class InpaintingGUI(ThemedTk):
             )
             self._save_debug_image(frames_output_final, "09_final_blended_right_eye", base_video_name, 0)
             logger.debug("Post-inpainting blend complete.")
+
+        # These are no longer needed after optional post-blend and can be released before SBS concat.
+        del frames_mask_processed, frames_warpped_original_unpadded_normalized
 
         # --- Final Concatenation ---
         final_output_frames_for_encoding: Optional[torch.Tensor] = None
