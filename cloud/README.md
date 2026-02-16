@@ -9,6 +9,8 @@ No separate always-on API server is required.
 - `cloud/bootstrap_remote.sh`: prepares remote venv + dependencies
 - `cloud/run_depth_job.py`: remote headless job runner
 - `cloud/release_vast_image.py`: local helper to build/push image and print/run `vastai create instance`
+- `cloud/hf.env.example`: template for Hugging Face token env file
+- `cloud/ghcr.env.example`: template for GHCR login env file
 
 ## Prerequisites
 

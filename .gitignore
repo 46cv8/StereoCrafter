@@ -105,3 +105,4 @@ nul
 
 # Local cloud secrets
 cloud/hf.env
+cloud/ghcr.env

@@ -4,8 +4,9 @@
 Typical flow:
 1) Build Docker image using cloud/Dockerfile.vastai.
 2) Push the image to your registry.
-3) Read cloud/hf.env and generate --env payload for Vast.
-4) Print the exact `vastai create instance ...` command.
+3) (Optional) Login to GHCR via cloud/ghcr.env when pushing ghcr.io images.
+4) Read cloud/hf.env and generate --env payload for Vast.
+5) Print the exact `vastai create instance ...` command.
 """
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ def shell_join(parts: Iterable[str]) -> str:
     return " ".join(shlex.quote(p) for p in parts)
 
 
-def run(cmd: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess:
+def run(cmd: Sequence[str], *, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess:
     log("$ " + shell_join(cmd))
-    return subprocess.run(list(cmd), check=check)
+    return subprocess.run(list(cmd), check=check, text=True, input=input_text)
 
 
 def require_tool(name: str) -> None:
@@ -71,6 +72,39 @@ def load_env_payload(env_file: Path, no_env_file: bool) -> str:
         )
 
     return build_vast_env_arg(env_vars)
+
+
+def ghcr_registry_from_image(image: str) -> str:
+    # Example image: ghcr.io/user/repo:tag
+    return image.split("/", 1)[0].lower()
+
+
+def load_ghcr_credentials(ghcr_env_file: Path) -> tuple[str, str]:
+    env_vars: Dict[str, str] = parse_env_file(ghcr_env_file)
+    if not env_vars:
+        raise ReleaseError(f"No env vars found in {ghcr_env_file}")
+
+    username = (
+        env_vars.get("GHCR_USERNAME")
+        or env_vars.get("GHCR_USER")
+        or env_vars.get("GITHUB_USER")
+        or env_vars.get("GITHUB_USERNAME")
+    )
+    token = (
+        env_vars.get("GHCR_PAT")
+        or env_vars.get("GITHUB_PAT")
+        or env_vars.get("GH_PAT")
+    )
+
+    if not username:
+        raise ReleaseError(
+            f"{ghcr_env_file} must include GHCR_USERNAME (or GHCR_USER / GITHUB_USER)."
+        )
+    if not token:
+        raise ReleaseError(
+            f"{ghcr_env_file} must include GHCR_PAT (or GITHUB_PAT / GH_PAT)."
+        )
+    return username, token
 
 
 def build_docker_cmd(args: argparse.Namespace) -> List[str]:
@@ -129,6 +163,12 @@ def parser() -> argparse.ArgumentParser:
 
     p.add_argument("--env-file", default=str(Path("cloud") / "hf.env"))
     p.add_argument("--no-env-file", action="store_true", help="Do not pass --env to vastai.")
+    p.add_argument("--ghcr-env-file", default=str(Path("cloud") / "ghcr.env"))
+    p.add_argument(
+        "--skip-ghcr-login",
+        action="store_true",
+        help="Skip docker login to ghcr.io (use existing docker auth instead).",
+    )
 
     p.add_argument("--offer-id", default="<OFFER_ID>")
     p.add_argument("--disk", type=int, default=120)
@@ -151,6 +191,7 @@ def main() -> int:
 
     validate_image_ref(args.image)
     env_file = Path(args.env_file).expanduser().resolve()
+    ghcr_env_file = Path(args.ghcr_env_file).expanduser().resolve()
     dockerfile = Path(args.dockerfile).expanduser().resolve()
     context = Path(args.context).expanduser().resolve()
 
@@ -175,6 +216,13 @@ def main() -> int:
 
     if not args.skip_build:
         run(docker_build_cmd)
+
+    if not args.skip_push and ghcr_registry_from_image(args.image) == "ghcr.io" and not args.skip_ghcr_login:
+        username, token = load_ghcr_credentials(ghcr_env_file)
+        run(
+            ["docker", "login", "ghcr.io", "-u", username, "--password-stdin"],
+            input_text=token,
+        )
 
     if not args.skip_push:
         run(docker_push_cmd)

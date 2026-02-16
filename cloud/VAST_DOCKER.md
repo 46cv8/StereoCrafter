@@ -61,6 +61,23 @@ HF_TOKEN=hf_xxx...
 python cloud/envfile_to_vast_env.py --env-file cloud/hf.env
 ```
 
+## GHCR credentials (gitignored file)
+
+1. Copy template:
+
+```bash
+cp cloud/ghcr.env.example cloud/ghcr.env
+```
+
+2. Edit `cloud/ghcr.env`:
+
+```bash
+GHCR_USERNAME=46cv8
+GHCR_PAT=ghp_xxx...
+```
+
+3. `cloud/ghcr.env` is gitignored, so it stays local.
+
 ## Build and push
 
 From repo root:
@@ -90,13 +107,14 @@ python cloud/release_vast_image.py \
   --image ghcr.io/<your_user>/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
   --git-repo-url https://github.com/<your_user>/StereoCrafter.git \
   --git-branch 004_depthcrafter_on_cloud \
-  --env-file cloud/hf.env
+  --env-file cloud/hf.env \
+  --ghcr-env-file cloud/ghcr.env
 ```
 
 This will:
 
 1. Build using `cloud/Dockerfile.vastai`.
-2. Push your image.
+2. Login to GHCR (from `cloud/ghcr.env`) and push your image.
 3. Print the exact `vastai create instance ...` command with `--env` already populated from `cloud/hf.env`.
 
 To execute the create command directly, add:
