@@ -73,6 +73,14 @@ class InpaintingGUI(ThemedTk):
         self.inpaint_mask_initial_threshold_var = tk.StringVar(
             value=str(self.app_config.get("inpaint_mask_initial_threshold", self.app_config.get("mask_initial_threshold", 0.3)))
         )
+        self.inpaint_mask_post_threshold_var = tk.StringVar(
+            value=str(
+                self.app_config.get(
+                    "inpaint_mask_post_threshold",
+                    self.app_config.get("inpaint_mask_initial_threshold", self.app_config.get("mask_initial_threshold", 0.3)),
+                )
+            )
+        )
         self.inpaint_mask_morph_kernel_size_var = tk.StringVar(
             value=str(self.app_config.get("inpaint_mask_morph_kernel_size", self.app_config.get("mask_morph_kernel_size", 0.0)))
         )
@@ -84,6 +92,9 @@ class InpaintingGUI(ThemedTk):
         )
 
         self.mask_initial_threshold_var = tk.StringVar(value=str(self.app_config.get("mask_initial_threshold", 0.3)))
+        self.mask_post_threshold_var = tk.StringVar(
+            value=str(self.app_config.get("mask_post_threshold", self.app_config.get("mask_initial_threshold", 0.3)))
+        )
         self.mask_morph_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_morph_kernel_size", 0.0)))
         self.mask_dilate_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_dilate_kernel_size", 5)))        
         self.mask_blur_kernel_size_var = tk.StringVar(value=str(self.app_config.get("mask_blur_kernel_size", 10)))
@@ -322,21 +333,31 @@ class InpaintingGUI(ThemedTk):
 
     def _resolve_mask_processing_params(
         self,
-        threshold_raw: str,
+        pre_threshold_raw: str,
+        post_threshold_raw: str,
         morph_kernel_raw: str,
         dilate_kernel_raw: str,
         blur_kernel_raw: str,
         context_label: str,
-    ) -> Tuple[float, int, int, int]:
+    ) -> Tuple[float, float, int, int, int]:
         """Parses and validates mask processing params for inference/blend mask pipelines."""
         try:
-            threshold = float(threshold_raw)
-            if not (0.0 <= threshold <= 1.0):
-                logger.warning(f"{context_label}: invalid threshold {threshold}; using 0.1")
-                threshold = 0.1
+            pre_threshold = float(pre_threshold_raw)
+            if not (0.0 <= pre_threshold <= 1.0):
+                logger.warning(f"{context_label}: invalid pre-threshold {pre_threshold}; using 0.1")
+                pre_threshold = 0.1
         except ValueError:
-            logger.error(f"{context_label}: invalid threshold '{threshold_raw}'; using 0.1", exc_info=True)
-            threshold = 0.1
+            logger.error(f"{context_label}: invalid pre-threshold '{pre_threshold_raw}'; using 0.1", exc_info=True)
+            pre_threshold = 0.1
+
+        try:
+            post_threshold = float(post_threshold_raw)
+            if not (0.0 <= post_threshold <= 1.0):
+                logger.warning(f"{context_label}: invalid post-threshold {post_threshold}; using 0.1")
+                post_threshold = 0.1
+        except ValueError:
+            logger.error(f"{context_label}: invalid post-threshold '{post_threshold_raw}'; using 0.1", exc_info=True)
+            post_threshold = 0.1
 
         try:
             morph_kernel = int(float(morph_kernel_raw))
@@ -356,12 +377,13 @@ class InpaintingGUI(ThemedTk):
             logger.error(f"{context_label}: invalid blur kernel '{blur_kernel_raw}'; using 0", exc_info=True)
             blur_kernel = 0
 
-        return threshold, morph_kernel, dilate_kernel, blur_kernel
+        return pre_threshold, post_threshold, morph_kernel, dilate_kernel, blur_kernel
 
     def _process_mask_frames(
         self,
         frames_mask_raw: torch.Tensor,
-        threshold: float,
+        pre_threshold: float,
+        post_threshold: float,
         morph_kernel_size: int,
         dilate_kernel_size: int,
         blur_kernel_size: int,
@@ -407,10 +429,10 @@ class InpaintingGUI(ThemedTk):
         if save_debug and debug_prefix:
             self._save_debug_image(current_processed_mask, f"{debug_prefix}_02_mask_initial_grayscale", base_video_name, 0)
 
-        if threshold != 0.0:
-            current_processed_mask = (current_processed_mask > threshold).float()
+        if pre_threshold != 0.0:
+            current_processed_mask = (current_processed_mask > pre_threshold).float()
             if save_debug and debug_prefix:
-                self._save_debug_image(current_processed_mask, f"{debug_prefix}_03_mask_binarized", base_video_name, 0)
+                self._save_debug_image(current_processed_mask, f"{debug_prefix}_03_mask_pre_binarized", base_video_name, 0)
 
         if morph_kernel_size != 0:
             current_processed_mask = self._apply_morphological_closing(current_processed_mask, morph_kernel_size)
@@ -426,6 +448,11 @@ class InpaintingGUI(ThemedTk):
             current_processed_mask = self._apply_gaussian_blur(current_processed_mask, blur_kernel_size)
             if save_debug and debug_prefix:
                 self._save_debug_image(current_processed_mask, f"{debug_prefix}_06_mask_final_blurred", base_video_name, 0)
+
+        if post_threshold != 0.0:
+            current_processed_mask = (current_processed_mask > post_threshold).float()
+            if save_debug and debug_prefix:
+                self._save_debug_image(current_processed_mask, f"{debug_prefix}_07_mask_post_binarized", base_video_name, 0)
 
         return current_processed_mask
 
@@ -820,6 +847,7 @@ class InpaintingGUI(ThemedTk):
             "original_input_blend_strength": float(original_input_blend_strength),
             "process_length": int(process_length),
             "inpaint_mask_initial_threshold": self.inpaint_mask_initial_threshold_var.get(),
+            "inpaint_mask_post_threshold": self.inpaint_mask_post_threshold_var.get(),
             "inpaint_mask_morph_kernel_size": self.inpaint_mask_morph_kernel_size_var.get(),
             "inpaint_mask_dilate_kernel_size": self.inpaint_mask_dilate_kernel_size_var.get(),
             "inpaint_mask_blur_kernel_size": self.inpaint_mask_blur_kernel_size_var.get(),
@@ -1036,8 +1064,9 @@ class InpaintingGUI(ThemedTk):
         if blend_mask_source not in ("lowres", "hires", "hybrid"):
             logger.warning(f"Invalid blend_mask_source '{blend_mask_source}', defaulting to 'hybrid'.")
             blend_mask_source = "hybrid"
-        blend_mask_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = self._resolve_mask_processing_params(
-            threshold_raw=self.mask_initial_threshold_var.get(),
+        blend_mask_pre_threshold, blend_mask_post_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = self._resolve_mask_processing_params(
+            pre_threshold_raw=self.mask_initial_threshold_var.get(),
+            post_threshold_raw=self.mask_post_threshold_var.get(),
             morph_kernel_raw=self.mask_morph_kernel_size_var.get(),
             dilate_kernel_raw=self.mask_dilate_kernel_size_var.get(),
             blur_kernel_raw=self.mask_blur_kernel_size_var.get(),
@@ -1162,7 +1191,8 @@ class InpaintingGUI(ThemedTk):
                             hires_mask_chunk_raw = hires_frames_torch[:, :, :, :half_w_hires]
                             hires_mask_chunk_processed = self._process_mask_frames(
                                 frames_mask_raw=hires_mask_chunk_raw,
-                                threshold=blend_mask_threshold,
+                                pre_threshold=blend_mask_pre_threshold,
+                                post_threshold=blend_mask_post_threshold,
                                 morph_kernel_size=blend_mask_morph,
                                 dilate_kernel_size=blend_mask_dilate,
                                 blur_kernel_size=blend_mask_blur,
@@ -1178,7 +1208,8 @@ class InpaintingGUI(ThemedTk):
                             hires_mask_chunk_raw = hires_frames_torch[:, :, half_h_hires:, :half_w_hires]
                             hires_mask_chunk_processed = self._process_mask_frames(
                                 frames_mask_raw=hires_mask_chunk_raw,
-                                threshold=blend_mask_threshold,
+                                pre_threshold=blend_mask_pre_threshold,
+                                post_threshold=blend_mask_post_threshold,
                                 morph_kernel_size=blend_mask_morph,
                                 dilate_kernel_size=blend_mask_dilate,
                                 blur_kernel_size=blend_mask_blur,
@@ -1549,12 +1580,14 @@ class InpaintingGUI(ThemedTk):
 
             # Inference mask processing (applied before model inpainting)
             "inpaint_mask_initial_threshold": self.inpaint_mask_initial_threshold_var.get(),
+            "inpaint_mask_post_threshold": self.inpaint_mask_post_threshold_var.get(),
             "inpaint_mask_morph_kernel_size": self.inpaint_mask_morph_kernel_size_var.get(),
             "inpaint_mask_dilate_kernel_size": self.inpaint_mask_dilate_kernel_size_var.get(),
             "inpaint_mask_blur_kernel_size": self.inpaint_mask_blur_kernel_size_var.get(),
 
             # --- Granular Mask Processing Toggles & Parameters (Full Pipeline) ---
             "mask_initial_threshold": self.mask_initial_threshold_var.get(),
+            "mask_post_threshold": self.mask_post_threshold_var.get(),
             "mask_morph_kernel_size": self.mask_morph_kernel_size_var.get(),
             "mask_dilate_kernel_size": self.mask_dilate_kernel_size_var.get(),
             "mask_blur_kernel_size": self.mask_blur_kernel_size_var.get(),
@@ -1722,15 +1755,17 @@ class InpaintingGUI(ThemedTk):
         self._save_debug_image(frames_warpped_normalized, "01a_warped_input", base_video_name, 0)
         # --- END FIX ---
 
-        inpaint_mask_threshold, inpaint_mask_morph, inpaint_mask_dilate, inpaint_mask_blur = self._resolve_mask_processing_params(
-            threshold_raw=self.inpaint_mask_initial_threshold_var.get(),
+        inpaint_mask_pre_threshold, inpaint_mask_post_threshold, inpaint_mask_morph, inpaint_mask_dilate, inpaint_mask_blur = self._resolve_mask_processing_params(
+            pre_threshold_raw=self.inpaint_mask_initial_threshold_var.get(),
+            post_threshold_raw=self.inpaint_mask_post_threshold_var.get(),
             morph_kernel_raw=self.inpaint_mask_morph_kernel_size_var.get(),
             dilate_kernel_raw=self.inpaint_mask_dilate_kernel_size_var.get(),
             blur_kernel_raw=self.inpaint_mask_blur_kernel_size_var.get(),
             context_label="inpaint_mask",
         )
-        blend_mask_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = self._resolve_mask_processing_params(
-            threshold_raw=self.mask_initial_threshold_var.get(),
+        blend_mask_pre_threshold, blend_mask_post_threshold, blend_mask_morph, blend_mask_dilate, blend_mask_blur = self._resolve_mask_processing_params(
+            pre_threshold_raw=self.mask_initial_threshold_var.get(),
+            post_threshold_raw=self.mask_post_threshold_var.get(),
             morph_kernel_raw=self.mask_morph_kernel_size_var.get(),
             dilate_kernel_raw=self.mask_dilate_kernel_size_var.get(),
             blur_kernel_raw=self.mask_blur_kernel_size_var.get(),
@@ -1739,7 +1774,8 @@ class InpaintingGUI(ThemedTk):
 
         inpaint_processed_mask = self._process_mask_frames(
             frames_mask_raw=frames_mask_raw,
-            threshold=inpaint_mask_threshold,
+            pre_threshold=inpaint_mask_pre_threshold,
+            post_threshold=inpaint_mask_post_threshold,
             morph_kernel_size=inpaint_mask_morph,
             dilate_kernel_size=inpaint_mask_dilate,
             blur_kernel_size=inpaint_mask_blur,
@@ -1749,7 +1785,8 @@ class InpaintingGUI(ThemedTk):
         )
         blend_processed_mask = self._process_mask_frames(
             frames_mask_raw=frames_mask_raw,
-            threshold=blend_mask_threshold,
+            pre_threshold=blend_mask_pre_threshold,
+            post_threshold=blend_mask_post_threshold,
             morph_kernel_size=blend_mask_morph,
             dilate_kernel_size=blend_mask_dilate,
             blur_kernel_size=blend_mask_blur,
@@ -2047,11 +2084,27 @@ class InpaintingGUI(ThemedTk):
         ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 4: Inpaint Mask Threshold (Left) & Inpaint Mask Dilation (Right)
-        inpaint_bin_thresh_label = ttk.Label(param_frame, text="Inpaint Mask Thresh:")
+        # Row 4: Inpaint Pre-Threshold (Left) & Inpaint Post-Threshold (Right)
+        inpaint_bin_thresh_label = ttk.Label(param_frame, text="Inpaint Pre Thresh:")
         inpaint_bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inpaint_bin_thresh_label, self.help_data.get("inpaint_mask_initial_threshold", ""))
         ttk.Entry(param_frame, textvariable=self.inpaint_mask_initial_threshold_var, width=10).grid(
+            row=current_row, column=1, sticky="w", padx=5
+        )
+
+        inpaint_post_thresh_label = ttk.Label(param_frame, text="Inpaint Post Thresh:")
+        inpaint_post_thresh_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_post_thresh_label, self.help_data.get("inpaint_mask_post_threshold", ""))
+        ttk.Entry(param_frame, textvariable=self.inpaint_mask_post_threshold_var, width=10).grid(
+            row=current_row, column=3, sticky="w", padx=5
+        )
+        current_row += 1
+
+        # Row 5: Inpaint Morph Close (Left) & Inpaint Dilate Kernel (Right)
+        inpaint_morph_kernel_label = ttk.Label(param_frame, text="Inpaint Morph Close:")
+        inpaint_morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(inpaint_morph_kernel_label, self.help_data.get("inpaint_mask_morph_kernel_size", ""))
+        ttk.Entry(param_frame, textvariable=self.inpaint_mask_morph_kernel_size_var, width=10).grid(
             row=current_row, column=1, sticky="w", padx=5
         )
 
@@ -2063,20 +2116,14 @@ class InpaintingGUI(ThemedTk):
         )
         current_row += 1
 
-        # Row 5: Inpaint Morph Close (Left) & Inpaint Blur Kernel (Right)
-        inpaint_morph_kernel_label = ttk.Label(param_frame, text="Inpaint Morph Close:")
-        inpaint_morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
-        Tooltip(inpaint_morph_kernel_label, self.help_data.get("inpaint_mask_morph_kernel_size", ""))
-        ttk.Entry(param_frame, textvariable=self.inpaint_mask_morph_kernel_size_var, width=10).grid(
-            row=current_row, column=1, sticky="w", padx=5
-        )
-
+        # Row 6: Inpaint Blur Kernel
         inpaint_blur_kernel_label = ttk.Label(param_frame, text="Inpaint Blur Kernel:")
-        inpaint_blur_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        inpaint_blur_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inpaint_blur_kernel_label, self.help_data.get("inpaint_mask_blur_kernel_size", ""))
         ttk.Entry(param_frame, textvariable=self.inpaint_mask_blur_kernel_size_var, width=10).grid(
-            row=current_row, column=3, sticky="w", padx=5
+            row=current_row, column=1, sticky="w", padx=5
         )
+        current_row += 1
 
 
         # --- POST-PROCESSING FRAME ---
@@ -2132,23 +2179,23 @@ class InpaintingGUI(ThemedTk):
         self.mask_param_widgets.append(blend_mask_source_menu)
         current_row += 1
 
-        # Row 2: Blend Mask Binarization Threshold (Left) & Blend Mask Dilation (Right)
-        bin_thresh_label = ttk.Label(post_process_frame, text="Mask Binarize Thresh:")
+        # Row 2: Blend Pre-Threshold (Left) & Blend Post-Threshold (Right)
+        bin_thresh_label = ttk.Label(post_process_frame, text="Mask Pre Thresh:")
         bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(bin_thresh_label, self.help_data.get("mask_initial_threshold", ""))
         bin_thresh_entry = ttk.Entry(post_process_frame, textvariable=self.mask_initial_threshold_var, width=10)
         bin_thresh_entry.grid(row=current_row, column=1, sticky="w", padx=5)
         self.mask_param_widgets.append(bin_thresh_entry) # Store reference
-        
-        dilate_kernel_label = ttk.Label(post_process_frame, text="Mask Dilate Kernel:")
-        dilate_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
-        Tooltip(dilate_kernel_label, self.help_data.get("mask_dilate_kernel_size", ""))
-        dilate_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_dilate_kernel_size_var, width=10)
-        dilate_kernel_entry.grid(row=current_row, column=3, sticky="w", padx=5)
-        self.mask_param_widgets.append(dilate_kernel_entry) # Store reference
+
+        post_thresh_label = ttk.Label(post_process_frame, text="Mask Post Thresh:")
+        post_thresh_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(post_thresh_label, self.help_data.get("mask_post_threshold", ""))
+        post_thresh_entry = ttk.Entry(post_process_frame, textvariable=self.mask_post_threshold_var, width=10)
+        post_thresh_entry.grid(row=current_row, column=3, sticky="w", padx=5)
+        self.mask_param_widgets.append(post_thresh_entry)
         current_row += 1
 
-        # Row 3: Blend Morph Close (Left) & Blend Blur Kernel (Right)
+        # Row 3: Blend Morph Close (Left) & Blend Dilate Kernel (Right)
         morph_kernel_label = ttk.Label(post_process_frame, text="Morph Close Kernel:")
         morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(morph_kernel_label, self.help_data.get("mask_morph_kernel_size", ""))
@@ -2156,13 +2203,22 @@ class InpaintingGUI(ThemedTk):
         morph_kernel_entry.grid(row=current_row, column=1, sticky="w", padx=5)
         self.mask_param_widgets.append(morph_kernel_entry) # Store reference
 
+        dilate_kernel_label = ttk.Label(post_process_frame, text="Mask Dilate Kernel:")
+        dilate_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        Tooltip(dilate_kernel_label, self.help_data.get("mask_dilate_kernel_size", ""))
+        dilate_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_dilate_kernel_size_var, width=10)
+        dilate_kernel_entry.grid(row=current_row, column=3, sticky="w", padx=5)
+        self.mask_param_widgets.append(dilate_kernel_entry)
+        current_row += 1
+
+        # Row 4: Blend Blur Kernel
         blur_kernel_label = ttk.Label(post_process_frame, text="Mask Blur Kernel:")
-        blur_kernel_label.grid(row=current_row, column=2, sticky="e", padx=5, pady=2)
+        blur_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(blur_kernel_label, self.help_data.get("mask_blur_kernel_size", ""))
         blur_kernel_entry = ttk.Entry(post_process_frame, textvariable=self.mask_blur_kernel_size_var, width=10)
-        blur_kernel_entry.grid(row=current_row, column=3, sticky="w", padx=5)
-        self.mask_param_widgets.append(blur_kernel_entry) # Store reference
-        # current_row += 1 # No need to increment here, post_process_frame is done
+        blur_kernel_entry.grid(row=current_row, column=1, sticky="w", padx=5)
+        self.mask_param_widgets.append(blur_kernel_entry)
+        current_row += 1
         
         # Initialize the state of blend parameters immediately after creation
         self._toggle_blend_parameters_state()
@@ -2272,15 +2328,16 @@ class InpaintingGUI(ThemedTk):
             process_length=process_length,
         )
         resume_checkpoint = self._load_prefinalize_checkpoint(checkpoint_path, resume_signature)
-        inpaint_mask_threshold_for_pipeline, _, _, _ = self._resolve_mask_processing_params(
-            threshold_raw=self.inpaint_mask_initial_threshold_var.get(),
+        _, inpaint_mask_post_threshold_for_pipeline, _, _, _ = self._resolve_mask_processing_params(
+            pre_threshold_raw=self.inpaint_mask_initial_threshold_var.get(),
+            post_threshold_raw=self.inpaint_mask_post_threshold_var.get(),
             morph_kernel_raw=self.inpaint_mask_morph_kernel_size_var.get(),
             dilate_kernel_raw=self.inpaint_mask_dilate_kernel_size_var.get(),
             blur_kernel_raw=self.inpaint_mask_blur_kernel_size_var.get(),
             context_label="inpaint_mask_pipeline",
         )
         pipeline_mask_binarize_threshold = (
-            None if inpaint_mask_threshold_for_pipeline == 0.0 else inpaint_mask_threshold_for_pipeline
+            None if inpaint_mask_post_threshold_for_pipeline == 0.0 else inpaint_mask_post_threshold_for_pipeline
         )
 
         frames_output_final: torch.Tensor
@@ -2652,11 +2709,13 @@ class InpaintingGUI(ThemedTk):
         self.offload_type_var.set("model")
 
         self.inpaint_mask_initial_threshold_var.set("0.3")
+        self.inpaint_mask_post_threshold_var.set("0.3")
         self.inpaint_mask_morph_kernel_size_var.set("0.0")
         self.inpaint_mask_dilate_kernel_size_var.set("5")
         self.inpaint_mask_blur_kernel_size_var.set("7")
 
         self.mask_initial_threshold_var.set("0.3")
+        self.mask_post_threshold_var.set("0.3")
         self.mask_morph_kernel_size_var.set("0.0")
         self.mask_dilate_kernel_size_var.set("5")
         self.mask_blur_kernel_size_var.set("7")
