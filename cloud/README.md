@@ -9,8 +9,10 @@ No separate always-on API server is required.
 - `cloud/bootstrap_remote.sh`: prepares remote venv + dependencies
 - `cloud/run_depth_job.py`: remote headless job runner
 - `cloud/release_vast_image.py`: local helper to build/push image and print/run `vastai create instance`
+- `cloud/vast_worker_launch.py`: pick cheapest offer for a GPU profile, launch one instance, generate cloud config copy, and optionally run `cloudctl`
 - `cloud/hf.env.example`: template for Hugging Face token env file
 - `cloud/ghcr.env.example`: template for GHCR login env file
+- `cloud/vast.env.example`: template for Vast API key env file
 
 ## Prerequisites
 
@@ -25,6 +27,97 @@ Remote machine (Vast instance):
 - Linux with NVIDIA driver/CUDA runtime
 - `python3` and `venv` support
 - enough disk for model cache and outputs
+
+## Refresh Cloud Image (when branch changes)
+
+`cloud/Dockerfile.vastai` now does:
+
+- `git clone` of your branch
+- `git pull --ff-only` inside image build
+- optional commit pin (`GIT_COMMIT`) and baked commit record at `/opt/stereocrafter_git_commit.txt`
+
+Use this from repo root to rebuild and push with latest branch contents:
+
+```bash
+python cloud/release_vast_image.py \
+  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --git-repo-url https://github.com/46cv8/StereoCrafter.git \
+  --git-branch 004_depthcrafter_on_cloud \
+  --env-file cloud/hf.env \
+  --ghcr-env-file cloud/ghcr.env \
+  --refresh-repo
+```
+
+Note: `--docker-pull-base` is intentionally omitted for speed. Add it only when you explicitly want to refresh the CUDA base image (it can invalidate more cache layers and trigger long rebuilds).
+
+If you want to pin a specific commit:
+
+```bash
+python cloud/release_vast_image.py \
+  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --git-repo-url https://github.com/46cv8/StereoCrafter.git \
+  --git-branch 004_depthcrafter_on_cloud \
+  --git-commit <commit_sha> \
+  --env-file cloud/hf.env \
+  --ghcr-env-file cloud/ghcr.env
+```
+
+## 0) One-command worker launch (recommended)
+
+This flow avoids editing your default `config_depthcrafter.json`.
+It will:
+
+1. search offers for profile `5090_32gb` or `rtx_pro_6000_96gb`,
+2. show candidate costs,
+3. ask approval,
+4. create one instance,
+5. wait until ready,
+6. write a generated config copy under `cloud/generated_configs/`,
+7. print the exact `cloudctl` command to run.
+
+Setup once:
+
+```bash
+cp cloud/vast.env.example cloud/vast.env
+cp cloud/hf.env.example cloud/hf.env
+```
+
+Fill:
+
+- `cloud/vast.env` with `VAST_API_KEY=...`
+- `cloud/hf.env` with your accepted-terms HF token.
+
+Launch a 5090 worker using your current config as base:
+
+```bash
+python cloud/vast_worker_launch.py \
+  --profile 5090_32gb \
+  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --base-config config_depthcrafter.json \
+  --remote-root /opt/StereoCrafter \
+  --remote-venv /opt/venv
+```
+
+Launch a 96GB RTX PRO 6000 worker:
+
+```bash
+python cloud/vast_worker_launch.py \
+  --profile rtx_pro_6000_96gb \
+  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --base-config config_depthcrafter.json \
+  --remote-root /opt/StereoCrafter \
+  --remote-venv /opt/venv
+```
+
+Notes:
+
+- `5090_32gb` profile defaults to `1664x896`.
+- `rtx_pro_6000_96gb` profile defaults to `1920x1040`.
+- default disk is `40GB` (override with `--disk`).
+- use `--dry-run` to only rank/select offers without creating an instance.
+- The script prompts `Type GO ...` after readiness; that starts remote processing immediately.
+- Add `--run-now` to skip GO prompt.
+- Add `--output-config /path/custom.json` to control generated config path.
 
 ## 1) Bootstrap a fresh instance
 

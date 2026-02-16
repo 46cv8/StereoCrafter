@@ -10,6 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/opt/hf-cache \
     TRANSFORMERS_CACHE=/opt/hf-cache \
     TORCH_HOME=/opt/torch-cache \
+    PREINSTALLED_VENV=/venv/main \
     VENV_PATH=/opt/venv \
     APP_ROOT=/opt/StereoCrafter
 
@@ -24,10 +25,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv "${VENV_PATH}"
+RUN set -eux; \
+    if [ -x "${PREINSTALLED_VENV}/bin/python" ]; then \
+      PY312_BIN="${PREINSTALLED_VENV}/bin/python"; \
+    elif command -v python3.12 >/dev/null 2>&1; then \
+      PY312_BIN="$(command -v python3.12)"; \
+    else \
+      echo "Python 3.12 interpreter not found (expected in ${PREINSTALLED_VENV}/bin/python or python3.12)." >&2; \
+      exit 1; \
+    fi; \
+    "${PY312_BIN}" --version; \
+    "${PY312_BIN}" -m venv "${VENV_PATH}"
 ENV PATH="${VENV_PATH}/bin:${PATH}"
 
-RUN python - <<'PY'
+RUN "${VENV_PATH}/bin/python" - <<'PY'
 import sys
 major, minor = sys.version_info[:2]
 assert (major, minor) == (3, 12), f"Expected Python 3.12, found {major}.{minor}"
@@ -60,4 +71,14 @@ CMD ["bash"]
 # Last step requested: clone your cloud branch into the runtime app path.
 ARG GIT_REPO_URL=https://github.com/REPLACE_WITH_YOUR_USER/StereoCrafter.git
 ARG GIT_BRANCH=004_depthcrafter_on_cloud
-RUN git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_URL}" "${APP_ROOT}"
+ARG GIT_COMMIT=
+ARG GIT_CACHE_BUST=0
+RUN set -eux; \
+    echo "git-cache-bust=${GIT_CACHE_BUST}"; \
+    git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_URL}" "${APP_ROOT}"; \
+    git -C "${APP_ROOT}" pull --ff-only origin "${GIT_BRANCH}"; \
+    if [ -n "${GIT_COMMIT}" ]; then \
+      git -C "${APP_ROOT}" fetch --depth 1 origin "${GIT_COMMIT}"; \
+      git -C "${APP_ROOT}" checkout --detach "${GIT_COMMIT}"; \
+    fi; \
+    git -C "${APP_ROOT}" rev-parse HEAD | tee /opt/stereocrafter_git_commit.txt

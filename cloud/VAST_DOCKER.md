@@ -38,6 +38,7 @@ It does the following:
 4. Validates Python is `3.12.x` at build time.
 5. Uses Hugging Face runtime auth (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`) for gated model pulls.
 6. Final step clones repo branch `004_depthcrafter_on_cloud` from your GitHub URL.
+7. Clone stage now forces a fast-forward `git pull`, supports optional commit pin, and records baked commit at `/opt/stereocrafter_git_commit.txt`.
 
 ## Hugging Face credentials (gitignored file)
 
@@ -91,6 +92,8 @@ docker build \
   -f cloud/Dockerfile.vastai \
   --build-arg GIT_REPO_URL=https://github.com/<your_user>/StereoCrafter.git \
   --build-arg GIT_BRANCH=004_depthcrafter_on_cloud \
+  --build-arg GIT_CACHE_BUST="$(date +%s)" \
+  --pull \
   -t "$IMAGE" \
   .
 
@@ -108,7 +111,8 @@ python cloud/release_vast_image.py \
   --git-repo-url https://github.com/<your_user>/StereoCrafter.git \
   --git-branch 004_depthcrafter_on_cloud \
   --env-file cloud/hf.env \
-  --ghcr-env-file cloud/ghcr.env
+  --ghcr-env-file cloud/ghcr.env \
+  --refresh-repo
 ```
 
 This will:
@@ -122,6 +126,14 @@ To execute the create command directly, add:
 ```bash
 --offer-id <OFFER_ID> --run-vast-create
 ```
+
+To pin to a specific commit while still using the same branch:
+
+```bash
+--git-commit <commit_sha>
+```
+
+Use `--docker-pull-base` only when you intentionally want to refresh the base image and accept a potentially much longer rebuild.
 
 ## Vast.ai instance create example
 

@@ -5,6 +5,11 @@ import sys
 import glob
 import shutil
 import json
+import ast
+import re
+import shlex
+import select
+import subprocess
 import tkinter as tk
 from tkinter import Toplevel, Label
 from tkinter import filedialog, messagebox, ttk
@@ -14,6 +19,7 @@ import numpy as np
 import torch
 import logging # Import standard logging
 import random
+from pathlib import Path
 
 # Configure a logger for this module
 _logger = logging.getLogger(__name__)
@@ -73,6 +79,11 @@ try:
 except ImportError:
     THEMEDTK_AVAILABLE = False
     _logger.warning("ttkthemes not found. Dark mode functionality will be disabled.")
+# Optional helper from cloud tooling for env-file parsing.
+try:
+    from cloud.envfile_to_vast_env import parse_env_file as _parse_cloud_env_file
+except Exception:
+    _parse_cloud_env_file = None
 # --- Imports End ---
 
 GUI_VERSION = "25-11-01.0"
@@ -152,6 +163,22 @@ class DepthCrafterGUI:
     LAST_SETTINGS_DIR_CONFIG_KEY = "last_settings_dir"
     VIDEO_EXTENSIONS = ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm", "*.flv", "*.gif"]
     IMAGE_EXTENSIONS = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.exr"]
+    CLOUD_PROFILE_DEFAULTS = {
+        "5090_32gb": {
+            "label": "RTX 5090 32GB",
+            "target_width": 1664,
+            "target_height": 896,
+            "window_size": 75,
+            "overlap": 25,
+        },
+        "rtx_pro_6000_96gb": {
+            "label": "RTX PRO 6000 96GB",
+            "target_width": 1920,
+            "target_height": 1040,
+            "window_size": 75,
+            "overlap": 25,
+        },
+    }
 
     def __init__(self, root):
         self.root = root
@@ -176,7 +203,10 @@ class DepthCrafterGUI:
         self.enable_spatial_refine_mode_var = tk.BooleanVar(value=False)
         # Special secondary mode: edge-guided hi-res upscaling from low-res raw depth + source RGB edges.
         self.enable_edge_guided_upscale_mode_var = tk.BooleanVar(value=False)
+        # Special mode: dispatch DepthCrafter jobs to a Vast.ai cloud worker.
+        self.enable_cloud_dispatch_mode_var = tk.BooleanVar(value=False)
         self.spatial_refine_options_expanded_var = tk.BooleanVar(value=False)
+        self.cloud_options_expanded_var = tk.BooleanVar(value=False)
         self.spatial_refine_tile_num_var = tk.IntVar(value=2)
         self.spatial_refine_tile_num_y_var = tk.IntVar(value=2)
         self.spatial_refine_tile_overlap_var = tk.IntVar(value=128)  # Legacy single-overlap setting.
@@ -200,6 +230,39 @@ class DepthCrafterGUI:
         self.edge_guided_output_suffix_var = tk.StringVar(value="_edge_hires_depth")
         self.spatial_refine_cleanup_temp_var = tk.BooleanVar(value=True)
         self.spatial_refine_output_suffix_var = tk.StringVar(value="_hires_refined_depth")
+        self.cloud_profile_var = tk.StringVar(value="5090_32gb")
+        # 0 => use selected cloud profile default resolution.
+        self.cloud_target_width_override_var = tk.IntVar(value=0)
+        self.cloud_target_height_override_var = tk.IntVar(value=0)
+        # 0 / -1 => inherit from main dialog values.
+        self.cloud_window_size_override_var = tk.IntVar(value=0)
+        self.cloud_overlap_override_var = tk.IntVar(value=-1)
+        self.cloud_image_var = tk.StringVar(value="ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud")
+        self.cloud_disk_gb_var = tk.IntVar(value=40)
+        self.cloud_reuse_existing_instance_var = tk.BooleanVar(value=True)
+        self.cloud_last_instance_id_var = tk.IntVar(value=0)
+        self.cloud_last_instance_profile_var = tk.StringVar(value="")
+        self.cloud_last_host_var = tk.StringVar(value="")
+        self.cloud_last_port_var = tk.IntVar(value=22)
+        self.cloud_remote_user_var = tk.StringVar(value="root")
+        self.cloud_remote_root_var = tk.StringVar(value="/opt/StereoCrafter")
+        self.cloud_remote_venv_var = tk.StringVar(value="/opt/venv")
+        self.cloud_identity_file_var = tk.StringVar(value="~/.ssh/id_vastai_ed25519")
+        self.cloud_vast_env_file_var = tk.StringVar(value="cloud/vast.env")
+        self.cloud_hf_env_file_var = tk.StringVar(value="cloud/hf.env")
+        self.cloud_no_hf_env_var = tk.BooleanVar(value=False)
+        self.cloud_offer_limit_var = tk.IntVar(value=30)
+        self.cloud_max_dph_var = tk.DoubleVar(value=0.0)
+        self.cloud_expected_runtime_hours_var = tk.DoubleVar(value=1.0)
+        self.cloud_expected_upload_gb_var = tk.DoubleVar(value=8.0)
+        self.cloud_expected_download_gb_var = tk.DoubleVar(value=8.0)
+        self.cloud_auto_destroy_instance_var = tk.BooleanVar(value=True)
+        self.cloud_secondary_summary_var = tk.StringVar(
+            value="  ↳ Launches a Vast worker, uploads clip(s), runs remote depth, downloads outputs."
+        )
+        self.cloud_profile_default_summary_var = tk.StringVar(value="")
+        self.cloud_effective_processing_summary_var = tk.StringVar(value="")
+        self.cloud_inherited_processing_summary_var = tk.StringVar(value="")
         self.save_final_output_json_var = tk.BooleanVar(value=False)
         self.merge_output_format_var = tk.StringVar(value="mp4")
         self.merge_alignment_method_var = tk.StringVar(value="Shift & Scale")
@@ -251,7 +314,9 @@ class DepthCrafterGUI:
             "npz_backfill_missing_only_var": self.npz_backfill_missing_only_var,
             "enable_spatial_refine_mode_var": self.enable_spatial_refine_mode_var,
             "enable_edge_guided_upscale_mode_var": self.enable_edge_guided_upscale_mode_var,
+            "enable_cloud_dispatch_mode_var": self.enable_cloud_dispatch_mode_var,
             "spatial_refine_options_expanded_var": self.spatial_refine_options_expanded_var,
+            "cloud_options_expanded_var": self.cloud_options_expanded_var,
             "spatial_refine_tile_num_var": self.spatial_refine_tile_num_var,
             "spatial_refine_tile_num_y_var": self.spatial_refine_tile_num_y_var,
             "spatial_refine_tile_overlap_var": self.spatial_refine_tile_overlap_var,
@@ -275,6 +340,31 @@ class DepthCrafterGUI:
             "edge_guided_output_suffix_var": self.edge_guided_output_suffix_var,
             "spatial_refine_cleanup_temp_var": self.spatial_refine_cleanup_temp_var,
             "spatial_refine_output_suffix_var": self.spatial_refine_output_suffix_var,
+            "cloud_profile_var": self.cloud_profile_var,
+            "cloud_target_width_override_var": self.cloud_target_width_override_var,
+            "cloud_target_height_override_var": self.cloud_target_height_override_var,
+            "cloud_window_size_override_var": self.cloud_window_size_override_var,
+            "cloud_overlap_override_var": self.cloud_overlap_override_var,
+            "cloud_image_var": self.cloud_image_var,
+            "cloud_disk_gb_var": self.cloud_disk_gb_var,
+            "cloud_reuse_existing_instance_var": self.cloud_reuse_existing_instance_var,
+            "cloud_last_instance_id_var": self.cloud_last_instance_id_var,
+            "cloud_last_instance_profile_var": self.cloud_last_instance_profile_var,
+            "cloud_last_host_var": self.cloud_last_host_var,
+            "cloud_last_port_var": self.cloud_last_port_var,
+            "cloud_remote_user_var": self.cloud_remote_user_var,
+            "cloud_remote_root_var": self.cloud_remote_root_var,
+            "cloud_remote_venv_var": self.cloud_remote_venv_var,
+            "cloud_identity_file_var": self.cloud_identity_file_var,
+            "cloud_vast_env_file_var": self.cloud_vast_env_file_var,
+            "cloud_hf_env_file_var": self.cloud_hf_env_file_var,
+            "cloud_no_hf_env_var": self.cloud_no_hf_env_var,
+            "cloud_offer_limit_var": self.cloud_offer_limit_var,
+            "cloud_max_dph_var": self.cloud_max_dph_var,
+            "cloud_expected_runtime_hours_var": self.cloud_expected_runtime_hours_var,
+            "cloud_expected_upload_gb_var": self.cloud_expected_upload_gb_var,
+            "cloud_expected_download_gb_var": self.cloud_expected_download_gb_var,
+            "cloud_auto_destroy_instance_var": self.cloud_auto_destroy_instance_var,
             "save_final_output_json_var": self.save_final_output_json_var,
             "merge_output_format_var": self.merge_output_format_var,
             "merge_alignment_method_var": self.merge_alignment_method_var,
@@ -306,6 +396,12 @@ class DepthCrafterGUI:
         self._help_data = None
         self.spatial_refine_settings_dialog = None
         self.spatial_refine_settings_widgets = []
+        self.cloud_settings_dialog = None
+        self.cloud_settings_widgets = []
+        self.cloud_processing_overrides_expanded = False
+        self.cloud_processing_overrides_toggle_btn = None
+        self.cloud_processing_overrides_frame = None
+        self.active_external_process = None
 
         self.last_settings_dir = os.getcwd()
         self.message_queue = queue.Queue() # Still needed for progress updates
@@ -334,6 +430,8 @@ class DepthCrafterGUI:
 
         self._create_menubar()
         self.create_widgets() 
+        self._bind_cloud_processing_summary_traces()
+        self._refresh_cloud_processing_summary()
         self.root.app_instance = self 
         # --------------------------------------
         
@@ -2113,7 +2211,37 @@ class DepthCrafterGUI:
         self.spatial_refine_summary_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=(15, 5), pady=(0, 2))
         self.widgets_to_disable_during_processing.append(self.spatial_refine_summary_label); row_idx += 1
 
+        ttk.Separator(secondary_output_frame, orient="horizontal").grid(
+            row=row_idx, column=0, columnspan=2, sticky="ew", padx=5, pady=(6, 4)
+        )
+        row_idx += 1
+
+        self.cloud_dispatch_mode_cb = ttk.Checkbutton(
+            secondary_output_frame,
+            text="Special: Cloud Dispatch Mode (Vast.ai, Sequential)",
+            variable=self.enable_cloud_dispatch_mode_var
+        )
+        self.cloud_dispatch_mode_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        self.widgets_to_disable_during_processing.append(self.cloud_dispatch_mode_cb); row_idx += 1
+
+        self.cloud_settings_toggle_btn = ttk.Button(
+            secondary_output_frame,
+            text="  ↳ Configure Cloud Dispatch...",
+            command=self.toggle_cloud_settings_visibility,
+        )
+        self.cloud_settings_toggle_btn.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=(15, 5), pady=2)
+        self.widgets_to_disable_during_processing.append(self.cloud_settings_toggle_btn); row_idx += 1
+
+        self.cloud_summary_label = ttk.Label(
+            secondary_output_frame,
+            textvariable=self.cloud_secondary_summary_var,
+            anchor="w",
+        )
+        self.cloud_summary_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=(15, 5), pady=(0, 2))
+        self.widgets_to_disable_during_processing.append(self.cloud_summary_label); row_idx += 1
+
         self._apply_spatial_refine_options_visibility()
+        self._apply_cloud_options_visibility()
 
         # --- Progress Bar and Status ---
         progress_bar_frame = ttk.Frame(self.root)
@@ -2256,10 +2384,16 @@ class DepthCrafterGUI:
 
     def on_close(self):
         self._close_spatial_refine_settings_dialog()
+        self._close_cloud_settings_dialog()
         self.save_config()
         if self.processing_thread and self.processing_thread.is_alive():
             _logger.info("Stopping processing before exit...")
             self.stop_event.set()
+            if self.active_external_process is not None and self.active_external_process.poll() is None:
+                try:
+                    self.active_external_process.terminate()
+                except Exception:
+                    pass
             self.processing_thread.join(timeout=10)
             if self.processing_thread.is_alive(): 
                 _logger.warning("Processing thread did not terminate gracefully. Forcing exit.")
@@ -2384,6 +2518,7 @@ class DepthCrafterGUI:
         npz_backfill_mode = bool(self.npz_backfill_missing_only_var.get())
         spatial_refine_mode = bool(self.enable_spatial_refine_mode_var.get())
         edge_guided_mode = bool(self.enable_edge_guided_upscale_mode_var.get())
+        cloud_dispatch_mode = bool(self.enable_cloud_dispatch_mode_var.get())
         selected_special_modes = int(npz_backfill_mode) + int(spatial_refine_mode) + int(edge_guided_mode)
         if selected_special_modes > 1:
             messagebox.showerror(
@@ -2391,6 +2526,20 @@ class DepthCrafterGUI:
                 "Select only one special mode at a time: NPZ backfill OR Spatial Hi-Res Refine OR Edge-Guided Hi-Res Upscale."
             )
             _logger.error("Start blocked: conflicting special modes selected.")
+            return
+        if cloud_dispatch_mode and selected_special_modes > 0:
+            messagebox.showerror(
+                "Invalid Setting",
+                "Cloud Dispatch mode cannot be combined with NPZ backfill, Spatial Hi-Res Refine, or Edge-Guided Hi-Res mode."
+            )
+            _logger.error("Start blocked: cloud mode selected with local special modes.")
+            return
+        if cloud_dispatch_mode and self.process_as_segments_var.get():
+            messagebox.showerror(
+                "Invalid Setting",
+                "Cloud Dispatch mode currently supports full video clip jobs only. Disable 'Process as Segments'."
+            )
+            _logger.error("Start blocked: cloud mode with segment mode enabled.")
             return
 
         if spatial_refine_mode and run_spatial_hires_refine is None:
@@ -2574,6 +2723,20 @@ class DepthCrafterGUI:
         if not sources_to_process_specs:
             _logger.warning(f"GUI: No valid video files or image sequences found in '{input_path_str}' for mode '{self.current_input_mode}'.")
             return
+
+        if cloud_dispatch_mode:
+            non_video_sources = [
+                spec for spec in sources_to_process_specs
+                if spec.get("type") not in ("video_file", "single_video_file")
+            ]
+            if non_video_sources:
+                messagebox.showerror(
+                    "Unsupported Input",
+                    "Cloud Dispatch currently supports video clips only. "
+                    "Image sequence and single-image inputs are not supported in cloud mode yet."
+                )
+                _logger.error("Start blocked: cloud mode received non-video input source(s).")
+                return
         
         # --- NEW SEED GENERATION GUARD ---
         gui_seed_setting = self.seed.get()
@@ -2612,6 +2775,7 @@ class DepthCrafterGUI:
         npz_backfill_mode_active = self.npz_backfill_missing_only_var.get()
         spatial_refine_mode_active = self.enable_spatial_refine_mode_var.get()
         edge_guided_mode_active = self.enable_edge_guided_upscale_mode_var.get()
+        cloud_dispatch_mode_active = self.enable_cloud_dispatch_mode_var.get()
         
         # Progress max is already set to len(source_specs_to_process) in start_thread
         _logger.debug(f"Starting lazy batch processing for {len(source_specs_to_process)} sources...")
@@ -2621,7 +2785,20 @@ class DepthCrafterGUI:
             _logger.info("Special Mode Active: Spatial Hi-Res Refine (Secondary Run).")
         if edge_guided_mode_active:
             _logger.info("Special Mode Active: Edge-Guided Hi-Res Upscale (Secondary Run).")
+        if cloud_dispatch_mode_active:
+            _logger.info("Special Mode Active: Cloud Dispatch (Vast.ai Sequential Jobs).")
         self.status_message_var.set("Starting processing...")
+
+        if cloud_dispatch_mode_active:
+            try:
+                self._run_cloud_dispatch_mode(
+                    source_specs_to_process=source_specs_to_process,
+                    effective_seed_for_run=effective_seed_for_run,
+                )
+            except Exception as cloud_exc:
+                _logger.exception(f"Cloud dispatch exception: {cloud_exc}")
+                self.status_message_var.set(f"Cloud Error: {cloud_exc.__class__.__name__}")
+            return
 
         # Initialize a dict to store master metadata for each video/sequence path
         all_videos_master_metadata = {}
@@ -2948,6 +3125,12 @@ class DepthCrafterGUI:
         if self.processing_thread and self.processing_thread.is_alive():
             _logger.info("Cancel request received. Processing will stop after current item.")
             self.stop_event.set()
+            if self.active_external_process is not None and self.active_external_process.poll() is None:
+                _logger.info("Terminating active cloud subprocess...")
+                try:
+                    self.active_external_process.terminate()
+                except Exception as term_exc:
+                    _logger.warning(f"Could not terminate active cloud subprocess cleanly: {term_exc}")
         else: 
             _logger.info("No processing is currently active to cancel.")
 
@@ -3243,6 +3426,1279 @@ class DepthCrafterGUI:
         close_btn.grid(row=row, column=0, columnspan=2, sticky="e", padx=5, pady=(8, 2))
 
         self._apply_spatial_refine_options_visibility()
+
+    def _browse_file_into_var(self, tk_var, title, filetypes):
+        initial_guess = tk_var.get().strip()
+        if initial_guess:
+            initial_guess = os.path.expanduser(initial_guess)
+            if os.path.isfile(initial_guess):
+                initial_dir = os.path.dirname(initial_guess)
+            elif os.path.isdir(initial_guess):
+                initial_dir = initial_guess
+            else:
+                initial_dir = os.path.expanduser("~")
+        else:
+            initial_dir = os.path.expanduser("~")
+        selected = filedialog.askopenfilename(
+            title=title,
+            initialdir=initial_dir,
+            filetypes=filetypes,
+        )
+        if selected:
+            tk_var.set(os.path.normpath(selected))
+
+    def _safe_int_from_tk_var(self, tk_var, fallback: int) -> int:
+        try:
+            return int(tk_var.get())
+        except Exception:
+            return int(fallback)
+
+    def _get_cloud_profile_defaults(self, profile_key: Optional[str] = None) -> Dict[str, object]:
+        key = (profile_key or self.cloud_profile_var.get().strip() or "5090_32gb").strip()
+        defaults = self.CLOUD_PROFILE_DEFAULTS.get(key)
+        if defaults is None:
+            key = "5090_32gb"
+            defaults = self.CLOUD_PROFILE_DEFAULTS[key]
+        return {"key": key, **defaults}
+
+    def _get_effective_cloud_processing_settings(self) -> Dict[str, object]:
+        profile_defaults = self._get_cloud_profile_defaults()
+        width_override = max(0, self._safe_int_from_tk_var(self.cloud_target_width_override_var, 0))
+        height_override = max(0, self._safe_int_from_tk_var(self.cloud_target_height_override_var, 0))
+        window_override = self._safe_int_from_tk_var(self.cloud_window_size_override_var, 0)
+        overlap_override = self._safe_int_from_tk_var(self.cloud_overlap_override_var, -1)
+
+        base_window = max(1, self._safe_int_from_tk_var(self.window_size, int(profile_defaults["window_size"])))
+        base_overlap = max(0, self._safe_int_from_tk_var(self.overlap, int(profile_defaults["overlap"])))
+
+        effective_width = width_override if width_override > 0 else int(profile_defaults["target_width"])
+        effective_height = height_override if height_override > 0 else int(profile_defaults["target_height"])
+        effective_window = window_override if window_override > 0 else base_window
+        effective_overlap = overlap_override if overlap_override >= 0 else base_overlap
+
+        target_source = (
+            "cloud override"
+            if width_override > 0 or height_override > 0
+            else f"profile default ({profile_defaults['key']})"
+        )
+        window_source = "cloud override" if window_override > 0 else "main window"
+        overlap_source = "cloud override" if overlap_override >= 0 else "main window"
+
+        return {
+            "profile_key": str(profile_defaults["key"]),
+            "profile_label": str(profile_defaults["label"]),
+            "profile_target_width": int(profile_defaults["target_width"]),
+            "profile_target_height": int(profile_defaults["target_height"]),
+            "profile_window_size": int(profile_defaults["window_size"]),
+            "profile_overlap": int(profile_defaults["overlap"]),
+            "target_width_override": width_override,
+            "target_height_override": height_override,
+            "window_size_override": window_override,
+            "overlap_override": overlap_override,
+            "target_width": int(effective_width),
+            "target_height": int(effective_height),
+            "window_size": int(effective_window),
+            "overlap": int(effective_overlap),
+            "target_source": target_source,
+            "window_source": window_source,
+            "overlap_source": overlap_source,
+            "base_window": int(base_window),
+            "base_overlap": int(base_overlap),
+        }
+
+    def _refresh_cloud_processing_summary(self):
+        settings = self._get_effective_cloud_processing_settings()
+        self.cloud_profile_default_summary_var.set(
+            (
+                f"{settings['profile_label']} defaults: "
+                f"{settings['profile_target_width']}x{settings['profile_target_height']}, "
+                f"window={settings['profile_window_size']}, overlap={settings['profile_overlap']}"
+            )
+        )
+        self.cloud_effective_processing_summary_var.set(
+            (
+                f"Effective cloud run: {settings['target_width']}x{settings['target_height']} "
+                f"({settings['target_source']}), window={settings['window_size']} "
+                f"({settings['window_source']}), overlap={settings['overlap']} "
+                f"({settings['overlap_source']})."
+            )
+        )
+        self.cloud_inherited_processing_summary_var.set(
+            (
+                f"Main dialog currently: window={settings['base_window']}, overlap={settings['base_overlap']}. "
+                "Advanced cloud overrides replace these only when set."
+            )
+        )
+        self.cloud_secondary_summary_var.set(
+            (
+                "  ↳ Launches a Vast worker, uploads clip(s), runs remote depth, downloads outputs. "
+                f"Cloud target: {settings['target_width']}x{settings['target_height']}."
+            )
+        )
+
+    def _on_cloud_processing_setting_changed(self, *_):
+        self._refresh_cloud_processing_summary()
+
+    def _bind_cloud_processing_summary_traces(self):
+        tracked_vars = [
+            self.cloud_profile_var,
+            self.cloud_target_width_override_var,
+            self.cloud_target_height_override_var,
+            self.cloud_window_size_override_var,
+            self.cloud_overlap_override_var,
+            self.window_size,
+            self.overlap,
+        ]
+        for tk_var in tracked_vars:
+            try:
+                tk_var.trace_add("write", self._on_cloud_processing_setting_changed)
+            except Exception:
+                continue
+
+    def _apply_cloud_processing_overrides_visibility(self):
+        frame = self.cloud_processing_overrides_frame
+        btn = self.cloud_processing_overrides_toggle_btn
+        if frame is None or btn is None:
+            return
+        if self.cloud_processing_overrides_expanded:
+            frame.grid()
+            btn.configure(text="  ↳ Hide Advanced Cloud Overrides")
+        else:
+            frame.grid_remove()
+            btn.configure(text="  ↳ Show Advanced Cloud Overrides")
+
+    def _toggle_cloud_processing_overrides_visibility(self):
+        self.cloud_processing_overrides_expanded = not bool(self.cloud_processing_overrides_expanded)
+        self._apply_cloud_processing_overrides_visibility()
+
+    def _close_cloud_settings_dialog(self):
+        tracked_widgets = list(self.cloud_settings_widgets)
+        if self.cloud_settings_dialog is not None:
+            try:
+                self.cloud_settings_dialog.destroy()
+            except tk.TclError:
+                pass
+        if tracked_widgets:
+            self.widgets_to_disable_during_processing = [
+                w for w in self.widgets_to_disable_during_processing if w not in tracked_widgets
+            ]
+        self.cloud_settings_dialog = None
+        self.cloud_settings_widgets = []
+        self.cloud_processing_overrides_toggle_btn = None
+        self.cloud_processing_overrides_frame = None
+        self.cloud_options_expanded_var.set(False)
+        self._apply_cloud_options_visibility()
+
+    def _register_cloud_dialog_widget(self, widget):
+        self.cloud_settings_widgets.append(widget)
+        self.widgets_to_disable_during_processing.append(widget)
+        return widget
+
+    def _open_cloud_settings_dialog(self):
+        if self.cloud_settings_dialog is not None:
+            try:
+                if self.cloud_settings_dialog.winfo_exists():
+                    self.cloud_settings_dialog.lift()
+                    self.cloud_settings_dialog.focus_force()
+                    self.cloud_options_expanded_var.set(True)
+                    self._apply_cloud_options_visibility()
+                    return
+            except tk.TclError:
+                self._close_cloud_settings_dialog()
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Cloud Dispatch Settings")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_cloud_settings_dialog)
+
+        self.cloud_settings_dialog = dialog
+        self.cloud_settings_widgets = [dialog]
+        self.cloud_options_expanded_var.set(True)
+
+        outer = ttk.Frame(dialog, padding=12)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(outer, text="GPU Profile:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        combo_profile = self._register_cloud_dialog_widget(
+            ttk.Combobox(
+                outer,
+                textvariable=self.cloud_profile_var,
+                values=["5090_32gb", "rtx_pro_6000_96gb"],
+                width=30,
+                state="readonly",
+            )
+        )
+        combo_profile.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        combo_profile.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_cloud_processing_summary())
+        row += 1
+
+        ttk.Label(outer, text="Profile Defaults:").grid(row=row, column=0, sticky="ne", padx=5, pady=2)
+        lbl_profile_defaults = self._register_cloud_dialog_widget(
+            ttk.Label(
+                outer,
+                textvariable=self.cloud_profile_default_summary_var,
+                anchor="w",
+                justify="left",
+                wraplength=460,
+            )
+        )
+        lbl_profile_defaults.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Cloud Resolution Override:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        resolution_override_frame = ttk.Frame(outer)
+        resolution_override_frame.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        spin_cloud_width = self._register_cloud_dialog_widget(
+            ttk.Spinbox(
+                resolution_override_frame,
+                from_=0,
+                to=8192,
+                increment=8,
+                textvariable=self.cloud_target_width_override_var,
+                width=8,
+            )
+        )
+        spin_cloud_width.pack(side=tk.LEFT)
+        ttk.Label(resolution_override_frame, text="x").pack(side=tk.LEFT, padx=(4, 4))
+        spin_cloud_height = self._register_cloud_dialog_widget(
+            ttk.Spinbox(
+                resolution_override_frame,
+                from_=0,
+                to=8192,
+                increment=8,
+                textvariable=self.cloud_target_height_override_var,
+                width=8,
+            )
+        )
+        spin_cloud_height.pack(side=tk.LEFT)
+        ttk.Label(resolution_override_frame, text="(0 = profile default)").pack(side=tk.LEFT, padx=(8, 0))
+        row += 1
+
+        ttk.Label(outer, text="Effective Cloud Params:").grid(row=row, column=0, sticky="ne", padx=5, pady=2)
+        lbl_effective = self._register_cloud_dialog_widget(
+            ttk.Label(
+                outer,
+                textvariable=self.cloud_effective_processing_summary_var,
+                anchor="w",
+                justify="left",
+                wraplength=460,
+            )
+        )
+        lbl_effective.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        self.cloud_processing_overrides_toggle_btn = self._register_cloud_dialog_widget(
+            ttk.Button(
+                outer,
+                text="  ↳ Show Advanced Cloud Overrides",
+                command=self._toggle_cloud_processing_overrides_visibility,
+            )
+        )
+        self.cloud_processing_overrides_toggle_btn.grid(row=row, column=0, columnspan=2, sticky="w", padx=(10, 5), pady=2)
+        row += 1
+
+        self.cloud_processing_overrides_frame = self._register_cloud_dialog_widget(ttk.Frame(outer))
+        self.cloud_processing_overrides_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0), pady=(0, 4))
+        self.cloud_processing_overrides_frame.columnconfigure(1, weight=1)
+
+        adv_row = 0
+        ttk.Label(self.cloud_processing_overrides_frame, text="Window Override:").grid(
+            row=adv_row, column=0, sticky="e", padx=5, pady=2
+        )
+        spin_window_override = self._register_cloud_dialog_widget(
+            ttk.Spinbox(
+                self.cloud_processing_overrides_frame,
+                from_=0,
+                to=512,
+                increment=1,
+                textvariable=self.cloud_window_size_override_var,
+                width=10,
+            )
+        )
+        spin_window_override.grid(row=adv_row, column=1, sticky="w", padx=(5, 0), pady=2)
+        ttk.Label(self.cloud_processing_overrides_frame, text="(0 = inherit main dialog)").grid(
+            row=adv_row, column=2, sticky="w", padx=(8, 0), pady=2
+        )
+        adv_row += 1
+
+        ttk.Label(self.cloud_processing_overrides_frame, text="Overlap Override:").grid(
+            row=adv_row, column=0, sticky="e", padx=5, pady=2
+        )
+        spin_overlap_override = self._register_cloud_dialog_widget(
+            ttk.Spinbox(
+                self.cloud_processing_overrides_frame,
+                from_=-1,
+                to=512,
+                increment=1,
+                textvariable=self.cloud_overlap_override_var,
+                width=10,
+            )
+        )
+        spin_overlap_override.grid(row=adv_row, column=1, sticky="w", padx=(5, 0), pady=2)
+        ttk.Label(self.cloud_processing_overrides_frame, text="(-1 = inherit main dialog)").grid(
+            row=adv_row, column=2, sticky="w", padx=(8, 0), pady=2
+        )
+        adv_row += 1
+
+        lbl_inherit = self._register_cloud_dialog_widget(
+            ttk.Label(
+                self.cloud_processing_overrides_frame,
+                textvariable=self.cloud_inherited_processing_summary_var,
+                anchor="w",
+                justify="left",
+                wraplength=430,
+            )
+        )
+        lbl_inherit.grid(row=adv_row, column=0, columnspan=3, sticky="w", padx=5, pady=(2, 4))
+        row += 1
+
+        ttk.Label(outer, text="Image:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_image = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_image_var, width=44)
+        )
+        entry_image.grid(row=row, column=1, sticky="ew", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Disk (GB):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_disk = self._register_cloud_dialog_widget(
+            ttk.Spinbox(outer, from_=20, to=4096, increment=5, textvariable=self.cloud_disk_gb_var, width=12)
+        )
+        spin_disk.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        reuse_instance_cb = self._register_cloud_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Reuse existing instance when profile matches",
+                variable=self.cloud_reuse_existing_instance_var,
+            )
+        )
+        reuse_instance_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Cached Instance ID:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        cached_instance_frame = ttk.Frame(outer)
+        cached_instance_frame.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        entry_cached_instance = self._register_cloud_dialog_widget(
+            ttk.Entry(cached_instance_frame, textvariable=self.cloud_last_instance_id_var, width=10)
+        )
+        entry_cached_instance.pack(side=tk.LEFT)
+        lbl_cached_profile = self._register_cloud_dialog_widget(
+            ttk.Label(cached_instance_frame, textvariable=self.cloud_last_instance_profile_var)
+        )
+        lbl_cached_profile.pack(side=tk.LEFT, padx=(8, 0))
+        row += 1
+
+        ttk.Label(outer, text="Cached Host:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        cached_host_frame = ttk.Frame(outer)
+        cached_host_frame.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        entry_cached_host = self._register_cloud_dialog_widget(
+            ttk.Entry(cached_host_frame, textvariable=self.cloud_last_host_var, width=26)
+        )
+        entry_cached_host.pack(side=tk.LEFT, padx=(0, 4))
+        entry_cached_port = self._register_cloud_dialog_widget(
+            ttk.Entry(cached_host_frame, textvariable=self.cloud_last_port_var, width=7)
+        )
+        entry_cached_port.pack(side=tk.LEFT)
+        row += 1
+
+        admin_btn_frame = ttk.Frame(outer)
+        admin_btn_frame.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 2))
+        btn_force_start = self._register_cloud_dialog_widget(
+            ttk.Button(
+                admin_btn_frame,
+                text="Force Start",
+                command=self._force_start_cached_cloud_instance_from_ui,
+                width=12,
+            )
+        )
+        btn_force_start.pack(side=tk.LEFT, padx=(0, 4))
+        btn_force_stop = self._register_cloud_dialog_widget(
+            ttk.Button(
+                admin_btn_frame,
+                text="Force Stop",
+                command=self._force_stop_cached_cloud_instance_from_ui,
+                width=12,
+            )
+        )
+        btn_force_stop.pack(side=tk.LEFT, padx=(0, 4))
+        btn_clear_cache = self._register_cloud_dialog_widget(
+            ttk.Button(
+                admin_btn_frame,
+                text="Clear Cache",
+                command=self._clear_cached_cloud_instance_from_ui,
+                width=12,
+            )
+        )
+        btn_clear_cache.pack(side=tk.LEFT)
+        row += 1
+
+        ttk.Label(outer, text="SSH Identity Key:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        identity_frame = ttk.Frame(outer)
+        identity_frame.grid(row=row, column=1, sticky="ew", padx=(5, 0), pady=2)
+        identity_frame.columnconfigure(0, weight=1)
+        entry_identity = self._register_cloud_dialog_widget(
+            ttk.Entry(identity_frame, textvariable=self.cloud_identity_file_var, width=34)
+        )
+        entry_identity.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        btn_identity = self._register_cloud_dialog_widget(
+            ttk.Button(
+                identity_frame,
+                text="Browse...",
+                command=lambda: self._browse_file_into_var(
+                    self.cloud_identity_file_var,
+                    "Select SSH Private Key",
+                    [("Private keys", "*"), ("All files", "*.*")],
+                ),
+                width=10,
+            )
+        )
+        btn_identity.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(outer, text="Vast API Env File:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        vast_env_frame = ttk.Frame(outer)
+        vast_env_frame.grid(row=row, column=1, sticky="ew", padx=(5, 0), pady=2)
+        vast_env_frame.columnconfigure(0, weight=1)
+        entry_vast_env = self._register_cloud_dialog_widget(
+            ttk.Entry(vast_env_frame, textvariable=self.cloud_vast_env_file_var, width=34)
+        )
+        entry_vast_env.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        btn_vast_env = self._register_cloud_dialog_widget(
+            ttk.Button(
+                vast_env_frame,
+                text="Browse...",
+                command=lambda: self._browse_file_into_var(
+                    self.cloud_vast_env_file_var,
+                    "Select Vast API Env File",
+                    [("Env files", "*.env"), ("All files", "*.*")],
+                ),
+                width=10,
+            )
+        )
+        btn_vast_env.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(outer, text="HF Env File:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        hf_env_frame = ttk.Frame(outer)
+        hf_env_frame.grid(row=row, column=1, sticky="ew", padx=(5, 0), pady=2)
+        hf_env_frame.columnconfigure(0, weight=1)
+        entry_hf_env = self._register_cloud_dialog_widget(
+            ttk.Entry(hf_env_frame, textvariable=self.cloud_hf_env_file_var, width=34)
+        )
+        entry_hf_env.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        btn_hf_env = self._register_cloud_dialog_widget(
+            ttk.Button(
+                hf_env_frame,
+                text="Browse...",
+                command=lambda: self._browse_file_into_var(
+                    self.cloud_hf_env_file_var,
+                    "Select Hugging Face Env File",
+                    [("Env files", "*.env"), ("All files", "*.*")],
+                ),
+                width=10,
+            )
+        )
+        btn_hf_env.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        no_hf_cb = self._register_cloud_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Skip HF env payload (--no-hf-env)",
+                variable=self.cloud_no_hf_env_var,
+            )
+        )
+        no_hf_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Remote User:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_remote_user = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_remote_user_var, width=18)
+        )
+        entry_remote_user.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Remote Root:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_remote_root = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_remote_root_var, width=44)
+        )
+        entry_remote_root.grid(row=row, column=1, sticky="ew", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Remote Venv:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_remote_venv = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_remote_venv_var, width=44)
+        )
+        entry_remote_venv.grid(row=row, column=1, sticky="ew", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Offer Limit:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_offer_limit = self._register_cloud_dialog_widget(
+            ttk.Spinbox(outer, from_=1, to=200, increment=1, textvariable=self.cloud_offer_limit_var, width=12)
+        )
+        spin_offer_limit.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Max $/hr (0=off):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_max_dph = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_max_dph_var, width=12)
+        )
+        entry_max_dph.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Expected Runtime (h):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_expected_runtime = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_expected_runtime_hours_var, width=12)
+        )
+        entry_expected_runtime.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Expected Upload (GB):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_expected_up = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_expected_upload_gb_var, width=12)
+        )
+        entry_expected_up.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        ttk.Label(outer, text="Expected Download (GB):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_expected_down = self._register_cloud_dialog_widget(
+            ttk.Entry(outer, textvariable=self.cloud_expected_download_gb_var, width=12)
+        )
+        entry_expected_down.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        row += 1
+
+        auto_destroy_cb = self._register_cloud_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Auto destroy cloud instance after GUI run",
+                variable=self.cloud_auto_destroy_instance_var,
+            )
+        )
+        auto_destroy_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        row += 1
+
+        close_btn = self._register_cloud_dialog_widget(
+            ttk.Button(outer, text="Close", command=self._close_cloud_settings_dialog, width=12)
+        )
+        close_btn.grid(row=row, column=0, columnspan=2, sticky="e", padx=5, pady=(8, 2))
+
+        self._refresh_cloud_processing_summary()
+        self._apply_cloud_processing_overrides_visibility()
+        self._apply_cloud_options_visibility()
+
+    def _apply_cloud_options_visibility(self):
+        if not hasattr(self, 'cloud_settings_toggle_btn'):
+            return
+        is_open = (
+            self.cloud_settings_dialog is not None
+            and bool(self.cloud_settings_dialog.winfo_exists())
+        )
+        self.cloud_options_expanded_var.set(bool(is_open))
+        button_text = "  ↳ Cloud Settings Open" if is_open else "  ↳ Configure Cloud Dispatch..."
+        try:
+            self.cloud_settings_toggle_btn.configure(text=button_text)
+        except tk.TclError:
+            pass
+
+    def toggle_cloud_settings_visibility(self):
+        self._open_cloud_settings_dialog()
+
+    def _parse_cloud_env_file_data(self, path_value: str) -> Dict[str, str]:
+        parsed: Dict[str, str] = {}
+        candidate = path_value.strip()
+        if not candidate:
+            return parsed
+        env_path = os.path.expanduser(candidate)
+        if not os.path.isfile(env_path):
+            return parsed
+
+        try:
+            if _parse_cloud_env_file is not None:
+                parsed = _parse_cloud_env_file(Path(env_path))
+            else:
+                with open(env_path, "r", encoding="utf-8") as env_file:
+                    for raw in env_file.readlines():
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if line.startswith("export "):
+                            line = line[len("export "):].strip()
+                        if "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip().strip("'").strip('"')
+                        if key:
+                            parsed[key] = value
+        except Exception as parse_exc:
+            _logger.warning(f"Cloud env parsing warning for '{env_path}': {parse_exc}")
+        return parsed
+
+    def _resolve_cloud_api_key(self) -> str:
+        env_data = self._parse_cloud_env_file_data(self.cloud_vast_env_file_var.get())
+        for key in ("VAST_API_KEY", "VASTAI_API_KEY", "VAST_KEY"):
+            value = env_data.get(key, "").strip()
+            if value and "REPLACE_WITH" not in value.upper():
+                return value
+        return ""
+
+    def _build_vast_cli_cmd(self, args: List[str]) -> List[str]:
+        cmd = ["vastai"] + list(args)
+        api_key = self._resolve_cloud_api_key()
+        if api_key:
+            cmd.extend(["--api-key", api_key])
+        return cmd
+
+    def _parse_json_like_payload(self, raw_text: str):
+        text = (raw_text or "").strip()
+        if not text:
+            return None
+        candidates = [text]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines and lines[-1] not in candidates:
+            candidates.append(lines[-1])
+        for payload in candidates:
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    return parser(payload)
+                except Exception:
+                    continue
+        return None
+
+    def _parse_ssh_url_text(self, raw_text: str) -> Tuple[str, str, int]:
+        payload = self._parse_json_like_payload(raw_text)
+        text = ""
+        if isinstance(payload, dict):
+            for key in ("ssh_url", "url", "value"):
+                maybe = payload.get(key)
+                if isinstance(maybe, str) and maybe.strip():
+                    text = maybe.strip()
+                    break
+        elif isinstance(payload, list) and payload:
+            first = payload[0]
+            if isinstance(first, str):
+                text = first.strip()
+            elif isinstance(first, dict):
+                for key in ("ssh_url", "url", "value"):
+                    maybe = first.get(key)
+                    if isinstance(maybe, str) and maybe.strip():
+                        text = maybe.strip()
+                        break
+        if not text:
+            text = (raw_text or "").strip()
+        if not text:
+            return "", "", 0
+
+        patterns = [
+            r"ssh://(?P<user>[^@]+)@(?P<host>[^:\s]+):(?P<port>\d+)",
+            r"ssh\s+(?P<user>[^@\s]+)@(?P<host>[^\s]+)\s+-p\s+(?P<port>\d+)",
+            r"-p\s+(?P<port>\d+)\s+(?P<user>[^@\s]+)@(?P<host>[^\s]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            user = match.group("user")
+            host = match.group("host")
+            try:
+                port = int(match.group("port"))
+            except Exception:
+                port = 0
+            if user and host and port > 0:
+                return user, host, port
+        return "", "", 0
+
+    def _get_cloud_instance_status(self, instance_id: int) -> str:
+        show_cmd = self._build_vast_cli_cmd(["show", "instance", str(instance_id), "--raw"])
+        rc, lines = self._run_external_command_with_logging(show_cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if rc != 0:
+            return ""
+        raw = "\n".join(lines).strip()
+        payload = self._parse_json_like_payload(raw)
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
+            value = str(payload.get(key, "")).strip()
+            if value:
+                return value
+        return ""
+
+    def _wait_for_cloud_instance_ready(self, instance_id: int, timeout_sec: int = 900, poll_sec: int = 8) -> Dict[str, object]:
+        deadline = time.time() + max(15, int(timeout_sec))
+        last_status = ""
+        while time.time() < deadline:
+            if self.stop_event.is_set():
+                raise RuntimeError("Cancelled while waiting for cloud instance readiness.")
+
+            status_cmd = self._build_vast_cli_cmd(["show", "instance", str(instance_id), "--raw"])
+            status_rc, status_lines = self._run_external_command_with_logging(
+                status_cmd,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            status_raw = "\n".join(status_lines).strip()
+            status_payload = self._parse_json_like_payload(status_raw) if status_rc == 0 else None
+            status_text = ""
+            if isinstance(status_payload, dict):
+                for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
+                    value = str(status_payload.get(key, "")).strip()
+                    if value:
+                        status_text = value
+                        break
+            if status_text and status_text != last_status:
+                _logger.info(f"[CLOUD] Instance {instance_id} status: {status_text}")
+                self.message_queue.put(("status", f"Cloud instance {instance_id}: {status_text}"))
+                last_status = status_text
+
+            ssh_cmd = self._build_vast_cli_cmd(["ssh-url", str(instance_id)])
+            ssh_rc, ssh_lines = self._run_external_command_with_logging(
+                ssh_cmd,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            if ssh_rc == 0:
+                ssh_user, ssh_host, ssh_port = self._parse_ssh_url_text("\n".join(ssh_lines))
+                if ssh_host and ssh_port > 0:
+                    return {
+                        "instance_id": int(instance_id),
+                        "host": ssh_host,
+                        "port": int(ssh_port),
+                        "user": ssh_user or self.cloud_remote_user_var.get().strip() or "root",
+                        "remote_root": self.cloud_remote_root_var.get().strip() or "/opt/StereoCrafter",
+                        "remote_venv": self.cloud_remote_venv_var.get().strip() or "/opt/venv",
+                    }
+            time.sleep(max(1, int(poll_sec)))
+
+        raise RuntimeError(f"Timed out waiting for cloud instance {instance_id} readiness.")
+
+    def _cache_cloud_instance_connection(self, connection_info: Dict[str, object], profile: str):
+        instance_id = int(connection_info.get("instance_id", 0) or 0)
+        host = str(connection_info.get("host", "") or "")
+        port = int(connection_info.get("port", 22) or 22)
+        if instance_id > 0:
+            self.cloud_last_instance_id_var.set(instance_id)
+            self.cloud_last_instance_profile_var.set(profile or "")
+            self.cloud_last_host_var.set(host)
+            self.cloud_last_port_var.set(port)
+
+    def _start_cloud_instance_and_wait(self, instance_id: int) -> Dict[str, object]:
+        start_cmd = self._build_vast_cli_cmd(["start", "instance", str(instance_id), "--raw"])
+        start_rc, _ = self._run_external_command_with_logging(start_cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if start_rc != 0:
+            raise RuntimeError(f"Failed to start cloud instance {instance_id}.")
+        return self._wait_for_cloud_instance_ready(instance_id)
+
+    def _stop_cloud_instance(self, instance_id: int):
+        stop_cmd = self._build_vast_cli_cmd(["stop", "instance", str(instance_id), "--raw"])
+        stop_rc, _ = self._run_external_command_with_logging(stop_cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if stop_rc != 0:
+            raise RuntimeError(f"Failed to stop cloud instance {instance_id}.")
+
+    def _run_cloud_admin_action_async(self, action_name: str, action_fn):
+        if self.processing_thread and self.processing_thread.is_alive():
+            messagebox.showwarning("Busy", "Processing is currently active. Wait for it to finish before cloud admin actions.")
+            return
+        self.stop_event.clear()
+
+        def _runner():
+            try:
+                self.message_queue.put(("status", f"Cloud {action_name}..."))
+                action_fn()
+                self.message_queue.put(("status", f"Cloud {action_name} complete."))
+            except Exception as admin_exc:
+                _logger.exception(f"Cloud {action_name} failed: {admin_exc}")
+                self.message_queue.put(("status", f"Cloud {action_name} failed: {admin_exc.__class__.__name__}"))
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def _force_start_cached_cloud_instance_from_ui(self):
+        try:
+            instance_id = int(self.cloud_last_instance_id_var.get())
+        except Exception:
+            instance_id = 0
+        if instance_id <= 0:
+            messagebox.showerror("Cloud", "Set a valid cached instance ID first.")
+            return
+
+        def _start():
+            conn = self._start_cloud_instance_and_wait(instance_id)
+            profile = self.cloud_last_instance_profile_var.get().strip() or self.cloud_profile_var.get().strip()
+            self._cache_cloud_instance_connection(conn, profile)
+
+        self._run_cloud_admin_action_async(f"start instance {instance_id}", _start)
+
+    def _force_stop_cached_cloud_instance_from_ui(self):
+        try:
+            instance_id = int(self.cloud_last_instance_id_var.get())
+        except Exception:
+            instance_id = 0
+        if instance_id <= 0:
+            messagebox.showerror("Cloud", "Set a valid cached instance ID first.")
+            return
+
+        def _stop():
+            self._stop_cloud_instance(instance_id)
+
+        self._run_cloud_admin_action_async(f"stop instance {instance_id}", _stop)
+
+    def _clear_cached_cloud_instance_from_ui(self):
+        self.cloud_last_instance_id_var.set(0)
+        self.cloud_last_instance_profile_var.set("")
+        self.cloud_last_host_var.set("")
+        self.cloud_last_port_var.set(22)
+        self.message_queue.put(("status", "Cloud cached instance cleared."))
+
+    def _run_external_command_with_logging(self, cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, List[str]]:
+        log_cmd = " ".join(shlex.quote(str(part)) for part in cmd)
+        _logger.info(f"[CLOUD] $ {log_cmd}")
+        output_lines: List[str] = []
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.active_external_process = process
+        terminate_requested = False
+        try:
+            if process.stdout is not None:
+                stdout_fd = process.stdout.fileno()
+                while True:
+                    if self.stop_event.is_set() and process.poll() is None and not terminate_requested:
+                        _logger.info("Cancellation requested; terminating active cloud command...")
+                        terminate_requested = True
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+
+                    ready, _, _ = select.select([stdout_fd], [], [], 0.25)
+                    if ready:
+                        line = process.stdout.readline()
+                        if line:
+                            stripped = line.rstrip("\n")
+                            output_lines.append(stripped)
+                            _logger.info(stripped)
+
+                    if process.poll() is not None:
+                        remaining = process.stdout.read() or ""
+                        if remaining:
+                            for tail_line in remaining.splitlines():
+                                output_lines.append(tail_line)
+                                _logger.info(tail_line)
+                        break
+            returncode = process.wait()
+            return returncode, output_lines
+        finally:
+            self.active_external_process = None
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+
+    def _build_cloud_launcher_command(
+        self,
+        repo_root: str,
+        base_cfg_path: str,
+        generated_cfg_path: str,
+    ) -> List[str]:
+        cloud_settings = self._get_effective_cloud_processing_settings()
+        cloud_image = self.cloud_image_var.get().strip()
+        if not cloud_image:
+            raise RuntimeError("Cloud image is empty. Set it in Cloud Dispatch settings.")
+
+        cloud_target_width_override = int(cloud_settings["target_width_override"])
+        cloud_target_height_override = int(cloud_settings["target_height_override"])
+        cloud_window_override = int(cloud_settings["window_size_override"])
+        cloud_overlap_override = int(cloud_settings["overlap_override"])
+        # vast_worker_launch expects explicit values; for window/overlap we inherit main dialog when sentinel is used.
+        launcher_window_override = (
+            cloud_window_override if cloud_window_override > 0 else int(cloud_settings["base_window"])
+        )
+        launcher_overlap_override = (
+            cloud_overlap_override if cloud_overlap_override >= 0 else int(cloud_settings["base_overlap"])
+        )
+
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "cloud", "vast_worker_launch.py"),
+            "--profile",
+            self.cloud_profile_var.get().strip() or "5090_32gb",
+            "--image",
+            cloud_image,
+            "--disk",
+            str(int(self.cloud_disk_gb_var.get())),
+            "--base-config",
+            base_cfg_path,
+            "--output-config",
+            generated_cfg_path,
+            "--remote-user",
+            self.cloud_remote_user_var.get().strip() or "root",
+            "--remote-root",
+            self.cloud_remote_root_var.get().strip() or "/opt/StereoCrafter",
+            "--remote-venv",
+            self.cloud_remote_venv_var.get().strip() or "/opt/venv",
+            "--offer-limit",
+            str(int(self.cloud_offer_limit_var.get())),
+            "--expected-runtime-hours",
+            str(float(self.cloud_expected_runtime_hours_var.get())),
+            "--expected-upload-gb",
+            str(float(self.cloud_expected_upload_gb_var.get())),
+            "--expected-download-gb",
+            str(float(self.cloud_expected_download_gb_var.get())),
+            "--target-width-override",
+            str(cloud_target_width_override),
+            "--target-height-override",
+            str(cloud_target_height_override),
+            "--window-size-override",
+            str(launcher_window_override),
+            "--overlap-override",
+            str(launcher_overlap_override),
+            "--force-cpu-offload",
+            self.cpu_offload.get(),
+            "--yes",
+            "--no-go-prompt",
+        ]
+
+        max_dph_value = float(self.cloud_max_dph_var.get())
+        if max_dph_value > 0.0:
+            cmd.extend(["--max-dph", str(max_dph_value)])
+
+        identity_file = self.cloud_identity_file_var.get().strip()
+        if identity_file:
+            cmd.extend(["--identity", os.path.expanduser(identity_file)])
+
+        vast_env_file = self.cloud_vast_env_file_var.get().strip()
+        if vast_env_file:
+            cmd.extend(["--vast-env-file", os.path.expanduser(vast_env_file)])
+
+        if bool(self.cloud_no_hf_env_var.get()):
+            cmd.append("--no-hf-env")
+        else:
+            hf_env_file = self.cloud_hf_env_file_var.get().strip()
+            if hf_env_file:
+                cmd.extend(["--hf-env-file", os.path.expanduser(hf_env_file)])
+
+        return cmd
+
+    def _launch_cloud_worker_for_gui_run(
+        self,
+        source_specs_to_process: List[Dict],
+        effective_seed_for_run: int,
+    ) -> Dict[str, object]:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        cloud_tmp_root = os.path.join(self.output_dir.get(), ".cloud_gui_tmp")
+        os.makedirs(cloud_tmp_root, exist_ok=True)
+        run_stamp = time.strftime("%Y%m%d_%H%M%S")
+
+        base_cfg_path = os.path.join(cloud_tmp_root, f"cloud_gui_base_{run_stamp}.json")
+        generated_cfg_path = os.path.join(cloud_tmp_root, f"cloud_gui_generated_{run_stamp}.json")
+
+        base_settings = self._collect_all_settings()
+        base_settings["seed"] = effective_seed_for_run
+        base_settings["output_dir"] = self.output_dir.get()
+        if source_specs_to_process:
+            base_settings["input_dir_or_file_var"] = source_specs_to_process[0]["path"]
+
+        with open(base_cfg_path, "w", encoding="utf-8") as base_cfg_file:
+            json.dump(base_settings, base_cfg_file, indent=2)
+
+        launcher_cmd = self._build_cloud_launcher_command(
+            repo_root=repo_root,
+            base_cfg_path=base_cfg_path,
+            generated_cfg_path=generated_cfg_path,
+        )
+
+        self.status_message_var.set("Cloud: selecting offer and launching worker...")
+        self.root.update_idletasks()
+        rc, _ = self._run_external_command_with_logging(launcher_cmd, cwd=repo_root)
+        if rc != 0:
+            raise RuntimeError(f"Cloud worker launch failed with exit code {rc}.")
+        if self.stop_event.is_set():
+            raise RuntimeError("Cancelled while launching cloud worker.")
+
+        generated_cfg = load_json_file(generated_cfg_path)
+        if not isinstance(generated_cfg, dict):
+            raise RuntimeError("Cloud launch did not produce a readable generated config.")
+        cloud_remote = generated_cfg.get("cloud_remote", {})
+        if not isinstance(cloud_remote, dict):
+            raise RuntimeError("Generated cloud config missing 'cloud_remote' details.")
+
+        host = str(cloud_remote.get("vast_host", "")).strip()
+        if not host:
+            raise RuntimeError("Cloud launch completed but host was not found in generated config.")
+
+        connection = {
+            "instance_id": int(cloud_remote.get("vast_instance_id", 0) or 0),
+            "host": host,
+            "port": int(cloud_remote.get("vast_ssh_port", 22) or 22),
+            "user": str(cloud_remote.get("vast_user", "root") or "root"),
+            "remote_root": str(cloud_remote.get("remote_root", self.cloud_remote_root_var.get()) or self.cloud_remote_root_var.get()),
+            "remote_venv": str(cloud_remote.get("remote_venv", self.cloud_remote_venv_var.get()) or self.cloud_remote_venv_var.get()),
+            "generated_cfg_path": generated_cfg_path,
+            "base_cfg_path": base_cfg_path,
+            "target_width": int(generated_cfg.get("target_width", self._safe_int_from_tk_var(self.target_width, 1920))),
+            "target_height": int(generated_cfg.get("target_height", self._safe_int_from_tk_var(self.target_height, 1040))),
+            "window_size": int(generated_cfg.get("window_size", self._safe_int_from_tk_var(self.window_size, 75))),
+            "overlap": int(generated_cfg.get("overlap", self._safe_int_from_tk_var(self.overlap, 25))),
+            "cpu_offload": str(generated_cfg.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get()),
+        }
+        self._cache_cloud_instance_connection(connection, self.cloud_profile_var.get().strip())
+        return connection
+
+    def _build_cloudctl_run_job_command(
+        self,
+        connection_info: Dict[str, object],
+        source_spec: Dict,
+        effective_seed_for_run: int,
+        source_idx: int,
+        total_sources: int,
+    ) -> Tuple[List[str], str]:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        cloud_settings = self._get_effective_cloud_processing_settings()
+        cloud_target_width = int(connection_info.get("target_width", int(cloud_settings["target_width"])))
+        cloud_target_height = int(connection_info.get("target_height", int(cloud_settings["target_height"])))
+        cloud_window_size = int(connection_info.get("window_size", int(cloud_settings["window_size"])))
+        cloud_overlap = int(connection_info.get("overlap", int(cloud_settings["overlap"])))
+        cloud_cpu_offload = str(connection_info.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get())
+        original_basename = source_spec["basename"]
+        job_name = (
+            f"{original_basename}_cloud_{source_idx + 1:03d}"
+            if total_sources > 1
+            else f"{original_basename}_cloud"
+        )
+        cloud_output_format = str(self.merge_output_format_var.get())
+        if cloud_output_format not in ("mp4", "main10_mp4"):
+            cloud_output_format = "main10_mp4"
+
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "cloud", "cloudctl.py"),
+            "run-job",
+            "--host",
+            str(connection_info["host"]),
+            "--user",
+            str(connection_info["user"]),
+            "--port",
+            str(int(connection_info["port"])),
+            "--remote-root",
+            str(connection_info["remote_root"]),
+            "--venv-name",
+            str(connection_info["remote_venv"]),
+            "--local-input",
+            source_spec["path"],
+            "--job-name",
+            job_name,
+            "--download-dir",
+            self.output_dir.get(),
+            "--target-width",
+            str(cloud_target_width),
+            "--target-height",
+            str(cloud_target_height),
+            "--window-size",
+            str(cloud_window_size),
+            "--overlap",
+            str(cloud_overlap),
+            "--inference-steps",
+            str(int(self.inference_steps.get())),
+            "--guidance-scale",
+            str(float(self.guidance_scale.get())),
+            "--seed",
+            str(int(effective_seed_for_run)),
+            "--target-fps",
+            str(float(self.target_fps.get())),
+            "--process-length",
+            str(int(self.process_length.get())),
+            "--output-format",
+            cloud_output_format,
+            "--cpu-offload",
+            cloud_cpu_offload,
+        ]
+
+        identity_file = self.cloud_identity_file_var.get().strip()
+        if identity_file:
+            cmd.extend(["--identity", os.path.expanduser(identity_file)])
+
+        if bool(self.disable_xformers_var.get()):
+            cmd.append("--disable-xformers")
+        if bool(self.use_cudnn_benchmark.get()):
+            cmd.append("--use-cudnn-benchmark")
+        if bool(self.use_local_models_only_var.get()):
+            cmd.append("--local-files-only")
+
+        return cmd, job_name
+
+    def _update_gui_info_from_cloud_status(self, job_info_stub: Dict, status_json_path: str):
+        status_data = load_json_file(status_json_path)
+        if not isinstance(status_data, dict):
+            return
+        metadata = status_data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return
+        self._update_gui_info_on_job_finish(job_info_stub, metadata)
+
+    def _destroy_cloud_instance(self, instance_id: int):
+        if instance_id <= 0:
+            return
+        destroy_cmd = self._build_vast_cli_cmd(["destroy", "instance", str(instance_id), "--raw"])
+        try:
+            rc, _ = self._run_external_command_with_logging(destroy_cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+            if rc != 0:
+                _logger.warning(f"Cloud instance destroy returned exit code {rc} for instance {instance_id}.")
+        except Exception as destroy_exc:
+            _logger.warning(f"Cloud instance destroy failed for {instance_id}: {destroy_exc}")
+
+    def _get_reusable_cloud_connection(self, instance_id: int) -> Dict[str, object]:
+        status = (self._get_cloud_instance_status(instance_id) or "").strip().lower()
+        if status:
+            _logger.info(f"[CLOUD] Cached instance {instance_id} reported status: {status}")
+        if any(token in status for token in ("stopped", "offline", "exited")):
+            _logger.info(f"[CLOUD] Starting cached instance {instance_id}...")
+            return self._start_cloud_instance_and_wait(instance_id)
+        if any(token in status for token in ("destroy", "failed", "error")):
+            raise RuntimeError(f"Cached instance {instance_id} is not reusable (status: {status}).")
+        return self._wait_for_cloud_instance_ready(instance_id)
+
+    def _run_cloud_dispatch_mode(self, source_specs_to_process: List[Dict], effective_seed_for_run: int):
+        if not source_specs_to_process:
+            return
+        unsupported_sources = [
+            spec for spec in source_specs_to_process
+            if spec.get("type") not in ("video_file", "single_video_file")
+        ]
+        if unsupported_sources:
+            raise RuntimeError("Cloud dispatch mode currently supports video files only (no image sequences/images).")
+        selected_profile = self.cloud_profile_var.get().strip() or "5090_32gb"
+        cloud_settings = self._get_effective_cloud_processing_settings()
+        _logger.info(
+            "[CLOUD] Effective run settings | profile=%s target=%sx%s window=%s overlap=%s",
+            selected_profile,
+            cloud_settings["target_width"],
+            cloud_settings["target_height"],
+            cloud_settings["window_size"],
+            cloud_settings["overlap"],
+        )
+        reuse_enabled = bool(self.cloud_reuse_existing_instance_var.get())
+        cached_profile = self.cloud_last_instance_profile_var.get().strip()
+        try:
+            cached_instance_id = int(self.cloud_last_instance_id_var.get())
+        except Exception:
+            cached_instance_id = 0
+        connection_info: Optional[Dict[str, object]] = None
+
+        if reuse_enabled and cached_instance_id > 0 and cached_profile == selected_profile:
+            reuse_choice = messagebox.askyesnocancel(
+                "Cloud Dispatch",
+                f"Reuse cached instance {cached_instance_id} for profile '{selected_profile}'?\n\n"
+                "Yes = reuse/start cached instance\n"
+                "No = launch new cheapest worker\n"
+                "Cancel = abort"
+            )
+            if reuse_choice is None:
+                _logger.info("Cloud dispatch cancelled by user.")
+                self.status_message_var.set("Cloud dispatch cancelled.")
+                return
+            if reuse_choice:
+                try:
+                    self.status_message_var.set(f"Cloud: checking cached instance {cached_instance_id}...")
+                    self.root.update_idletasks()
+                    connection_info = self._get_reusable_cloud_connection(cached_instance_id)
+                    self._cache_cloud_instance_connection(connection_info, selected_profile)
+                except Exception as reuse_exc:
+                    _logger.warning(f"Cached instance reuse failed: {reuse_exc}")
+                    fallback_launch = messagebox.askyesno(
+                        "Cloud Dispatch",
+                        f"Could not reuse cached instance {cached_instance_id}.\n\n"
+                        f"Reason: {reuse_exc}\n\nLaunch a new worker instead?"
+                    )
+                    if not fallback_launch:
+                        self.status_message_var.set("Cloud dispatch cancelled.")
+                        return
+            # If user pressed "No", fall through to new launch.
+        else:
+            launch_confirm = messagebox.askyesno(
+                "Cloud Dispatch",
+                f"Launch cloud worker profile '{selected_profile}' and process "
+                f"{len(source_specs_to_process)} clip(s) remotely?"
+            )
+            if not launch_confirm:
+                _logger.info("Cloud dispatch cancelled by user before worker launch.")
+                self.status_message_var.set("Cloud dispatch cancelled.")
+                return
+
+        if connection_info is None:
+            connection_info = self._launch_cloud_worker_for_gui_run(
+                source_specs_to_process=source_specs_to_process,
+                effective_seed_for_run=effective_seed_for_run,
+            )
+        instance_id = int(connection_info.get("instance_id", 0) or 0)
+        total_sources_processed = 0
+
+        try:
+            for source_idx, source_spec in enumerate(source_specs_to_process):
+                if self.stop_event.is_set():
+                    _logger.info("Cloud dispatch cancelled by user.")
+                    break
+
+                current_video_path = source_spec["path"]
+                original_basename = source_spec["basename"]
+                self.current_filename_var.set(f"{original_basename} (Cloud)")
+                self.current_resolution_var.set("N/A")
+                self.current_frames_var.set("N/A")
+                self.status_message_var.set(
+                    f"Cloud processing {source_idx + 1} of {len(source_specs_to_process)}: {original_basename}"
+                )
+                self.root.update_idletasks()
+
+                job_stub = {
+                    "is_segment": False,
+                    "original_video_raw_frame_count": "N/A",
+                }
+                self._update_gui_info_on_job_start(job_stub, original_basename, "Cloud")
+
+                cloud_cmd, job_name = self._build_cloudctl_run_job_command(
+                    connection_info=connection_info,
+                    source_spec=source_spec,
+                    effective_seed_for_run=effective_seed_for_run,
+                    source_idx=source_idx,
+                    total_sources=len(source_specs_to_process),
+                )
+
+                rc, _ = self._run_external_command_with_logging(
+                    cloud_cmd,
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                )
+                if rc != 0:
+                    _logger.error(f"Cloud job failed for {original_basename} with exit code {rc}.")
+                    if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
+                        self._move_original_source(current_video_path, original_basename, "failed")
+                else:
+                    status_json_path = os.path.join(self.output_dir.get(), job_name, "job_status.json")
+                    self._update_gui_info_from_cloud_status(job_stub, status_json_path)
+                    if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
+                        self._move_original_source(current_video_path, original_basename, "finished")
+
+                total_sources_processed += 1
+                self.message_queue.put(("progress", total_sources_processed))
+
+            if self.stop_event.is_set():
+                self.status_message_var.set("Cloud processing cancelled.")
+            else:
+                self.status_message_var.set("Cloud processing finished.")
+        finally:
+            if bool(self.cloud_auto_destroy_instance_var.get()) and instance_id > 0:
+                self.status_message_var.set(f"Destroying cloud instance {instance_id}...")
+                self.root.update_idletasks()
+                self._destroy_cloud_instance(instance_id)
+                self.cloud_last_instance_id_var.set(0)
+                self.cloud_last_instance_profile_var.set("")
+                self.cloud_last_host_var.set("")
+                self.cloud_last_port_var.set(22)
 
     def _apply_spatial_refine_options_visibility(self):
         if not hasattr(self, 'spatial_refine_toggle_btn'):

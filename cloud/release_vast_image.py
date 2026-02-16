@@ -15,6 +15,7 @@ import argparse
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from shutil import which
 from typing import Dict, Iterable, List, Sequence
@@ -120,8 +121,16 @@ def build_docker_cmd(args: argparse.Namespace) -> List[str]:
         "--build-arg",
         f"GIT_BRANCH={args.git_branch}",
     ]
+    if args.git_commit:
+        cmd += ["--build-arg", f"GIT_COMMIT={args.git_commit}"]
+    if args.refresh_repo:
+        cmd += ["--build-arg", f"GIT_CACHE_BUST={args.git_cache_bust}"]
     if args.base_image:
         cmd += ["--build-arg", f"BASE_IMAGE={args.base_image}"]
+    if args.docker_pull_base:
+        cmd += ["--pull"]
+    if args.docker_no_cache:
+        cmd += ["--no-cache"]
     if args.platform:
         cmd += ["--platform", args.platform]
     cmd.append(str(args.context))
@@ -155,11 +164,33 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--image", required=True, help="Registry image ref (registry/repo:tag).")
     p.add_argument("--git-repo-url", required=True, help="GitHub repo URL to clone in image build.")
     p.add_argument("--git-branch", default="004_depthcrafter_on_cloud")
+    p.add_argument(
+        "--git-commit",
+        default="",
+        help="Optional commit SHA/ref to pin inside image after cloning the branch.",
+    )
+    p.add_argument(
+        "--refresh-repo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force-refresh git clone layer so branch updates are fetched on rebuild (default: true).",
+    )
 
     p.add_argument("--dockerfile", default=str(Path("cloud") / "Dockerfile.vastai"))
     p.add_argument("--context", default=".")
     p.add_argument("--platform", default="linux/amd64")
     p.add_argument("--base-image", default="")
+    p.add_argument(
+        "--docker-pull-base",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pass --pull to docker build to refresh base image (can trigger full rebuild; default: false).",
+    )
+    p.add_argument(
+        "--docker-no-cache",
+        action="store_true",
+        help="Pass --no-cache to docker build (rebuild all layers).",
+    )
 
     p.add_argument("--env-file", default=str(Path("cloud") / "hf.env"))
     p.add_argument("--no-env-file", action="store_true", help="Do not pass --env to vastai.")
@@ -190,6 +221,17 @@ def main() -> int:
     args = parser().parse_args()
 
     validate_image_ref(args.image)
+    args.git_commit = args.git_commit.strip()
+    if args.git_commit:
+        log(f"Pinning image repo checkout to ref: {args.git_commit}")
+    args.git_cache_bust = str(int(time.time())) if args.refresh_repo else "0"
+    if args.refresh_repo:
+        log(f"Refreshing repo clone layer (token={args.git_cache_bust})")
+    if args.docker_pull_base:
+        log("Base image pull is enabled; if the base tag changed, Docker may rebuild from early layers.")
+    else:
+        log("Base image pull is disabled for faster incremental rebuilds (last layers only when possible).")
+
     env_file = Path(args.env_file).expanduser().resolve()
     ghcr_env_file = Path(args.ghcr_env_file).expanduser().resolve()
     dockerfile = Path(args.dockerfile).expanduser().resolve()
