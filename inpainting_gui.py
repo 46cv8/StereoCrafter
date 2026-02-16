@@ -19,6 +19,7 @@ import time
 import subprocess # NEW: For running ffprobe and ffmpeg
 import cv2 # NEW: For saving 16-bit PNGs
 import logging
+import re
 
 try:
     import psutil
@@ -66,6 +67,7 @@ class InpaintingGUI(ThemedTk):
         self.original_input_blend_strength_var = tk.StringVar(value=str(self.app_config.get("original_input_blend_strength", 0.0)))
         self.output_crf_var = tk.StringVar(value=str(self.app_config.get("output_crf", 23)))
         self.process_length_var = tk.StringVar(value=str(self.app_config.get("process_length", -1)))
+        self.single_clip_id_var = tk.StringVar(value=str(self.app_config.get("single_clip_id", "")))
         self.offload_type_var = tk.StringVar(value=self.app_config.get("offload_type", "model"))
         self.hires_blend_folder_var = tk.StringVar(value=self.app_config.get("hires_blend_folder", "./output_splatted_hires"))
         
@@ -1572,6 +1574,7 @@ class InpaintingGUI(ThemedTk):
             "num_inference_steps": self.num_inference_steps_var.get(),
             "tile_num": self.tile_num_var.get(),
             "process_length": self.process_length_var.get(),
+            "single_clip_id": self.single_clip_id_var.get(),
             "frames_chunk": self.frames_chunk_var.get(),
             "frame_overlap": self.overlap_var.get(),
             "original_input_blend_strength": self.original_input_blend_strength_var.get(),            
@@ -2084,7 +2087,19 @@ class InpaintingGUI(ThemedTk):
         ttk.OptionMenu(param_frame, self.offload_type_var, self.offload_type_var.get(), *offload_options).grid(row=current_row, column=3, sticky="w", padx=5)
         current_row += 1
 
-        # Row 4: Inpaint Pre-Threshold (Left) & Inpaint Post-Threshold (Right)
+        # Row 4: Single Clip ID
+        single_clip_id_label = ttk.Label(param_frame, text="Single Clip ID:")
+        single_clip_id_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
+        Tooltip(single_clip_id_label, self.help_data.get("single_clip_id", "Optional clip ID filter. Leave blank to process all clips."))
+        ttk.Entry(param_frame, textvariable=self.single_clip_id_var, width=10).grid(
+            row=current_row, column=1, sticky="w", padx=5
+        )
+        ttk.Label(param_frame, text="Blank = all clips").grid(
+            row=current_row, column=2, columnspan=2, sticky="w", padx=5, pady=2
+        )
+        current_row += 1
+
+        # Row 5: Inpaint Pre-Threshold (Left) & Inpaint Post-Threshold (Right)
         inpaint_bin_thresh_label = ttk.Label(param_frame, text="Inpaint Pre Thresh:")
         inpaint_bin_thresh_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inpaint_bin_thresh_label, self.help_data.get("inpaint_mask_initial_threshold", ""))
@@ -2100,7 +2115,7 @@ class InpaintingGUI(ThemedTk):
         )
         current_row += 1
 
-        # Row 5: Inpaint Morph Close (Left) & Inpaint Dilate Kernel (Right)
+        # Row 6: Inpaint Morph Close (Left) & Inpaint Dilate Kernel (Right)
         inpaint_morph_kernel_label = ttk.Label(param_frame, text="Inpaint Morph Close:")
         inpaint_morph_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inpaint_morph_kernel_label, self.help_data.get("inpaint_mask_morph_kernel_size", ""))
@@ -2116,7 +2131,7 @@ class InpaintingGUI(ThemedTk):
         )
         current_row += 1
 
-        # Row 6: Inpaint Blur Kernel
+        # Row 7: Inpaint Blur Kernel
         inpaint_blur_kernel_label = ttk.Label(param_frame, text="Inpaint Blur Kernel:")
         inpaint_blur_kernel_label.grid(row=current_row, column=0, sticky="e", padx=5, pady=2)
         Tooltip(inpaint_blur_kernel_label, self.help_data.get("inpaint_mask_blur_kernel_size", ""))
@@ -2706,6 +2721,7 @@ class InpaintingGUI(ThemedTk):
         self.frames_chunk_var.set("23")
         self.overlap_var.set("3")
         self.original_input_blend_strength_var.set("0.5")
+        self.single_clip_id_var.set("")
         self.offload_type_var.set("model")
 
         self.inpaint_mask_initial_threshold_var.set("0.3")
@@ -2781,6 +2797,21 @@ class InpaintingGUI(ThemedTk):
             messagebox.showinfo("Restore Complete", "No files found to restore.")
             logger.info("Restore complete: No files found to restore.")
 
+    def _extract_clip_id_from_video_path(self, video_path: str) -> Optional[int]:
+        """
+        Best-effort parser for clip ID in splatted filenames.
+        Expected common format: *-0006_640_splatted4.mp4 -> 6
+        """
+        stem = os.path.splitext(os.path.basename(video_path))[0]
+        strict_match = re.search(r"-(\d+)_\d+_splatted[24]$", stem)
+        if strict_match:
+            return int(strict_match.group(1))
+
+        fallback_matches = re.findall(r"-(\d+)(?:_|$)", stem)
+        if fallback_matches:
+            return int(fallback_matches[-1])
+        return None
+
     def run_batch_process(
             self,
             input_folder,
@@ -2790,7 +2821,8 @@ class InpaintingGUI(ThemedTk):
             frames_chunk, gui_overlap,
             gui_original_input_blend_strength,
             gui_output_crf,
-            process_length
+            process_length,
+            single_clip_id
         ):
         """
         Orchestrates the batch processing of videos, handling sidecar JSON,
@@ -2809,6 +2841,38 @@ class InpaintingGUI(ThemedTk):
                 self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in input folder"))
                 self.after(0, self.processing_done)
                 return
+
+            if single_clip_id is not None:
+                filtered_videos = []
+                unparsable_count = 0
+                for video_path in input_videos:
+                    parsed_clip_id = self._extract_clip_id_from_video_path(video_path)
+                    if parsed_clip_id is None:
+                        unparsable_count += 1
+                        continue
+                    if parsed_clip_id == single_clip_id:
+                        filtered_videos.append(video_path)
+
+                if unparsable_count > 0:
+                    logger.warning(
+                        f"Single Clip ID mode: skipped {unparsable_count} file(s) because clip ID could not be parsed."
+                    )
+
+                if not filtered_videos:
+                    self.after(
+                        0,
+                        lambda: messagebox.showinfo(
+                            "Info",
+                            f"No .mp4 files matched Single Clip ID {single_clip_id} in input folder.",
+                        ),
+                    )
+                    self.after(0, self.processing_done)
+                    return
+
+                logger.info(
+                    f"Single Clip ID mode enabled: processing clip ID {single_clip_id} ({len(filtered_videos)} file(s))."
+                )
+                input_videos = filtered_videos
 
             self.total_videos.set(len(input_videos))
             # finished_folder = os.path.join(input_folder, "finished")
@@ -2898,33 +2962,38 @@ class InpaintingGUI(ThemedTk):
                 )
                 
                 if completed:
-                    # Define finished folder paths dynamically
-                    low_res_input_folder = input_folder
-                    hires_input_folder = self.hires_blend_folder_var.get()
+                    if single_clip_id is not None:
+                        logger.info(
+                            "Single Clip ID mode: leaving processed input files in place (skipping move to 'finished')."
+                        )
+                    else:
+                        # Define finished folder paths dynamically
+                        low_res_input_folder = input_folder
+                        hires_input_folder = self.hires_blend_folder_var.get()
 
-                    low_res_finished_folder = os.path.join(low_res_input_folder, "finished")
-                    
-                    # 1. Move LOW-RES input file
-                    try:
-                        os.makedirs(low_res_finished_folder, exist_ok=True) # Ensure low-res finished exists
-                        shutil.move(video_path, low_res_finished_folder)
-                        logger.debug(f"Moved {video_path} to {low_res_finished_folder}")
-                    except Exception as e:
-                        logger.error(f"Failed to move {video_path} to {low_res_finished_folder}: {e}")
-                        
-                    # 2. Move HI-RES input file if it was used
-                    if hi_res_input_path:
-                        # Ensure the high-res folder is different before trying to move
-                        if os.path.normpath(low_res_input_folder) != os.path.normpath(hires_input_folder):
-                            hires_finished_folder = os.path.join(hires_input_folder, "finished")
-                            try:
-                                os.makedirs(hires_finished_folder, exist_ok=True) # Ensure hi-res finished exists
-                                shutil.move(hi_res_input_path, hires_finished_folder)
-                                logger.debug(f"Moved Hi-Res input {hi_res_input_path} to {hires_finished_folder}")
-                            except Exception as e:
-                                logger.error(f"Failed to move Hi-Res input {hi_res_input_path} to {hires_finished_folder}: {e}")
-                        else:
-                            logger.warning(f"Skipping Hi-Res move: Folder {hires_input_folder} is same as Low-Res folder.")
+                        low_res_finished_folder = os.path.join(low_res_input_folder, "finished")
+
+                        # 1. Move LOW-RES input file
+                        try:
+                            os.makedirs(low_res_finished_folder, exist_ok=True) # Ensure low-res finished exists
+                            shutil.move(video_path, low_res_finished_folder)
+                            logger.debug(f"Moved {video_path} to {low_res_finished_folder}")
+                        except Exception as e:
+                            logger.error(f"Failed to move {video_path} to {low_res_finished_folder}: {e}")
+
+                        # 2. Move HI-RES input file if it was used
+                        if hi_res_input_path:
+                            # Ensure the high-res folder is different before trying to move
+                            if os.path.normpath(low_res_input_folder) != os.path.normpath(hires_input_folder):
+                                hires_finished_folder = os.path.join(hires_input_folder, "finished")
+                                try:
+                                    os.makedirs(hires_finished_folder, exist_ok=True) # Ensure hi-res finished exists
+                                    shutil.move(hi_res_input_path, hires_finished_folder)
+                                    logger.debug(f"Moved Hi-Res input {hi_res_input_path} to {hires_finished_folder}")
+                                except Exception as e:
+                                    logger.error(f"Failed to move Hi-Res input {hi_res_input_path} to {hires_finished_folder}: {e}")
+                            else:
+                                logger.warning(f"Skipping Hi-Res move: Folder {hires_input_folder} is same as Low-Res folder.")
                 else:
                     logger.info(f"Processing of {video_path} was stopped or skipped due to issues.")
                 
@@ -2963,13 +3032,20 @@ class InpaintingGUI(ThemedTk):
             process_length = int(self.process_length_var.get())
             if process_length != -1 and process_length <= 0:
                 raise ValueError("Process Length must be -1 or a positive integer.")
+
+            single_clip_id_raw = self.single_clip_id_var.get().strip()
+            single_clip_id = None
+            if single_clip_id_raw:
+                single_clip_id = int(single_clip_id_raw)
+                if single_clip_id < 0:
+                    raise ValueError("Single Clip ID must be blank or a non-negative integer.")
             
             if num_inference_steps < 1 or tile_num < 1 or frames_chunk < 1 or gui_overlap  < 0 or \
                not (0.0 <= gui_original_input_blend_strength  <= 1.0) or gui_output_crf < 0: # NEW VALIDATION for CRF
                 raise ValueError("Invalid parameter values")
         except ValueError:
             # UPDATED ERROR MESSAGE
-            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0.")
+            messagebox.showerror("Error", "Please enter valid values: Inference Steps >=1, Tile Number >=1, Frames Chunk >=1, Frame Overlap >=0, Original Input Bias between 0.0 and 1.0, Output CRF >=0, Process Length is -1 or >0, and Single Clip ID is blank or >=0.")
             return
         offload_type = self.offload_type_var.get()
 
@@ -2987,7 +3063,7 @@ class InpaintingGUI(ThemedTk):
         self.update_video_info_display("N/A", "N/A", "N/A", "N/A", "N/A")
 
         threading.Thread(target=self.run_batch_process,
-                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf, process_length),
+                         args=(input_folder, output_folder, num_inference_steps, tile_num, offload_type, frames_chunk, gui_overlap, gui_original_input_blend_strength, gui_output_crf, process_length, single_clip_id),
                          daemon=True).start()
 
     def stop_processing(self):

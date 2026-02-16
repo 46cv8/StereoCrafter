@@ -9,6 +9,7 @@
   "original_input_blend_strength": "Controls how much the original warped input (1.0) versus the previous generated inpainted frame (0.0) influences the blend during temporal overlap. higher for less hallucination but less consistency Default:0 = Off",
   "offload_type": "Determines how parts of the model are moved to CPU memory to reduce GPU VRAM usage. 'model' offloads entire components, 'sequential' offloads layers one by one, 'none' keeps everything on GPU.",
   "process_length": "Number of frames to process for each video. Enter -1 to process all frames, or a positive integer to limit the processing to the first N frames. Useful for quick testing.",
+  "single_clip_id": "Optional clip ID filter for batch input names (example: entering 6 targets files like '*-0006_*'). Leave blank to process all clips. When this filter is used, processed input files are left in place and are not moved to a 'finished' folder.",
   "inpaint_mask_initial_threshold": "Pre-threshold for the inpainting mask pipeline. Applied before morph/dilate/blur. Lower values include more pixels. Set to 0 to skip pre-binarization.",
   "inpaint_mask_post_threshold": "Post-threshold for the inpainting mask pipeline. Applied after morph/dilate/blur. Set to 0 to keep soft mask values (no final binarization).",
   "inpaint_mask_morph_kernel_size": "Morphological closing kernel for the inpainting mask pipeline. Helps fill small holes before inference. Set to 0 to disable.",
