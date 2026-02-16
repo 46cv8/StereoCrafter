@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+
+# Recommended Vast-compatible CUDA 12.8 base with Python 3.12.
+ARG BASE_IMAGE=vastai/base-image:cuda-12.8.1-cudnn-devel-ubuntu22.04-py312
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/opt/hf-cache \
+    TRANSFORMERS_CACHE=/opt/hf-cache \
+    TORCH_HOME=/opt/torch-cache \
+    VENV_PATH=/opt/venv \
+    APP_ROOT=/opt/StereoCrafter
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ffmpeg \
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv "${VENV_PATH}"
+ENV PATH="${VENV_PATH}/bin:${PATH}"
+
+RUN python - <<'PY'
+import sys
+major, minor = sys.version_info[:2]
+assert (major, minor) == (3, 12), f"Expected Python 3.12, found {major}.{minor}"
+print(f"Python version OK: {major}.{minor}")
+PY
+
+# Install Python dependencies from this workspace's pinned requirements.
+COPY requirements.linux.txt /tmp/requirements.linux.txt
+RUN python -m pip install --upgrade pip wheel setuptools && \
+    python -m pip install -r /tmp/requirements.linux.txt && \
+    rm -f /tmp/requirements.linux.txt
+
+# Startup helper.
+RUN cat > /usr/local/bin/stereocrafter-onstart.sh <<'SH' && chmod +x /usr/local/bin/stereocrafter-onstart.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# If the secret is supplied under either name, normalize to HF_TOKEN.
+if [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN="${HUGGING_FACE_HUB_TOKEN}"
+fi
+
+cd "${APP_ROOT}"
+exec "$@"
+SH
+
+ENTRYPOINT ["/usr/local/bin/stereocrafter-onstart.sh"]
+CMD ["bash"]
+
+# Last step requested: clone your cloud branch into the runtime app path.
+ARG GIT_REPO_URL=https://github.com/REPLACE_WITH_YOUR_USER/StereoCrafter.git
+ARG GIT_BRANCH=004_depthcrafter_on_cloud
+RUN git clone --depth 1 --branch "${GIT_BRANCH}" "${GIT_REPO_URL}" "${APP_ROOT}"

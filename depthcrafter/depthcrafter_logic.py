@@ -157,7 +157,12 @@ class DepthCrafterDemo:
                                     target_fps_for_read: float, segment_job_info: Optional[dict],
                                     output_filename_for_meta: str, pipe_call_window_size: int,
                                     pipe_call_overlap: int,
-                                    original_video_basename: str) -> dict:
+                                    original_video_basename: str,
+                                    full_video_output_format: str = "mp4") -> dict:
+        normalized_output_format = str(full_video_output_format).strip().lower()
+        if normalized_output_format not in {"mp4", "main10_mp4"}:
+            normalized_output_format = "mp4"
+
         job_specific_metadata = {
             "original_video_basename": original_video_basename, 
             "guidance_scale": float(guidance_scale),
@@ -184,7 +189,8 @@ class DepthCrafterDemo:
             job_specific_metadata.update({
                 "output_video_filename": output_filename_for_meta,
                 "pipeline_window_size_used_for_full_video_pass": int(pipe_call_window_size),
-                "pipeline_overlap_used_for_full_video_pass": int(pipe_call_overlap)
+                "pipeline_overlap_used_for_full_video_pass": int(pipe_call_overlap),
+                "preferred_output_format": normalized_output_format
             })
         return job_specific_metadata
 
@@ -522,7 +528,8 @@ class DepthCrafterDemo:
                         segment_job_info: Optional[dict] = None,
                         should_save_intermediate_visuals: bool = False,
                         intermediate_visual_format_to_save: str = "none",
-                        save_final_output_json_config_passed_in: bool = False
+                        save_final_output_json_config_passed_in: bool = False,
+                        full_video_output_format: str = "mp4",
                         ) -> Tuple[Optional[str], dict]:
 
         infer_start_time = time.perf_counter()
@@ -536,7 +543,8 @@ class DepthCrafterDemo:
             guidance_scale, num_denoising_steps, user_target_height, user_target_width, seed_val,
             gui_target_fps_for_job,
             segment_job_info, output_filename_for_meta,
-            pipe_call_window_size, pipe_call_overlap, original_video_basename
+            pipe_call_window_size, pipe_call_overlap, original_video_basename,
+            full_video_output_format=full_video_output_format
         )
 
         actual_frames_to_process, actual_fps_for_save, actual_processed_h, actual_processed_w = self._load_frames(
@@ -626,7 +634,8 @@ class DepthCrafterDemo:
             segment_job_info_param: Optional[dict] = None,
             keep_intermediate_npz_config: bool = False,
             intermediate_segment_visual_format_config: str = "none",
-            save_final_json_for_this_job_config: bool = False
+            save_final_json_for_this_job_config: bool = False,
+            full_video_output_format: str = "mp4",
             ):
         
         video_path_or_info_for_infer_load: Union[str, dict]
@@ -713,7 +722,8 @@ class DepthCrafterDemo:
             segment_job_info=segment_job_info_param,
             should_save_intermediate_visuals=should_save_visuals_for_infer,
             intermediate_visual_format_to_save=intermediate_visual_fmt_for_infer,
-            save_final_output_json_config_passed_in=save_final_json_for_this_job_config
+            save_final_output_json_config_passed_in=save_final_json_for_this_job_config,
+            full_video_output_format=full_video_output_format,
         )
         gc.collect(); torch.cuda.empty_cache()
         return save_path, job_metadata_dict

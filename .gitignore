@@ -102,3 +102,6 @@ config_sidecaredit.json
 config_merging.mergecfg
 config_splat.splatcfg
 nul
+
+# Local cloud secrets
+cloud/hf.env
