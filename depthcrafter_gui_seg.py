@@ -9,6 +9,7 @@ import ast
 import re
 import shlex
 import select
+import socket
 import subprocess
 import tkinter as tk
 from tkinter import Toplevel, Label
@@ -20,6 +21,8 @@ import torch
 import logging # Import standard logging
 import random
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 # Configure a logger for this module
 _logger = logging.getLogger(__name__)
@@ -163,6 +166,7 @@ class DepthCrafterGUI:
     LAST_SETTINGS_DIR_CONFIG_KEY = "last_settings_dir"
     VIDEO_EXTENSIONS = ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm", "*.flv", "*.gif"]
     IMAGE_EXTENSIONS = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.exr"]
+    DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
     CLOUD_PROFILE_DEFAULTS = {
         "5090_32gb": {
             "label": "RTX 5090 32GB",
@@ -256,6 +260,7 @@ class DepthCrafterGUI:
         self.cloud_hf_env_file_var = tk.StringVar(value="cloud/hf.env")
         self.cloud_no_hf_env_var = tk.BooleanVar(value=False)
         self.cloud_offer_limit_var = tk.IntVar(value=30)
+        self.cloud_require_verified_hosts_var = tk.BooleanVar(value=True)
         self.cloud_max_dph_var = tk.DoubleVar(value=0.0)
         self.cloud_expected_runtime_hours_var = tk.DoubleVar(value=1.0)
         self.cloud_expected_upload_gb_var = tk.DoubleVar(value=8.0)
@@ -364,6 +369,7 @@ class DepthCrafterGUI:
             "cloud_hf_env_file_var": self.cloud_hf_env_file_var,
             "cloud_no_hf_env_var": self.cloud_no_hf_env_var,
             "cloud_offer_limit_var": self.cloud_offer_limit_var,
+            "cloud_require_verified_hosts_var": self.cloud_require_verified_hosts_var,
             "cloud_max_dph_var": self.cloud_max_dph_var,
             "cloud_expected_runtime_hours_var": self.cloud_expected_runtime_hours_var,
             "cloud_expected_upload_gb_var": self.cloud_expected_upload_gb_var,
@@ -2538,14 +2544,6 @@ class DepthCrafterGUI:
             )
             _logger.error("Start blocked: cloud mode selected with local special modes.")
             return
-        if cloud_dispatch_mode and self.process_as_segments_var.get():
-            messagebox.showerror(
-                "Invalid Setting",
-                "Cloud Dispatch mode currently supports full video clip jobs only. Disable 'Process as Segments'."
-            )
-            _logger.error("Start blocked: cloud mode with segment mode enabled.")
-            return
-
         if spatial_refine_mode and run_spatial_hires_refine is None:
             messagebox.showerror(
                 "Unavailable",
@@ -3518,6 +3516,7 @@ class DepthCrafterGUI:
 
     def _refresh_cloud_processing_summary(self):
         settings = self._get_effective_cloud_processing_settings()
+        require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
         self.cloud_profile_default_summary_var.set(
             (
                 f"{settings['profile_label']} defaults: "
@@ -3542,7 +3541,8 @@ class DepthCrafterGUI:
         self.cloud_secondary_summary_var.set(
             (
                 "  ↳ Launches a Vast worker, uploads clip(s), runs remote depth, downloads outputs. "
-                f"Cloud target: {settings['target_width']}x{settings['target_height']}."
+                f"Cloud target: {settings['target_width']}x{settings['target_height']}. "
+                f"Verified hosts: {'required' if require_verified_hosts else 'optional'}."
             )
         )
 
@@ -3556,6 +3556,7 @@ class DepthCrafterGUI:
             self.cloud_target_height_override_var,
             self.cloud_window_size_override_var,
             self.cloud_overlap_override_var,
+            self.cloud_require_verified_hosts_var,
             self.window_size,
             self.overlap,
         ]
@@ -3953,6 +3954,16 @@ class DepthCrafterGUI:
         spin_offer_limit.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
         row += 1
 
+        require_verified_cb = self._register_cloud_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Require verified hosts in Vast search",
+                variable=self.cloud_require_verified_hosts_var,
+            )
+        )
+        require_verified_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        row += 1
+
         ttk.Label(outer, text="Max $/hr (0=off):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
         entry_max_dph = self._register_cloud_dialog_widget(
             ttk.Entry(outer, textvariable=self.cloud_max_dph_var, width=12)
@@ -4055,6 +4066,116 @@ class DepthCrafterGUI:
             if value and "REPLACE_WITH" not in value.upper():
                 return value
         return ""
+
+    def _resolve_cloud_api_base_url(self) -> str:
+        env_data = self._parse_cloud_env_file_data(self.cloud_vast_env_file_var.get())
+        for key in ("VAST_API_URL", "VAST_URL", "VAST_SERVER_URL"):
+            value = env_data.get(key, "").strip()
+            if value:
+                return value.rstrip("/")
+        return self.DEFAULT_VAST_API_BASE_URL
+
+    def _extract_instance_row_from_payload(self, payload, instance_id: int) -> Optional[Dict[str, Any]]:
+        target_id = int(instance_id)
+        rows: List[Dict[str, Any]] = []
+        if isinstance(payload, list):
+            rows = [row for row in payload if isinstance(row, dict)]
+        elif isinstance(payload, dict):
+            maybe_rows = payload.get("instances")
+            if isinstance(maybe_rows, list):
+                rows = [row for row in maybe_rows if isinstance(row, dict)]
+            elif isinstance(maybe_rows, dict):
+                rows = [maybe_rows]
+            else:
+                rows = [payload]
+
+        for row in rows:
+            try:
+                row_id = int(row.get("id", -1))
+            except Exception:
+                continue
+            if row_id == target_id:
+                return row
+        return None
+
+    def _extract_status_from_instance_row(self, row: Dict[str, Any]) -> str:
+        for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
+            value = str(row.get(key, "")).strip()
+            if value:
+                return value
+        return ""
+
+    def _extract_ssh_from_instance_row(self, row: Dict[str, Any]) -> Tuple[str, int]:
+        host = str(row.get("ssh_host", "") or "").strip()
+        port_value = row.get("ssh_port")
+        port = 0
+        try:
+            port = int(port_value)
+        except Exception:
+            port = 0
+
+        # Prefer explicit exposed 22/tcp mapping when available.
+        ports_data = row.get("ports", {})
+        used_22_map = False
+        if isinstance(ports_data, dict):
+            port_22_entries = ports_data.get("22/tcp")
+            if isinstance(port_22_entries, list) and port_22_entries:
+                first = port_22_entries[0]
+                if isinstance(first, dict):
+                    host_port = first.get("HostPort")
+                    try:
+                        mapped_port = int(host_port)
+                    except Exception:
+                        mapped_port = 0
+                    if mapped_port > 0:
+                        public_host = str(row.get("public_ipaddr", "") or "").strip()
+                        if public_host:
+                            host = public_host
+                        port = mapped_port
+                        used_22_map = True
+
+        # Match Vast CLI behavior for jupyter runtype when using ssh_host/ssh_port path.
+        if not used_22_map and port > 0:
+            runtype = str(row.get("image_runtype", "") or "").lower()
+            if "jupyter" in runtype:
+                port += 1
+
+        if host and port > 0:
+            return host, port
+        return "", 0
+
+    def _fetch_cloud_instance_row_http(self, instance_id: int) -> Optional[Dict[str, Any]]:
+        api_key = self._resolve_cloud_api_key()
+        if not api_key:
+            return None
+
+        base_url = self._resolve_cloud_api_base_url()
+        query = urlencode({"owner": "me", "api_key": api_key})
+        url = f"{base_url}/api/v0/instances?{query}"
+        try:
+            with urlopen(url, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return self._extract_instance_row_from_payload(payload, instance_id)
+        except Exception as http_exc:
+            _logger.debug(f"[CLOUD] HTTP instance poll failed for {instance_id}: {http_exc}")
+            return None
+
+    def _fetch_cloud_instance_row_cli(self, instance_id: int) -> Optional[Dict[str, Any]]:
+        show_cmd = self._build_vast_cli_cmd(["show", "instances", "--raw"])
+        rc, lines = self._run_external_command_with_logging(
+            show_cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        if rc != 0:
+            return None
+        payload = self._parse_json_like_payload("\n".join(lines).strip())
+        return self._extract_instance_row_from_payload(payload, instance_id)
+
+    def _get_cloud_instance_row(self, instance_id: int) -> Optional[Dict[str, Any]]:
+        row = self._fetch_cloud_instance_row_http(instance_id)
+        if row is not None:
+            return row
+        return self._fetch_cloud_instance_row_cli(instance_id)
 
     def _build_vast_cli_cmd(self, args: List[str]) -> List[str]:
         cmd = ["vastai"] + list(args)
@@ -4186,6 +4307,7 @@ class DepthCrafterGUI:
     def _build_cloud_offer_search_query(self, profile_key: str) -> Tuple[str, Dict[str, object]]:
         profile_defaults = self._get_cloud_profile_defaults(profile_key)
         offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "gpu_name=RTX_5090"))
+        require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
         min_reliability = 0.97
         min_cuda = 12.8
         min_direct_ports = 2
@@ -4197,7 +4319,6 @@ class DepthCrafterGUI:
         query_parts = [
             offer_gpu_filter,
             "rentable=true",
-            "verified=true",
             "num_gpus=1",
             f"cuda_vers>={min_cuda}",
             f"reliability>={min_reliability}",
@@ -4206,6 +4327,8 @@ class DepthCrafterGUI:
             f"inet_down>={min_inet_down}",
             f"inet_up>={min_inet_up}",
         ]
+        if require_verified_hosts:
+            query_parts.append("verified=true")
         if max_dph > 0.0:
             query_parts.append(f"dph<={max_dph}")
         return " ".join(query_parts), profile_defaults
@@ -4338,6 +4461,7 @@ class DepthCrafterGUI:
         lines.extend([
             "",
             f"Offer filter profile: {profile_defaults.get('label', profile_key)}",
+            f"Require verified hosts: {'Yes' if bool(self.cloud_require_verified_hosts_var.get()) else 'No'}",
             "Continue with instance creation?",
         ])
         return "\n".join(lines)
@@ -4367,62 +4491,69 @@ class DepthCrafterGUI:
         return messagebox.askyesno("Cloud Dispatch", msg)
 
     def _get_cloud_instance_status(self, instance_id: int) -> str:
-        show_cmd = self._build_vast_cli_cmd(["show", "instance", str(instance_id), "--raw"])
-        rc, lines = self._run_external_command_with_logging(show_cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
-        if rc != 0:
+        row = self._get_cloud_instance_row(instance_id)
+        if not isinstance(row, dict):
             return ""
-        raw = "\n".join(lines).strip()
-        payload = self._parse_json_like_payload(raw)
-        if not isinstance(payload, dict):
-            return ""
-        for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
-            value = str(payload.get(key, "")).strip()
-            if value:
-                return value
-        return ""
+        return self._extract_status_from_instance_row(row)
+
+    def _is_cloud_tcp_endpoint_ready(self, host: str, port: int, timeout_sec: float = 3.0) -> Tuple[bool, str]:
+        host_str = str(host or "").strip()
+        try:
+            port_int = int(port)
+        except Exception:
+            port_int = 0
+        if not host_str or port_int <= 0:
+            return False, "missing host/port"
+        try:
+            with socket.create_connection((host_str, port_int), timeout=max(0.5, float(timeout_sec))):
+                return True, ""
+        except Exception as tcp_exc:
+            return False, str(tcp_exc)
 
     def _wait_for_cloud_instance_ready(self, instance_id: int, timeout_sec: int = 900, poll_sec: int = 8) -> Dict[str, object]:
         deadline = time.time() + max(15, int(timeout_sec))
         last_status = ""
+        last_probe_error = ""
         while time.time() < deadline:
             if self.stop_event.is_set():
                 raise RuntimeError("Cancelled while waiting for cloud instance readiness.")
 
-            status_cmd = self._build_vast_cli_cmd(["show", "instance", str(instance_id), "--raw"])
-            status_rc, status_lines = self._run_external_command_with_logging(
-                status_cmd,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            )
-            status_raw = "\n".join(status_lines).strip()
-            status_payload = self._parse_json_like_payload(status_raw) if status_rc == 0 else None
-            status_text = ""
-            if isinstance(status_payload, dict):
-                for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
-                    value = str(status_payload.get(key, "")).strip()
-                    if value:
-                        status_text = value
-                        break
+            row = self._get_cloud_instance_row(instance_id)
+            status_text = self._extract_status_from_instance_row(row) if isinstance(row, dict) else ""
             if status_text and status_text != last_status:
                 _logger.info(f"[CLOUD] Instance {instance_id} status: {status_text}")
                 self.message_queue.put(("status", f"Cloud instance {instance_id}: {status_text}"))
                 last_status = status_text
 
-            ssh_cmd = self._build_vast_cli_cmd(["ssh-url", str(instance_id)])
-            ssh_rc, ssh_lines = self._run_external_command_with_logging(
-                ssh_cmd,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-            )
-            if ssh_rc == 0:
-                ssh_user, ssh_host, ssh_port = self._parse_ssh_url_text("\n".join(ssh_lines))
-                if ssh_host and ssh_port > 0:
+            ssh_host, ssh_port = self._extract_ssh_from_instance_row(row) if isinstance(row, dict) else ("", 0)
+            if isinstance(row, dict) and (not ssh_host or ssh_port <= 0):
+                # Final fallback for older payload shapes where ssh_host/ssh_port are omitted.
+                ssh_cmd = self._build_vast_cli_cmd(["ssh-url", str(instance_id)])
+                ssh_rc, ssh_lines = self._run_external_command_with_logging(
+                    ssh_cmd,
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                )
+                if ssh_rc == 0:
+                    _, ssh_host, ssh_port = self._parse_ssh_url_text("\n".join(ssh_lines))
+
+            if ssh_host and ssh_port > 0:
+                tcp_ready, probe_error = self._is_cloud_tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
+                if tcp_ready:
                     return {
                         "instance_id": int(instance_id),
                         "host": ssh_host,
                         "port": int(ssh_port),
-                        "user": ssh_user or self.cloud_remote_user_var.get().strip() or "root",
+                        "user": self.cloud_remote_user_var.get().strip() or "root",
                         "remote_root": self.cloud_remote_root_var.get().strip() or "/opt/StereoCrafter",
                         "remote_venv": self.cloud_remote_venv_var.get().strip() or "/opt/venv",
                     }
+                if probe_error and probe_error != last_probe_error:
+                    _logger.info(
+                        f"[CLOUD] Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
+                        f"but it is not accepting connections yet: {probe_error}"
+                    )
+                    self.message_queue.put(("status", f"Cloud instance {instance_id}: waiting for SSH service..."))
+                    last_probe_error = probe_error
             time.sleep(max(1, int(poll_sec)))
 
         raise RuntimeError(f"Timed out waiting for cloud instance {instance_id} readiness.")
@@ -4505,7 +4636,18 @@ class DepthCrafterGUI:
         self.message_queue.put(("status", "Cloud cached instance cleared."))
 
     def _run_external_command_with_logging(self, cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, List[str]]:
-        log_cmd = " ".join(shlex.quote(str(part)) for part in cmd)
+        redacted_cmd_parts: List[str] = []
+        redact_next = False
+        for part in cmd:
+            part_str = str(part)
+            if redact_next:
+                redacted_cmd_parts.append("***")
+                redact_next = False
+                continue
+            redacted_cmd_parts.append(part_str)
+            if part_str == "--api-key":
+                redact_next = True
+        log_cmd = " ".join(shlex.quote(part) for part in redacted_cmd_parts)
         _logger.info(f"[CLOUD] $ {log_cmd}")
         output_lines: List[str] = []
         process = subprocess.Popen(
@@ -4618,6 +4760,9 @@ class DepthCrafterGUI:
             "--yes",
             "--no-go-prompt",
         ]
+
+        if not bool(self.cloud_require_verified_hosts_var.get()):
+            cmd.append("--allow-unverified")
 
         max_dph_value = float(self.cloud_max_dph_var.get())
         if max_dph_value > 0.0:

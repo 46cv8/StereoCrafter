@@ -80,12 +80,14 @@ Setup once:
 ```bash
 cp cloud/vast.env.example cloud/vast.env
 cp cloud/hf.env.example cloud/hf.env
+cp cloud/ghcr.env.example cloud/ghcr.env
 ```
 
 Fill:
 
 - `cloud/vast.env` with `VAST_API_KEY=...`
 - `cloud/hf.env` with your accepted-terms HF token.
+- If your `--image` is private on GHCR: fill `cloud/ghcr.env` (`GHCR_USERNAME`, `GHCR_PAT` with at least `read:packages`).
 
 Launch a 5090 worker using your current config as base:
 

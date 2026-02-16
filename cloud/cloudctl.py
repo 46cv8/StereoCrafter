@@ -41,8 +41,15 @@ def log(msg: str) -> None:
     print(f"[cloudctl] {msg}")
 
 
-def run_cmd(cmd: Sequence[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    log("$ " + " ".join(shlex.quote(c) for c in cmd))
+def run_cmd(
+    cmd: Sequence[str],
+    check: bool = True,
+    capture: bool = False,
+    *,
+    log_command: bool = True,
+) -> subprocess.CompletedProcess:
+    if log_command:
+        log("$ " + " ".join(shlex.quote(c) for c in cmd))
     return subprocess.run(
         list(cmd),
         check=check,
@@ -71,9 +78,16 @@ def ssh_transport_string(cfg: SSHConfig) -> str:
     return " ".join(shlex.quote(p) for p in parts)
 
 
-def ssh_run(cfg: SSHConfig, remote_script: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+def ssh_run(
+    cfg: SSHConfig,
+    remote_script: str,
+    check: bool = True,
+    capture: bool = False,
+    *,
+    log_command: bool = True,
+) -> subprocess.CompletedProcess:
     wrapped = f"bash -lc {shlex.quote(remote_script)}"
-    return run_cmd(ssh_base_args(cfg) + [wrapped], check=check, capture=capture)
+    return run_cmd(ssh_base_args(cfg) + [wrapped], check=check, capture=capture, log_command=log_command)
 
 
 def rsync_to_remote(
@@ -134,6 +148,46 @@ def require_tool(name: str) -> None:
         raise CloudCtlError(f"Required tool '{name}' not found in PATH.")
 
 
+def wait_for_ssh_ready(cfg: SSHConfig, timeout_sec: int = 180, poll_sec: int = 4) -> None:
+    timeout_sec = max(5, int(timeout_sec))
+    poll_sec = max(1, int(poll_sec))
+    deadline = time.time() + timeout_sec
+    attempt = 0
+    last_error = ""
+
+    while time.time() < deadline:
+        attempt += 1
+        probe = ssh_run(
+            cfg,
+            "echo cloudctl_ssh_ready",
+            check=False,
+            capture=True,
+            log_command=False,
+        )
+        if probe.returncode == 0:
+            if attempt > 1:
+                log(
+                    f"SSH became ready after {attempt} probe(s) at "
+                    f"{cfg.user}@{cfg.host}:{cfg.port}."
+                )
+            return
+
+        probe_output = (probe.stdout or "").strip()
+        short_error = probe_output.splitlines()[-1] if probe_output else f"ssh exit {probe.returncode}"
+        if short_error != last_error:
+            log(
+                f"Waiting for SSH readiness at {cfg.user}@{cfg.host}:{cfg.port} "
+                f"(attempt {attempt}): {short_error}"
+            )
+            last_error = short_error
+        time.sleep(poll_sec)
+
+    raise CloudCtlError(
+        f"Timed out waiting for SSH readiness at {cfg.user}@{cfg.host}:{cfg.port} "
+        f"after {timeout_sec}s. Last error: {last_error or 'unknown'}"
+    )
+
+
 def remote_join(*parts: str) -> str:
     if not parts:
         return ""
@@ -158,6 +212,18 @@ def add_ssh_flags(parser: argparse.ArgumentParser) -> None:
         "--remote-root",
         required=True,
         help="Repo path on remote host (e.g. /workspace/StereoCrafter).",
+    )
+    parser.add_argument(
+        "--ssh-ready-timeout-sec",
+        type=int,
+        default=180,
+        help="How long to wait for SSH to accept connections before failing.",
+    )
+    parser.add_argument(
+        "--ssh-ready-poll-sec",
+        type=int,
+        default=4,
+        help="Polling interval while waiting for SSH readiness.",
     )
 
 
@@ -196,6 +262,11 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
     require_tool("rsync")
 
     cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
     local_repo = Path(args.local_repo).expanduser().resolve()
     if not local_repo.exists():
         raise CloudCtlError(f"Local repo path does not exist: {local_repo}")
@@ -394,6 +465,11 @@ def cmd_run_job(args: argparse.Namespace) -> int:
     require_tool("ssh")
     require_tool("rsync")
     cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
     local_input = Path(args.local_input).expanduser().resolve()
     return _run_one_job(cfg, args, local_input, explicit_job_name=args.job_name)
 
@@ -423,6 +499,11 @@ def cmd_run_batch(args: argparse.Namespace) -> int:
     require_tool("rsync")
 
     cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
     input_dir = Path(args.input_dir).expanduser().resolve()
     if not input_dir.exists():
         raise CloudCtlError(f"Input dir does not exist: {input_dir}")
@@ -462,6 +543,11 @@ def cmd_collect(args: argparse.Namespace) -> int:
     require_tool("rsync")
 
     cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
     remote_root = args.remote_root.rstrip("/")
     remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
     local_dir = Path(args.download_dir).expanduser().resolve()

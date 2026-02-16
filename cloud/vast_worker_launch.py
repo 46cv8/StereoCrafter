@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -25,9 +26,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from shutil import which
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -46,8 +50,23 @@ def shell_join(parts: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(p)) for p in parts)
 
 
+def redact_sensitive_cmd(parts: Sequence[str]) -> List[str]:
+    redacted: List[str] = []
+    redact_next = False
+    for part in parts:
+        part_str = str(part)
+        if redact_next:
+            redacted.append("***")
+            redact_next = False
+            continue
+        redacted.append(part_str)
+        if part_str in {"--api-key", "--login"}:
+            redact_next = True
+    return redacted
+
+
 def run_cmd(cmd: Sequence[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    log("$ " + shell_join(list(cmd)))
+    log("$ " + shell_join(redact_sensitive_cmd(list(cmd))))
     return subprocess.run(
         list(cmd),
         check=check,
@@ -184,6 +203,54 @@ def resolve_hf_env_payload(args: argparse.Namespace) -> str:
     return build_vast_env_arg(env_vars)
 
 
+def registry_from_image_ref(image_ref: str) -> str:
+    image = (image_ref or "").strip()
+    if "/" not in image:
+        return ""
+    return image.split("/", 1)[0].lower()
+
+
+def resolve_auto_registry_login_arg(args: argparse.Namespace) -> str:
+    if bool(getattr(args, "skip_image_login", False)):
+        return ""
+
+    explicit = (getattr(args, "registry_login", "") or "").strip()
+    if explicit:
+        return explicit
+
+    registry = registry_from_image_ref(str(getattr(args, "image", "") or ""))
+    if registry != "ghcr.io":
+        return ""
+
+    env_vars: Dict[str, str] = {}
+    ghcr_env_path = Path(getattr(args, "ghcr_env_file", "") or "").expanduser().resolve()
+    if ghcr_env_path.exists():
+        try:
+            env_vars = parse_env_file(ghcr_env_path)
+        except Exception as exc:
+            log(f"Warning: failed to parse GHCR env file {ghcr_env_path}: {exc}")
+
+    def _pick(*keys: str) -> str:
+        for key in keys:
+            value = (env_vars.get(key, "") or os.environ.get(key, "")).strip()
+            if value:
+                return value
+        return ""
+
+    username = _pick("GHCR_USERNAME", "GHCR_USER", "GITHUB_USER")
+    token = _pick("GHCR_PAT", "GITHUB_PAT", "GH_PAT")
+    if not username:
+        image_ref = str(getattr(args, "image", "") or "")
+        parts = image_ref.split("/")
+        if len(parts) >= 2:
+            username = parts[1].strip()
+    if not token:
+        return ""
+    if not username:
+        return ""
+    return f"-u {username} -p {token} {registry}"
+
+
 def with_api_key(cmd: List[str], api_key: str) -> List[str]:
     if api_key:
         return cmd + ["--api-key", api_key]
@@ -191,10 +258,10 @@ def with_api_key(cmd: List[str], api_key: str) -> List[str]:
 
 
 def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
+    require_verified = not bool(getattr(args, "allow_unverified", False))
     parts = [
         profile.offer_gpu_filter,
         "rentable=true",
-        "verified=true",
         "num_gpus=1",
         f"cuda_vers>={args.min_cuda}",
         f"reliability>={args.min_reliability}",
@@ -203,6 +270,8 @@ def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
         f"inet_down>={args.min_inet_down}",
         f"inet_up>={args.min_inet_up}",
     ]
+    if require_verified:
+        parts.append("verified=true")
     if args.max_dph > 0:
         parts.append(f"dph<={args.max_dph}")
     return " ".join(parts)
@@ -523,33 +592,147 @@ def build_cloudctl_cmd(
     return cmd, subcmd
 
 
+def resolve_vast_api_base_url() -> str:
+    for key in ("VAST_API_URL", "VAST_URL", "VAST_SERVER_URL"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value.rstrip("/")
+    return DEFAULT_VAST_API_BASE_URL
+
+
+def extract_instance_row_from_payload(payload: Any, instance_id: int) -> Optional[Dict[str, Any]]:
+    target_id = int(instance_id)
+    rows: List[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        rows = [row for row in payload if isinstance(row, dict)]
+    elif isinstance(payload, dict):
+        maybe_rows = payload.get("instances")
+        if isinstance(maybe_rows, list):
+            rows = [row for row in maybe_rows if isinstance(row, dict)]
+        elif isinstance(maybe_rows, dict):
+            rows = [maybe_rows]
+        else:
+            rows = [payload]
+
+    for row in rows:
+        row_id = as_int(row.get("id"), -1)
+        if row_id == target_id:
+            return row
+    return None
+
+
+def extract_instance_status_from_row(row: Dict[str, Any]) -> str:
+    for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
+        value = str(row.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def extract_ssh_from_instance_row(row: Dict[str, Any]) -> Tuple[str, int]:
+    host = str(row.get("ssh_host", "") or "").strip()
+    port = as_int(row.get("ssh_port"), 0)
+
+    ports_data = row.get("ports", {})
+    used_22_map = False
+    if isinstance(ports_data, dict):
+        port_22_entries = ports_data.get("22/tcp")
+        if isinstance(port_22_entries, list) and port_22_entries:
+            first = port_22_entries[0]
+            if isinstance(first, dict):
+                mapped_port = as_int(first.get("HostPort"), 0)
+                if mapped_port > 0:
+                    public_host = str(row.get("public_ipaddr", "") or "").strip()
+                    if public_host:
+                        host = public_host
+                    port = mapped_port
+                    used_22_map = True
+
+    if not used_22_map and port > 0:
+        runtype = str(row.get("image_runtype", "") or "").lower()
+        if "jupyter" in runtype:
+            port += 1
+
+    if host and port > 0:
+        return host, port
+    return "", 0
+
+
+def fetch_instance_row_http(instance_id: int, api_key: str) -> Optional[Dict[str, Any]]:
+    if not api_key:
+        return None
+    base_url = resolve_vast_api_base_url()
+    query = urlencode({"owner": "me", "api_key": api_key})
+    url = f"{base_url}/api/v0/instances?{query}"
+    try:
+        with urlopen(url, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return extract_instance_row_from_payload(payload, instance_id)
+    except Exception as exc:
+        log(f"HTTP poll warning for instance {instance_id}: {exc}")
+        return None
+
+
+def fetch_instance_row_cli(instance_id: int, api_key: str) -> Optional[Dict[str, Any]]:
+    show_instances_cmd = with_api_key(
+        ["vastai", "show", "instances", "--raw"],
+        api_key,
+    )
+    show_instances_proc = run_cmd(show_instances_cmd, check=False, capture=True)
+    payload = parse_json_like((show_instances_proc.stdout or "").strip())
+    return extract_instance_row_from_payload(payload, instance_id)
+
+
+def tcp_endpoint_ready(host: str, port: int, timeout_sec: float = 3.0) -> Tuple[bool, str]:
+    host_str = str(host or "").strip()
+    try:
+        port_int = int(port)
+    except Exception:
+        port_int = 0
+    if not host_str or port_int <= 0:
+        return False, "missing host/port"
+    try:
+        with socket.create_connection((host_str, port_int), timeout=max(0.5, float(timeout_sec))):
+            return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def wait_for_instance_ready(instance_id: int, api_key: str, timeout_sec: int, poll_sec: int) -> Tuple[str, str, int]:
     deadline = time.time() + timeout_sec
     last_status = ""
+    last_probe_error = ""
     while time.time() < deadline:
-        status_cmd = with_api_key(
-            ["vastai", "show", "instance", str(instance_id), "--raw"],
-            api_key,
-        )
-        status_proc = run_cmd(status_cmd, check=False, capture=True)
-        status_raw = (status_proc.stdout or "").strip()
-        status_payload = parse_json_like(status_raw)
-        status_text = extract_instance_status(status_payload) or "unknown"
+        row = fetch_instance_row_http(instance_id, api_key)
+        if row is None:
+            row = fetch_instance_row_cli(instance_id, api_key)
 
-        ssh_cmd = with_api_key(
-            ["vastai", "ssh-url", str(instance_id)],
-            api_key,
-        )
-        ssh_proc = run_cmd(ssh_cmd, check=False, capture=True)
-        ssh_raw = (ssh_proc.stdout or "").strip()
-        ssh_user, ssh_host, ssh_port = parse_ssh_url(ssh_raw)
+        status_text = extract_instance_status_from_row(row) if isinstance(row, dict) else "unknown"
+        ssh_host, ssh_port = extract_ssh_from_instance_row(row) if isinstance(row, dict) else ("", 0)
+
+        if isinstance(row, dict) and (not ssh_host or ssh_port <= 0):
+            ssh_cmd = with_api_key(
+                ["vastai", "ssh-url", str(instance_id)],
+                api_key,
+            )
+            ssh_proc = run_cmd(ssh_cmd, check=False, capture=True)
+            ssh_raw = (ssh_proc.stdout or "").strip()
+            _, ssh_host, ssh_port = parse_ssh_url(ssh_raw)
 
         if status_text != last_status:
             log(f"Instance {instance_id} status: {status_text}")
             last_status = status_text
 
         if ssh_host and ssh_port > 0:
-            return ssh_user or "root", ssh_host, ssh_port
+            is_open, probe_error = tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
+            if is_open:
+                return "root", ssh_host, ssh_port
+            if probe_error and probe_error != last_probe_error:
+                log(
+                    f"Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
+                    f"but not accepting connections yet: {probe_error}"
+                )
+                last_probe_error = probe_error
 
         time.sleep(max(1, poll_sec))
 
@@ -604,6 +787,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--show-top", type=int, default=8)
     p.add_argument("--offer-type", choices=["on-demand", "reserved", "bid"], default="on-demand")
     p.add_argument("--search-order", default="dph_total")
+    p.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="Allow unverified hosts in Vast offer search (default requires verified=true).",
+    )
     p.add_argument("--min-cuda", type=float, default=12.8)
     p.add_argument("--min-reliability", type=float, default=0.97)
     p.add_argument("--min-direct-ports", type=int, default=2)
@@ -619,6 +807,21 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--vast-env-file", default=str(REPO_ROOT / "cloud" / "vast.env"))
     p.add_argument("--hf-env-file", default=str(REPO_ROOT / "cloud" / "hf.env"))
     p.add_argument("--no-hf-env", action="store_true")
+    p.add_argument(
+        "--ghcr-env-file",
+        default=str(REPO_ROOT / "cloud" / "ghcr.env"),
+        help="Env file used to auto-build GHCR --login args for private images.",
+    )
+    p.add_argument(
+        "--registry-login",
+        default="",
+        help="Optional explicit value passed to vastai create instance --login.",
+    )
+    p.add_argument(
+        "--skip-image-login",
+        action="store_true",
+        help="Skip automatic private-registry login injection.",
+    )
 
     p.add_argument("--ready-timeout-sec", type=int, default=900)
     p.add_argument("--poll-sec", type=int, default=8)
@@ -692,6 +895,7 @@ def main() -> int:
         f"Top offers for {profile.label} (sorted by expected total = "
         f"{args.expected_runtime_hours}h runtime + transfer {args.expected_upload_gb}/{args.expected_download_gb} GB):"
     )
+    log(f"Offer filter: verified hosts {'required' if not args.allow_unverified else 'optional'}.")
     print_offer_table(offers, args.show_top)
 
     if args.offer_id > 0:
@@ -739,6 +943,16 @@ def main() -> int:
         args.onstart_cmd,
         "--raw",
     ]
+    registry = registry_from_image_ref(args.image)
+    login_arg = resolve_auto_registry_login_arg(args)
+    if login_arg:
+        log(f"Using registry login for {registry or 'custom registry'} (credentials hidden).")
+        create_cmd += ["--login", login_arg]
+    elif registry == "ghcr.io":
+        log(
+            "No GHCR login credentials found. Assuming image is public; "
+            "private GHCR images will fail to pull."
+        )
     if args.label:
         create_cmd += ["--label", args.label]
     if args.cancel_unavail:
