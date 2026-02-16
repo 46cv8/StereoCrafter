@@ -60,7 +60,7 @@ def redact_sensitive_cmd(parts: Sequence[str]) -> List[str]:
             redact_next = False
             continue
         redacted.append(part_str)
-        if part_str in {"--api-key", "--login"}:
+        if part_str in {"--api-key", "--login", "--env", "--registry-login", "--vast-api-key"}:
             redact_next = True
     return redacted
 

@@ -4645,7 +4645,7 @@ class DepthCrafterGUI:
                 redact_next = False
                 continue
             redacted_cmd_parts.append(part_str)
-            if part_str == "--api-key":
+            if part_str in {"--api-key", "--login", "--env", "--registry-login", "--vast-api-key"}:
                 redact_next = True
         log_cmd = " ".join(shlex.quote(part) for part in redacted_cmd_parts)
         _logger.info(f"[CLOUD] $ {log_cmd}")
