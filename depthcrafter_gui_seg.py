@@ -167,6 +167,7 @@ class DepthCrafterGUI:
     VIDEO_EXTENSIONS = ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm", "*.flv", "*.gif"]
     IMAGE_EXTENSIONS = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.exr"]
     DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
+    CLOUD_BLACKLIST_PATH = os.path.join("cloud", "cloud_blacklist.json")
     CLOUD_PROFILE_DEFAULTS = {
         "5090_32gb": {
             "label": "RTX 5090 32GB",
@@ -252,6 +253,9 @@ class DepthCrafterGUI:
         self.cloud_last_instance_profile_var = tk.StringVar(value="")
         self.cloud_last_host_var = tk.StringVar(value="")
         self.cloud_last_port_var = tk.IntVar(value=22)
+        self.cloud_last_offer_id_var = tk.IntVar(value=0)
+        self.cloud_last_machine_id_var = tk.IntVar(value=0)
+        self.cloud_last_host_id_var = tk.IntVar(value=0)
         self.cloud_remote_user_var = tk.StringVar(value="root")
         self.cloud_remote_root_var = tk.StringVar(value="/opt/StereoCrafter")
         self.cloud_remote_venv_var = tk.StringVar(value="/opt/venv")
@@ -259,6 +263,7 @@ class DepthCrafterGUI:
         self.cloud_vast_env_file_var = tk.StringVar(value="cloud/vast.env")
         self.cloud_hf_env_file_var = tk.StringVar(value="cloud/hf.env")
         self.cloud_no_hf_env_var = tk.BooleanVar(value=False)
+        self.cloud_use_private_registry_login_var = tk.BooleanVar(value=False)
         self.cloud_offer_limit_var = tk.IntVar(value=30)
         self.cloud_require_verified_hosts_var = tk.BooleanVar(value=True)
         self.cloud_max_dph_var = tk.DoubleVar(value=0.0)
@@ -272,6 +277,7 @@ class DepthCrafterGUI:
         self.cloud_profile_default_summary_var = tk.StringVar(value="")
         self.cloud_effective_processing_summary_var = tk.StringVar(value="")
         self.cloud_inherited_processing_summary_var = tk.StringVar(value="")
+        self.cloud_blacklist_summary_var = tk.StringVar(value="Blacklist: offers=0, machines=0, hosts=0")
         self.save_final_output_json_var = tk.BooleanVar(value=False)
         self.merge_output_format_var = tk.StringVar(value="mp4")
         self.merge_alignment_method_var = tk.StringVar(value="Shift & Scale")
@@ -361,6 +367,9 @@ class DepthCrafterGUI:
             "cloud_last_instance_profile_var": self.cloud_last_instance_profile_var,
             "cloud_last_host_var": self.cloud_last_host_var,
             "cloud_last_port_var": self.cloud_last_port_var,
+            "cloud_last_offer_id_var": self.cloud_last_offer_id_var,
+            "cloud_last_machine_id_var": self.cloud_last_machine_id_var,
+            "cloud_last_host_id_var": self.cloud_last_host_id_var,
             "cloud_remote_user_var": self.cloud_remote_user_var,
             "cloud_remote_root_var": self.cloud_remote_root_var,
             "cloud_remote_venv_var": self.cloud_remote_venv_var,
@@ -368,6 +377,7 @@ class DepthCrafterGUI:
             "cloud_vast_env_file_var": self.cloud_vast_env_file_var,
             "cloud_hf_env_file_var": self.cloud_hf_env_file_var,
             "cloud_no_hf_env_var": self.cloud_no_hf_env_var,
+            "cloud_use_private_registry_login_var": self.cloud_use_private_registry_login_var,
             "cloud_offer_limit_var": self.cloud_offer_limit_var,
             "cloud_require_verified_hosts_var": self.cloud_require_verified_hosts_var,
             "cloud_max_dph_var": self.cloud_max_dph_var,
@@ -3545,6 +3555,165 @@ class DepthCrafterGUI:
                 f"Verified hosts: {'required' if require_verified_hosts else 'optional'}."
             )
         )
+        self._refresh_cloud_blacklist_summary()
+
+    def _resolve_cloud_blacklist_path(self) -> str:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        return os.path.normpath(os.path.join(repo_root, self.CLOUD_BLACKLIST_PATH))
+
+    def _normalize_cloud_blacklist_data(self, raw_data: Optional[Dict[str, Any]]) -> Dict[str, set]:
+        normalized = {
+            "blocked_offer_ids": set(),
+            "blocked_machine_ids": set(),
+            "blocked_host_ids": set(),
+        }
+        if not isinstance(raw_data, dict):
+            return normalized
+
+        key_aliases = {
+            "blocked_offer_ids": ("blocked_offer_ids", "offer_ids"),
+            "blocked_machine_ids": ("blocked_machine_ids", "machine_ids"),
+            "blocked_host_ids": ("blocked_host_ids", "host_ids"),
+        }
+        for out_key, aliases in key_aliases.items():
+            for key in aliases:
+                values = raw_data.get(key)
+                if isinstance(values, list):
+                    for value in values:
+                        try:
+                            value_int = int(value)
+                        except Exception:
+                            continue
+                        if value_int > 0:
+                            normalized[out_key].add(value_int)
+        return normalized
+
+    def _load_cloud_blacklist_data(self) -> Dict[str, set]:
+        blacklist_path = self._resolve_cloud_blacklist_path()
+        if not os.path.isfile(blacklist_path):
+            return self._normalize_cloud_blacklist_data(None)
+        try:
+            with open(blacklist_path, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+            return self._normalize_cloud_blacklist_data(raw_data)
+        except Exception as exc:
+            _logger.warning(f"[CLOUD] Failed to parse blacklist file '{blacklist_path}': {exc}")
+            return self._normalize_cloud_blacklist_data(None)
+
+    def _save_cloud_blacklist_data(self, blacklist_data: Dict[str, set]):
+        blacklist_path = self._resolve_cloud_blacklist_path()
+        os.makedirs(os.path.dirname(blacklist_path), exist_ok=True)
+        serializable = {
+            "blocked_offer_ids": sorted(int(x) for x in blacklist_data.get("blocked_offer_ids", set()) if int(x) > 0),
+            "blocked_machine_ids": sorted(int(x) for x in blacklist_data.get("blocked_machine_ids", set()) if int(x) > 0),
+            "blocked_host_ids": sorted(int(x) for x in blacklist_data.get("blocked_host_ids", set()) if int(x) > 0),
+            "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_by": "depthcrafter_gui_seg.py",
+        }
+        with open(blacklist_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+
+    def _refresh_cloud_blacklist_summary(self):
+        data = self._load_cloud_blacklist_data()
+        offer_count = len(data.get("blocked_offer_ids", set()))
+        machine_count = len(data.get("blocked_machine_ids", set()))
+        host_count = len(data.get("blocked_host_ids", set()))
+        self.cloud_blacklist_summary_var.set(
+            f"Blacklist: offers={offer_count}, machines={machine_count}, hosts={host_count}"
+        )
+
+    def _is_cloud_offer_blacklisted(
+        self,
+        offer_entry: Dict[str, Any],
+        blacklist_data: Optional[Dict[str, set]] = None,
+    ) -> bool:
+        data = blacklist_data if blacklist_data is not None else self._load_cloud_blacklist_data()
+        try:
+            offer_id = int(offer_entry.get("id", 0) or 0)
+        except Exception:
+            offer_id = 0
+        try:
+            machine_id = int(offer_entry.get("machine_id", 0) or 0)
+        except Exception:
+            machine_id = 0
+        try:
+            host_id = int(offer_entry.get("host_id", 0) or 0)
+        except Exception:
+            host_id = 0
+        return (
+            (offer_id > 0 and offer_id in data.get("blocked_offer_ids", set()))
+            or (machine_id > 0 and machine_id in data.get("blocked_machine_ids", set()))
+            or (host_id > 0 and host_id in data.get("blocked_host_ids", set()))
+        )
+
+    def _blacklist_cached_cloud_target_from_ui(self):
+        try:
+            instance_id = int(self.cloud_last_instance_id_var.get())
+        except Exception:
+            instance_id = 0
+        if instance_id <= 0:
+            messagebox.showerror("Cloud", "Set a valid cached instance ID first.")
+            return
+
+        try:
+            cached_offer_id = int(self.cloud_last_offer_id_var.get())
+        except Exception:
+            cached_offer_id = 0
+        try:
+            cached_machine_id = int(self.cloud_last_machine_id_var.get())
+        except Exception:
+            cached_machine_id = 0
+        try:
+            cached_host_id = int(self.cloud_last_host_id_var.get())
+        except Exception:
+            cached_host_id = 0
+
+        row = self._get_cloud_instance_row(instance_id)
+        row_machine_id = 0
+        row_host_id = 0
+        if isinstance(row, dict):
+            try:
+                row_machine_id = int(row.get("machine_id", 0) or 0)
+            except Exception:
+                row_machine_id = 0
+            try:
+                row_host_id = int(row.get("host_id", 0) or 0)
+            except Exception:
+                row_host_id = 0
+
+        offer_id = cached_offer_id
+        machine_id = row_machine_id if row_machine_id > 0 else cached_machine_id
+        host_id = row_host_id if row_host_id > 0 else cached_host_id
+        if offer_id <= 0 and machine_id <= 0 and host_id <= 0:
+            messagebox.showerror(
+                "Cloud",
+                "No offer/machine/host identifiers are available to blacklist for the cached instance."
+            )
+            return
+
+        confirm_lines = [
+            f"Blacklist cached cloud target from future offer selection?",
+            "",
+            f"Instance ID: {instance_id}",
+            f"Offer ID: {offer_id if offer_id > 0 else 'n/a'}",
+            f"Machine ID: {machine_id if machine_id > 0 else 'n/a'}",
+            f"Host ID: {host_id if host_id > 0 else 'n/a'}",
+            "",
+            f"Blacklist file: {self._resolve_cloud_blacklist_path()}",
+        ]
+        if not messagebox.askyesno("Cloud Blacklist", "\n".join(confirm_lines)):
+            return
+
+        data = self._load_cloud_blacklist_data()
+        if offer_id > 0:
+            data["blocked_offer_ids"].add(offer_id)
+        if machine_id > 0:
+            data["blocked_machine_ids"].add(machine_id)
+        if host_id > 0:
+            data["blocked_host_ids"].add(host_id)
+        self._save_cloud_blacklist_data(data)
+        self._refresh_cloud_blacklist_summary()
+        self.message_queue.put(("status", f"Cloud blacklist updated from instance {instance_id}."))
 
     def _on_cloud_processing_setting_changed(self, *_):
         self._refresh_cloud_processing_summary()
@@ -3816,6 +3985,26 @@ class DepthCrafterGUI:
         entry_cached_port.pack(side=tk.LEFT)
         row += 1
 
+        ttk.Label(outer, text="Cached Offer/Machine/Host:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        cached_ids_frame = ttk.Frame(outer)
+        cached_ids_frame.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        ttk.Label(cached_ids_frame, text="Offer").pack(side=tk.LEFT)
+        entry_cached_offer = self._register_cloud_dialog_widget(
+            ttk.Entry(cached_ids_frame, textvariable=self.cloud_last_offer_id_var, width=8)
+        )
+        entry_cached_offer.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(cached_ids_frame, text="Machine").pack(side=tk.LEFT)
+        entry_cached_machine = self._register_cloud_dialog_widget(
+            ttk.Entry(cached_ids_frame, textvariable=self.cloud_last_machine_id_var, width=8)
+        )
+        entry_cached_machine.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(cached_ids_frame, text="Host").pack(side=tk.LEFT)
+        entry_cached_host_id = self._register_cloud_dialog_widget(
+            ttk.Entry(cached_ids_frame, textvariable=self.cloud_last_host_id_var, width=8)
+        )
+        entry_cached_host_id.pack(side=tk.LEFT, padx=(4, 0))
+        row += 1
+
         admin_btn_frame = ttk.Frame(outer)
         admin_btn_frame.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 2))
         btn_force_start = self._register_cloud_dialog_widget(
@@ -3845,6 +4034,23 @@ class DepthCrafterGUI:
             )
         )
         btn_clear_cache.pack(side=tk.LEFT)
+        row += 1
+
+        blacklist_btn_frame = ttk.Frame(outer)
+        blacklist_btn_frame.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 2))
+        btn_blacklist_cached = self._register_cloud_dialog_widget(
+            ttk.Button(
+                blacklist_btn_frame,
+                text="Blacklist Cached Host",
+                command=self._blacklist_cached_cloud_target_from_ui,
+                width=20,
+            )
+        )
+        btn_blacklist_cached.pack(side=tk.LEFT, padx=(0, 8))
+        lbl_blacklist_summary = self._register_cloud_dialog_widget(
+            ttk.Label(blacklist_btn_frame, textvariable=self.cloud_blacklist_summary_var)
+        )
+        lbl_blacklist_summary.pack(side=tk.LEFT)
         row += 1
 
         ttk.Label(outer, text="SSH Identity Key:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
@@ -3924,6 +4130,16 @@ class DepthCrafterGUI:
             )
         )
         no_hf_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        row += 1
+
+        private_registry_login_cb = self._register_cloud_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Use private registry login for image pull (--login)",
+                variable=self.cloud_use_private_registry_login_var,
+            )
+        )
+        private_registry_login_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
         row += 1
 
         ttk.Label(outer, text="Remote User:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
@@ -4363,10 +4579,15 @@ class DepthCrafterGUI:
         if not isinstance(parsed_payload, list) or not parsed_payload:
             raise RuntimeError("No cloud offers returned for current profile/filter settings.")
 
+        blacklist_data = self._load_cloud_blacklist_data()
         min_gpu_ram_gb = float(profile_defaults.get("min_gpu_ram_gb", 0.0))
         ranked_offers: List[Dict[str, Any]] = []
+        skipped_blacklist_count = 0
         for entry in parsed_payload:
             if not isinstance(entry, dict):
+                continue
+            if self._is_cloud_offer_blacklisted(entry, blacklist_data):
+                skipped_blacklist_count += 1
                 continue
             vram_gb = self._normalized_gpu_ram_gb(entry)
             if vram_gb + 1e-6 < min_gpu_ram_gb:
@@ -4384,7 +4605,8 @@ class DepthCrafterGUI:
 
         if not ranked_offers:
             raise RuntimeError(
-                f"No cloud offers passed VRAM guard ({min_gpu_ram_gb:.1f}GB) for profile '{profile_key}'."
+                f"No cloud offers passed filters for profile '{profile_key}' "
+                f"(VRAM>={min_gpu_ram_gb:.1f}GB, blacklisted skipped={skipped_blacklist_count})."
             )
 
         ranked_offers.sort(
@@ -4458,10 +4680,15 @@ class DepthCrafterGUI:
                     f"  ${alt_total:.4f} / ${alt_hourly:.4f}h / id={alt_offer_id} / {alt_gpu}"
                 )
 
+        blacklist_data = self._load_cloud_blacklist_data()
+        blocked_offer_count = len(blacklist_data.get("blocked_offer_ids", set()))
+        blocked_machine_count = len(blacklist_data.get("blocked_machine_ids", set()))
+        blocked_host_count = len(blacklist_data.get("blocked_host_ids", set()))
         lines.extend([
             "",
             f"Offer filter profile: {profile_defaults.get('label', profile_key)}",
             f"Require verified hosts: {'Yes' if bool(self.cloud_require_verified_hosts_var.get()) else 'No'}",
+            f"Blacklist active: offers={blocked_offer_count}, machines={blocked_machine_count}, hosts={blocked_host_count}",
             "Continue with instance creation?",
         ])
         return "\n".join(lines)
@@ -4539,10 +4766,29 @@ class DepthCrafterGUI:
             if ssh_host and ssh_port > 0:
                 tcp_ready, probe_error = self._is_cloud_tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
                 if tcp_ready:
+                    row_offer_id = 0
+                    row_machine_id = 0
+                    row_host_id = 0
+                    if isinstance(row, dict):
+                        try:
+                            row_offer_id = int(row.get("offer_id", 0) or 0)
+                        except Exception:
+                            row_offer_id = 0
+                        try:
+                            row_machine_id = int(row.get("machine_id", 0) or 0)
+                        except Exception:
+                            row_machine_id = 0
+                        try:
+                            row_host_id = int(row.get("host_id", 0) or 0)
+                        except Exception:
+                            row_host_id = 0
                     return {
                         "instance_id": int(instance_id),
                         "host": ssh_host,
                         "port": int(ssh_port),
+                        "offer_id": row_offer_id,
+                        "machine_id": row_machine_id,
+                        "host_id": row_host_id,
                         "user": self.cloud_remote_user_var.get().strip() or "root",
                         "remote_root": self.cloud_remote_root_var.get().strip() or "/opt/StereoCrafter",
                         "remote_venv": self.cloud_remote_venv_var.get().strip() or "/opt/venv",
@@ -4559,14 +4805,30 @@ class DepthCrafterGUI:
         raise RuntimeError(f"Timed out waiting for cloud instance {instance_id} readiness.")
 
     def _cache_cloud_instance_connection(self, connection_info: Dict[str, object], profile: str):
+        previous_instance_id = int(self.cloud_last_instance_id_var.get() or 0)
         instance_id = int(connection_info.get("instance_id", 0) or 0)
         host = str(connection_info.get("host", "") or "")
         port = int(connection_info.get("port", 22) or 22)
+        offer_id = int(connection_info.get("offer_id", 0) or 0)
+        machine_id = int(connection_info.get("machine_id", 0) or 0)
+        host_id = int(connection_info.get("host_id", 0) or 0)
         if instance_id > 0:
             self.cloud_last_instance_id_var.set(instance_id)
             self.cloud_last_instance_profile_var.set(profile or "")
             self.cloud_last_host_var.set(host)
             self.cloud_last_port_var.set(port)
+            if offer_id > 0:
+                self.cloud_last_offer_id_var.set(offer_id)
+            elif previous_instance_id != instance_id:
+                self.cloud_last_offer_id_var.set(0)
+            if machine_id > 0:
+                self.cloud_last_machine_id_var.set(machine_id)
+            elif previous_instance_id != instance_id:
+                self.cloud_last_machine_id_var.set(0)
+            if host_id > 0:
+                self.cloud_last_host_id_var.set(host_id)
+            elif previous_instance_id != instance_id:
+                self.cloud_last_host_id_var.set(0)
 
     def _start_cloud_instance_and_wait(self, instance_id: int) -> Dict[str, object]:
         start_cmd = self._build_vast_cli_cmd(["start", "instance", str(instance_id), "--raw"])
@@ -4633,6 +4895,9 @@ class DepthCrafterGUI:
         self.cloud_last_instance_profile_var.set("")
         self.cloud_last_host_var.set("")
         self.cloud_last_port_var.set(22)
+        self.cloud_last_offer_id_var.set(0)
+        self.cloud_last_machine_id_var.set(0)
+        self.cloud_last_host_id_var.set(0)
         self.message_queue.put(("status", "Cloud cached instance cleared."))
 
     def _run_external_command_with_logging(self, cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, List[str]]:
@@ -4741,6 +5006,8 @@ class DepthCrafterGUI:
             self.cloud_remote_venv_var.get().strip() or "/opt/venv",
             "--offer-limit",
             str(int(self.cloud_offer_limit_var.get())),
+            "--blacklist-file",
+            self._resolve_cloud_blacklist_path(),
             "--expected-runtime-hours",
             str(float(self.cloud_expected_runtime_hours_var.get())),
             "--expected-upload-gb",
@@ -4782,6 +5049,10 @@ class DepthCrafterGUI:
             hf_env_file = self.cloud_hf_env_file_var.get().strip()
             if hf_env_file:
                 cmd.extend(["--hf-env-file", os.path.expanduser(hf_env_file)])
+
+        # Default-safe behavior: do not send registry login creds unless explicitly enabled.
+        if not bool(self.cloud_use_private_registry_login_var.get()):
+            cmd.append("--skip-image-login")
 
         return cmd
 
@@ -4836,6 +5107,9 @@ class DepthCrafterGUI:
             "instance_id": int(cloud_remote.get("vast_instance_id", 0) or 0),
             "host": host,
             "port": int(cloud_remote.get("vast_ssh_port", 22) or 22),
+            "offer_id": int(cloud_remote.get("vast_offer_id", 0) or 0),
+            "machine_id": int(cloud_remote.get("vast_machine_id", 0) or 0),
+            "host_id": int(cloud_remote.get("vast_host_id", 0) or 0),
             "user": str(cloud_remote.get("vast_user", "root") or "root"),
             "remote_root": str(cloud_remote.get("remote_root", self.cloud_remote_root_var.get()) or self.cloud_remote_root_var.get()),
             "remote_venv": str(cloud_remote.get("remote_venv", self.cloud_remote_venv_var.get()) or self.cloud_remote_venv_var.get()),
@@ -5122,6 +5396,9 @@ class DepthCrafterGUI:
                 self.cloud_last_instance_profile_var.set("")
                 self.cloud_last_host_var.set("")
                 self.cloud_last_port_var.set(22)
+                self.cloud_last_offer_id_var.set(0)
+                self.cloud_last_machine_id_var.set(0)
+                self.cloud_last_host_id_var.set(0)
 
     def _apply_spatial_refine_options_visibility(self):
         if not hasattr(self, 'spatial_refine_toggle_btn'):

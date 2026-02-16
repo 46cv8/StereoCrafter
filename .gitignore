@@ -107,3 +107,4 @@ nul
 cloud/hf.env
 cloud/ghcr.env
 cloud/vast.env
+cloud/cloud_blacklist.json

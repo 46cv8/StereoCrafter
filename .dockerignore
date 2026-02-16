@@ -1,0 +1,24 @@
+# Prevent local secrets/state from entering Docker build context.
+cloud/*.env
+cloud/cloud_blacklist.json
+
+# VCS and local caches.
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.nox/
+.tox/
+
+# Large local artifacts not required for image build.
+weights/
+outputs/
+output_depthmaps/
+output_clips/
+temp/
+old/
+venv/
+.venv/

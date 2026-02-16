@@ -88,6 +88,7 @@ Fill:
 - `cloud/vast.env` with `VAST_API_KEY=...`
 - `cloud/hf.env` with your accepted-terms HF token.
 - If your `--image` is private on GHCR: fill `cloud/ghcr.env` (`GHCR_USERNAME`, `GHCR_PAT` with at least `read:packages`).
+- Optional blacklist file: `cloud/cloud_blacklist.json` (auto-created by GUI when you blacklist failed hosts).
 
 Launch a 5090 worker using your current config as base:
 
@@ -120,6 +121,7 @@ Notes:
 - The script prompts `Type GO ...` after readiness; that starts remote processing immediately.
 - Add `--run-now` to skip GO prompt.
 - Add `--output-config /path/custom.json` to control generated config path.
+- Add `--blacklist-file /path/to/cloud_blacklist.json` to override default blacklist location.
 
 ## 1) Bootstrap a fresh instance
 

@@ -277,6 +277,54 @@ def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
+def normalize_blacklist_payload(payload: Any) -> Dict[str, set]:
+    normalized = {
+        "blocked_offer_ids": set(),
+        "blocked_machine_ids": set(),
+        "blocked_host_ids": set(),
+    }
+    if not isinstance(payload, dict):
+        return normalized
+
+    key_aliases = {
+        "blocked_offer_ids": ("blocked_offer_ids", "offer_ids"),
+        "blocked_machine_ids": ("blocked_machine_ids", "machine_ids"),
+        "blocked_host_ids": ("blocked_host_ids", "host_ids"),
+    }
+    for out_key, aliases in key_aliases.items():
+        for key in aliases:
+            values = payload.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    value_int = as_int(value, 0)
+                    if value_int > 0:
+                        normalized[out_key].add(value_int)
+    return normalized
+
+
+def load_blacklist_file(path_value: str) -> Dict[str, set]:
+    path = Path(path_value).expanduser().resolve()
+    if not path.exists():
+        return normalize_blacklist_payload(None)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log(f"Warning: failed to parse blacklist file {path}: {exc}")
+        return normalize_blacklist_payload(None)
+    return normalize_blacklist_payload(raw)
+
+
+def offer_is_blacklisted(offer: Dict[str, Any], blacklist: Dict[str, set]) -> bool:
+    offer_id = as_int(offer.get("id"), 0)
+    machine_id = as_int(offer.get("machine_id"), 0)
+    host_id = as_int(offer.get("host_id"), 0)
+    return (
+        (offer_id > 0 and offer_id in blacklist.get("blocked_offer_ids", set()))
+        or (machine_id > 0 and machine_id in blacklist.get("blocked_machine_ids", set()))
+        or (host_id > 0 and host_id in blacklist.get("blocked_host_ids", set()))
+    )
+
+
 def normalized_gpu_ram_gb(offer: Dict[str, Any]) -> float:
     raw = as_float(offer.get("gpu_ram"), 0.0)
     if raw <= 0:
@@ -472,6 +520,7 @@ def update_config_for_profile(
         "vast_instance_id": instance_id,
         "vast_offer_id": as_int(selected_offer.get("id"), 0),
         "vast_machine_id": as_int(selected_offer.get("machine_id"), 0),
+        "vast_host_id": as_int(selected_offer.get("host_id"), 0),
         "vast_gpu_name": str(selected_offer.get("gpu_name", "")),
         "vast_gpu_ram_gb": round(normalized_gpu_ram_gb(selected_offer), 3),
         "vast_host": host,
@@ -784,6 +833,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-patterns", default="*.mkv,*.mp4,*.mov,*.avi")
 
     p.add_argument("--offer-limit", type=int, default=30)
+    p.add_argument(
+        "--blacklist-file",
+        default=str(REPO_ROOT / "cloud" / "cloud_blacklist.json"),
+        help="JSON file with blocked offer/machine/host ids.",
+    )
     p.add_argument("--show-top", type=int, default=8)
     p.add_argument("--offer-type", choices=["on-demand", "reserved", "bid"], default="on-demand")
     p.add_argument("--search-order", default="dph_total")
@@ -871,16 +925,25 @@ def main() -> int:
     if not isinstance(search_payload, list) or not search_payload:
         raise VastWorkerLaunchError(f"No offers matched query for profile '{profile.key}'. Query: {query}")
 
+    blacklist = load_blacklist_file(args.blacklist_file)
+    blocked_offer_count = len(blacklist.get("blocked_offer_ids", set()))
+    blocked_machine_count = len(blacklist.get("blocked_machine_ids", set()))
+    blocked_host_count = len(blacklist.get("blocked_host_ids", set()))
+    skipped_blacklist_count = 0
     offers = []
     for offer in search_payload:
         if not isinstance(offer, dict):
+            continue
+        if offer_is_blacklisted(offer, blacklist):
+            skipped_blacklist_count += 1
             continue
         if normalized_gpu_ram_gb(offer) + 1e-6 < profile.min_gpu_ram_gb:
             continue
         offers.append(annotate_offer(offer, args))
     if not offers:
         raise VastWorkerLaunchError(
-            f"No offers matched query for profile '{profile.key}' after RAM guard ({profile.min_gpu_ram_gb:.1f}GB). "
+            f"No offers matched query for profile '{profile.key}' after filters "
+            f"(RAM guard {profile.min_gpu_ram_gb:.1f}GB, blacklist skipped {skipped_blacklist_count}). "
             f"Query: {query}"
         )
     offers.sort(
@@ -896,6 +959,10 @@ def main() -> int:
         f"{args.expected_runtime_hours}h runtime + transfer {args.expected_upload_gb}/{args.expected_download_gb} GB):"
     )
     log(f"Offer filter: verified hosts {'required' if not args.allow_unverified else 'optional'}.")
+    log(
+        f"Blacklist filter: offers={blocked_offer_count}, machines={blocked_machine_count}, "
+        f"hosts={blocked_host_count}, skipped_now={skipped_blacklist_count}."
+    )
     print_offer_table(offers, args.show_top)
 
     if args.offer_id > 0:
