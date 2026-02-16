@@ -1053,10 +1053,10 @@ class InpaintingGUI(ThemedTk):
         hires_data: dict,
         base_video_name: str,
         is_dual_input: bool,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """
-        Applies Hi-Res upscaling/blending (if enabled), Color Transfer, and final SBS concatenation.
-        Returns the final tensor for encoding, or None on error.
+        Applies Hi-Res upscaling/blending (if enabled), Color Transfer, and final output preparation.
+        Returns (right_or_dual_frames, left_frames_or_none), or None on error.
         """
         frames_output_final = inpainted_frames
         frames_mask_processed = mask_frames
@@ -1415,15 +1415,16 @@ class InpaintingGUI(ThemedTk):
         del frames_mask_processed, frames_warpped_original_unpadded_normalized
         gc.collect()
 
-        # --- Final Concatenation ---
-        final_output_frames_for_encoding: Optional[torch.Tensor] = None
+        # --- Final Output Preparation ---
+        final_right_or_dual_frames: Optional[torch.Tensor] = None
+        final_left_frames_for_sbs: Optional[torch.Tensor] = None
 
         if is_dual_input:
             # For dual input, the only valid output is the inpainted right eye.
             # There is no left-eye data in the source to create an SBS view.
-            final_output_frames_for_encoding = frames_output_final
+            final_right_or_dual_frames = frames_output_final
         else:
-            # For quad input, we have the left eye, so we can create a side-by-side view.
+            # For quad input, keep left and right separate to avoid allocating a giant SBS tensor.
             if frames_left_original_cropped is None or frames_left_original_cropped.numel() == 0:
                 logger.error(f"Original left frames are missing or empty for non-dual input {base_video_name}. Cannot create SBS output.")
                 return None
@@ -1435,16 +1436,19 @@ class InpaintingGUI(ThemedTk):
                 logger.error(f"Dimension mismatch for SBS concatenation: Left {frames_left_original_cropped.shape}, Inpainted {frames_output_final.shape} for {base_video_name}.")
                 return None
 
-            sbs_frames = torch.cat([frames_left_original_cropped, frames_output_final], dim=3)
-            self._save_debug_image(sbs_frames, "10_final_sbs_for_encoding", base_video_name, 0)
-            final_output_frames_for_encoding = sbs_frames
+            if frames_output_final.shape[0] > 0:
+                debug_sbs_frame = torch.cat([frames_left_original_cropped[0], frames_output_final[0]], dim=2)
+                self._save_debug_image(debug_sbs_frame, "10_final_sbs_for_encoding", base_video_name, 0)
+                del debug_sbs_frame
+            final_right_or_dual_frames = frames_output_final
+            final_left_frames_for_sbs = frames_left_original_cropped
 
         # Final check: ensure the tensor to be encoded is actually populated
-        if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
+        if final_right_or_dual_frames is None or final_right_or_dual_frames.numel() == 0:
             logger.error(f"Final output frames for encoding are empty or None after preparation for {base_video_name}.")
             return None
 
-        return final_output_frames_for_encoding
+        return final_right_or_dual_frames, final_left_frames_for_sbs
     
     def _find_high_res_match(self, low_res_video_path: str) -> Optional[str]:
         """
@@ -2611,7 +2615,7 @@ class InpaintingGUI(ThemedTk):
             self._cleanup_chunk_checkpoints(base_video_name, checkpoint_path=checkpoint_path)
         
         # 5. FINALIZATION (Hi-Res Upscale, Color Transfer, Blend, Concat)
-        final_output_frames_for_encoding = self._finalize_output_frames(
+        finalized_outputs = self._finalize_output_frames(
             inpainted_frames=frames_output_final,
             mask_frames=frames_blend_mask_processed_unpadded_original_length,
             original_warped_frames=frames_warpped_original_unpadded_normalized,
@@ -2621,17 +2625,28 @@ class InpaintingGUI(ThemedTk):
             is_dual_input=is_dual_input,
         )
 
-        if final_output_frames_for_encoding is None or final_output_frames_for_encoding.numel() == 0:
+        if finalized_outputs is None:
             logger.error(f"Final output frames are empty after finalization for {base_video_name}.")
             if update_info_callback:
                 self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength))
             return False, None
+        final_right_or_dual_frames, final_left_frames_for_sbs = finalized_outputs
+        if final_right_or_dual_frames.numel() == 0:
+            logger.error(f"Final output frames are empty after finalization for {base_video_name}.")
+            if update_info_callback:
+                self.after(0, lambda: update_info_callback(base_video_name, "N/A", "0 (Empty Final)", overlap, original_input_blend_strength))
+            return False, None
+
+        output_width = int(final_right_or_dual_frames.shape[3])
+        if final_left_frames_for_sbs is not None:
+            output_width += int(final_left_frames_for_sbs.shape[3])
+
         self._log_resource_snapshot(
             stage="post_finalize",
             base_video_name=base_video_name,
             extra={
-                "num_frames": int(final_output_frames_for_encoding.shape[0]),
-                "resolution": f"{int(final_output_frames_for_encoding.shape[3])}x{int(final_output_frames_for_encoding.shape[2])}",
+                "num_frames": int(final_right_or_dual_frames.shape[0]),
+                "resolution": f"{output_width}x{int(final_right_or_dual_frames.shape[2])}",
             },
             level=logging.INFO,
         )
@@ -2641,7 +2656,7 @@ class InpaintingGUI(ThemedTk):
         os.makedirs(temp_png_dir, exist_ok=True)
         logger.debug(f"Saving intermediate 16-bit PNG sequence to {temp_png_dir}")
 
-        total_output_frames = final_output_frames_for_encoding.shape[0]
+        total_output_frames = final_right_or_dual_frames.shape[0]
         stop_event_non_optional = stop_event if stop_event is not None else threading.Event()
         
         try:
@@ -2652,7 +2667,9 @@ class InpaintingGUI(ThemedTk):
                     shutil.rmtree(temp_png_dir, ignore_errors=True)
                     return False, None
 
-                frame_tensor = final_output_frames_for_encoding[frame_idx] 
+                frame_tensor = final_right_or_dual_frames[frame_idx]
+                if final_left_frames_for_sbs is not None:
+                    frame_tensor = torch.cat([final_left_frames_for_sbs[frame_idx], frame_tensor], dim=2)
                 frame_np = frame_tensor.permute(1, 2, 0).numpy()
                 frame_uint16 = (np.clip(frame_np, 0.0, 1.0) * 65535.0).astype(np.uint16)
                 frame_bgr = cv2.cvtColor(frame_uint16, cv2.COLOR_RGB2BGR)
