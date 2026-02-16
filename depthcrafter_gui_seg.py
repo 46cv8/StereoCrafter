@@ -71,7 +71,7 @@ except ImportError:
     _logger.warning("OpenEXR or Imath module not found. EXR options might be limited.")
 
 
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 
 try:
     from ttkthemes import ThemedTk
@@ -166,6 +166,8 @@ class DepthCrafterGUI:
     CLOUD_PROFILE_DEFAULTS = {
         "5090_32gb": {
             "label": "RTX 5090 32GB",
+            "offer_gpu_filter": "gpu_name=RTX_5090",
+            "min_gpu_ram_gb": 30.0,
             "target_width": 1664,
             "target_height": 896,
             "window_size": 75,
@@ -173,6 +175,8 @@ class DepthCrafterGUI:
         },
         "rtx_pro_6000_96gb": {
             "label": "RTX PRO 6000 96GB",
+            "offer_gpu_filter": "gpu_name in [RTX_PRO_6000_WS,RTX_PRO_6000_S]",
+            "min_gpu_ram_gb": 92.0,
             "target_width": 1920,
             "target_height": 1040,
             "window_size": 75,
@@ -3453,6 +3457,12 @@ class DepthCrafterGUI:
         except Exception:
             return int(fallback)
 
+    def _safe_float_from_tk_var(self, tk_var, fallback: float) -> float:
+        try:
+            return float(tk_var.get())
+        except Exception:
+            return float(fallback)
+
     def _get_cloud_profile_defaults(self, profile_key: Optional[str] = None) -> Dict[str, object]:
         key = (profile_key or self.cloud_profile_var.get().strip() or "5090_32gb").strip()
         defaults = self.CLOUD_PROFILE_DEFAULTS.get(key)
@@ -4112,6 +4122,250 @@ class DepthCrafterGUI:
                 return user, host, port
         return "", "", 0
 
+    def _normalized_gpu_ram_gb(self, offer: Dict[str, Any]) -> float:
+        try:
+            raw = float(offer.get("gpu_ram", 0.0) or 0.0)
+        except Exception:
+            raw = 0.0
+        if raw <= 0:
+            return 0.0
+        return raw / 1024.0 if raw > 1000.0 else raw
+
+    def _offer_hourly_cost(self, offer: Dict[str, Any]) -> float:
+        for key in ("dph_total", "discounted_dph_total", "dph"):
+            if key in offer:
+                try:
+                    return float(offer.get(key) or 0.0)
+                except Exception:
+                    return 0.0
+        return 0.0
+
+    def _offer_cost_per_tb(self, offer: Dict[str, Any], direction: str) -> float:
+        if direction == "up":
+            if "internet_up_cost_per_tb" in offer:
+                try:
+                    return float(offer.get("internet_up_cost_per_tb") or 0.0)
+                except Exception:
+                    return 0.0
+            try:
+                return float(offer.get("inet_up_cost") or 0.0) * 1024.0
+            except Exception:
+                return 0.0
+        if "internet_down_cost_per_tb" in offer:
+            try:
+                return float(offer.get("internet_down_cost_per_tb") or 0.0)
+            except Exception:
+                return 0.0
+        try:
+            return float(offer.get("inet_down_cost") or 0.0) * 1024.0
+        except Exception:
+            return 0.0
+
+    def _estimate_offer_total_cost(self, offer: Dict[str, Any]) -> Dict[str, float]:
+        expected_runtime_hours = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_runtime_hours_var, 1.0))
+        expected_upload_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_upload_gb_var, 0.0))
+        expected_download_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_download_gb_var, 0.0))
+        hourly = self._offer_hourly_cost(offer)
+        up_tb = self._offer_cost_per_tb(offer, "up")
+        down_tb = self._offer_cost_per_tb(offer, "down")
+        transfer_cost = ((expected_upload_gb / 1024.0) * up_tb) + ((expected_download_gb / 1024.0) * down_tb)
+        runtime_cost = hourly * expected_runtime_hours
+        total_cost = runtime_cost + transfer_cost
+        return {
+            "hourly": hourly,
+            "up_tb": up_tb,
+            "down_tb": down_tb,
+            "runtime_cost": runtime_cost,
+            "transfer_cost": transfer_cost,
+            "total_cost": total_cost,
+            "expected_runtime_hours": expected_runtime_hours,
+            "expected_upload_gb": expected_upload_gb,
+            "expected_download_gb": expected_download_gb,
+        }
+
+    def _build_cloud_offer_search_query(self, profile_key: str) -> Tuple[str, Dict[str, object]]:
+        profile_defaults = self._get_cloud_profile_defaults(profile_key)
+        offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "gpu_name=RTX_5090"))
+        min_reliability = 0.97
+        min_cuda = 12.8
+        min_direct_ports = 2
+        min_inet_down = 200.0
+        min_inet_up = 50.0
+        disk_gb = max(20, self._safe_int_from_tk_var(self.cloud_disk_gb_var, 40))
+        max_dph = max(0.0, self._safe_float_from_tk_var(self.cloud_max_dph_var, 0.0))
+
+        query_parts = [
+            offer_gpu_filter,
+            "rentable=true",
+            "verified=true",
+            "num_gpus=1",
+            f"cuda_vers>={min_cuda}",
+            f"reliability>={min_reliability}",
+            f"disk_space>={disk_gb}",
+            f"direct_port_count>={min_direct_ports}",
+            f"inet_down>={min_inet_down}",
+            f"inet_up>={min_inet_up}",
+        ]
+        if max_dph > 0.0:
+            query_parts.append(f"dph<={max_dph}")
+        return " ".join(query_parts), profile_defaults
+
+    def _fetch_ranked_cloud_offers_for_confirmation(self, profile_key: str) -> List[Dict[str, Any]]:
+        query, profile_defaults = self._build_cloud_offer_search_query(profile_key)
+        offer_limit = max(1, self._safe_int_from_tk_var(self.cloud_offer_limit_var, 30))
+        disk_gb = max(20, self._safe_int_from_tk_var(self.cloud_disk_gb_var, 40))
+
+        search_cmd = self._build_vast_cli_cmd([
+            "search",
+            "offers",
+            query,
+            "--raw",
+            "--limit",
+            str(offer_limit),
+            "--storage",
+            str(disk_gb),
+            "--order",
+            "dph_total",
+            "--no-default",
+        ])
+        rc, lines = self._run_external_command_with_logging(
+            search_cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        if rc != 0:
+            raise RuntimeError(f"vastai search offers failed with exit code {rc}.")
+
+        raw_payload = "\n".join(lines).strip()
+        parsed_payload = self._parse_json_like_payload(raw_payload)
+        if not isinstance(parsed_payload, list) or not parsed_payload:
+            raise RuntimeError("No cloud offers returned for current profile/filter settings.")
+
+        min_gpu_ram_gb = float(profile_defaults.get("min_gpu_ram_gb", 0.0))
+        ranked_offers: List[Dict[str, Any]] = []
+        for entry in parsed_payload:
+            if not isinstance(entry, dict):
+                continue
+            vram_gb = self._normalized_gpu_ram_gb(entry)
+            if vram_gb + 1e-6 < min_gpu_ram_gb:
+                continue
+            cost_data = self._estimate_offer_total_cost(entry)
+            enriched = dict(entry)
+            enriched["_vram_gb"] = vram_gb
+            enriched["_hourly"] = cost_data["hourly"]
+            enriched["_up_tb"] = cost_data["up_tb"]
+            enriched["_down_tb"] = cost_data["down_tb"]
+            enriched["_runtime_cost"] = cost_data["runtime_cost"]
+            enriched["_transfer_cost"] = cost_data["transfer_cost"]
+            enriched["_total_cost"] = cost_data["total_cost"]
+            ranked_offers.append(enriched)
+
+        if not ranked_offers:
+            raise RuntimeError(
+                f"No cloud offers passed VRAM guard ({min_gpu_ram_gb:.1f}GB) for profile '{profile_key}'."
+            )
+
+        ranked_offers.sort(
+            key=lambda offer: (
+                float(offer.get("_total_cost", 1e12)),
+                float(offer.get("_hourly", 1e12)),
+                -float(offer.get("reliability", 0.0) or 0.0),
+            )
+        )
+        return ranked_offers
+
+    def _build_cloud_pricing_confirmation_message(
+        self,
+        profile_key: str,
+        source_count: int,
+        reason: str = "",
+    ) -> str:
+        profile_defaults = self._get_cloud_profile_defaults(profile_key)
+        settings = self._get_effective_cloud_processing_settings()
+        lines: List[str] = [
+            f"Launch cloud worker profile '{profile_key}' and process {source_count} clip(s)?",
+            "",
+            f"Effective cloud params: {settings['target_width']}x{settings['target_height']}, "
+            f"window={settings['window_size']}, overlap={settings['overlap']}",
+        ]
+        if reason:
+            lines.extend(["", reason])
+
+        ranked_offers = self._fetch_ranked_cloud_offers_for_confirmation(profile_key)
+        best = ranked_offers[0]
+        offer_id = int(best.get("id", 0) or 0)
+        gpu_name = str(best.get("gpu_name", "Unknown"))
+        location = str(best.get("geolocation", "Unknown"))
+        reliability = float(best.get("reliability", 0.0) or 0.0)
+        vram_gb = float(best.get("_vram_gb", 0.0) or 0.0)
+        inet_down = float(best.get("inet_down", 0.0) or 0.0)
+        inet_up = float(best.get("inet_up", 0.0) or 0.0)
+
+        lines.extend([
+            "",
+            "Selected cheapest estimated offer:",
+            f"  Offer ID: {offer_id}",
+            f"  GPU: {gpu_name} ({vram_gb:.1f} GB VRAM)",
+            f"  Location: {location}",
+            f"  Reliability: {reliability:.3f}",
+            f"  Network (down/up): {inet_down:.0f} / {inet_up:.0f} Mbps",
+            "",
+            "Pricing sanity check:",
+            f"  $/hour: ${float(best.get('_hourly', 0.0)):.4f}",
+            f"  Upload cost per TB: ${float(best.get('_up_tb', 0.0)):.4f}",
+            f"  Download cost per TB: ${float(best.get('_down_tb', 0.0)):.4f}",
+            "",
+            "Estimated total cost:",
+            f"  Runtime: {self.cloud_expected_runtime_hours_var.get()} h -> ${float(best.get('_runtime_cost', 0.0)):.4f}",
+            (
+                f"  Transfer: {self.cloud_expected_upload_gb_var.get()} GB up, "
+                f"{self.cloud_expected_download_gb_var.get()} GB down -> "
+                f"${float(best.get('_transfer_cost', 0.0)):.4f}"
+            ),
+            f"  Estimated total: ${float(best.get('_total_cost', 0.0)):.4f}",
+        ])
+
+        if len(ranked_offers) > 1:
+            lines.extend(["", "Alternatives (estimated total / $hr / offer):"])
+            for alt in ranked_offers[1:4]:
+                alt_offer_id = int(alt.get("id", 0) or 0)
+                alt_total = float(alt.get("_total_cost", 0.0) or 0.0)
+                alt_hourly = float(alt.get("_hourly", 0.0) or 0.0)
+                alt_gpu = str(alt.get("gpu_name", "Unknown"))
+                lines.append(
+                    f"  ${alt_total:.4f} / ${alt_hourly:.4f}h / id={alt_offer_id} / {alt_gpu}"
+                )
+
+        lines.extend([
+            "",
+            f"Offer filter profile: {profile_defaults.get('label', profile_key)}",
+            "Continue with instance creation?",
+        ])
+        return "\n".join(lines)
+
+    def _confirm_new_cloud_launch(self, profile_key: str, source_count: int, reason: str = "") -> bool:
+        try:
+            msg = self._build_cloud_pricing_confirmation_message(
+                profile_key=profile_key,
+                source_count=source_count,
+                reason=reason,
+            )
+        except Exception as preflight_exc:
+            _logger.warning(f"[CLOUD] Offer pricing preflight failed: {preflight_exc}")
+            fallback_lines = [
+                f"Launch cloud worker profile '{profile_key}' and process {source_count} clip(s)?",
+            ]
+            if reason:
+                fallback_lines.extend(["", reason])
+            fallback_lines.extend([
+                "",
+                "Could not fetch pricing preflight from Vast right now.",
+                f"Reason: {preflight_exc}",
+                "",
+                "Continue anyway?",
+            ])
+            msg = "\n".join(fallback_lines)
+        return messagebox.askyesno("Cloud Dispatch", msg)
+
     def _get_cloud_instance_status(self, instance_id: int) -> str:
         show_cmd = self._build_vast_cli_cmd(["show", "instance", str(instance_id), "--raw"])
         rc, lines = self._run_external_command_with_logging(show_cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
@@ -4590,11 +4844,17 @@ class DepthCrafterGUI:
         except Exception:
             cached_instance_id = 0
         connection_info: Optional[Dict[str, object]] = None
+        should_prompt_new_launch = False
+        new_launch_reason = ""
 
         if reuse_enabled and cached_instance_id > 0 and cached_profile == selected_profile:
+            cached_host = self.cloud_last_host_var.get().strip()
+            cached_port = self._safe_int_from_tk_var(self.cloud_last_port_var, 22)
+            cached_host_text = f"{cached_host}:{cached_port}" if cached_host else "unknown"
             reuse_choice = messagebox.askyesnocancel(
                 "Cloud Dispatch",
-                f"Reuse cached instance {cached_instance_id} for profile '{selected_profile}'?\n\n"
+                f"Reuse cached instance {cached_instance_id} for profile '{selected_profile}'?\n"
+                f"Cached host: {cached_host_text}\n\n"
                 "Yes = reuse/start cached instance\n"
                 "No = launch new cheapest worker\n"
                 "Cancel = abort"
@@ -4619,12 +4879,30 @@ class DepthCrafterGUI:
                     if not fallback_launch:
                         self.status_message_var.set("Cloud dispatch cancelled.")
                         return
+                    should_prompt_new_launch = True
+                    new_launch_reason = f"Reuse failed for cached instance {cached_instance_id}: {reuse_exc}"
+            else:
+                should_prompt_new_launch = True
+                new_launch_reason = (
+                    f"Cached instance {cached_instance_id} was not selected for reuse."
+                )
             # If user pressed "No", fall through to new launch.
         else:
-            launch_confirm = messagebox.askyesno(
-                "Cloud Dispatch",
-                f"Launch cloud worker profile '{selected_profile}' and process "
-                f"{len(source_specs_to_process)} clip(s) remotely?"
+            should_prompt_new_launch = True
+            if not reuse_enabled:
+                new_launch_reason = "Reuse is disabled in Cloud settings."
+            elif cached_instance_id <= 0:
+                new_launch_reason = "No cached instance is set for reuse."
+            elif cached_profile != selected_profile:
+                new_launch_reason = (
+                    f"Cached instance profile '{cached_profile or 'n/a'}' does not match selected profile '{selected_profile}'."
+                )
+
+        if connection_info is None and should_prompt_new_launch:
+            launch_confirm = self._confirm_new_cloud_launch(
+                profile_key=selected_profile,
+                source_count=len(source_specs_to_process),
+                reason=new_launch_reason,
             )
             if not launch_confirm:
                 _logger.info("Cloud dispatch cancelled by user before worker launch.")
