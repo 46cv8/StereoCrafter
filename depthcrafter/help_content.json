@@ -51,6 +51,9 @@
   "process_as_segments": {
     "text": "Check this to process long videos or on systems with limited VRAM.\nWhen enabled, the input video is divided into smaller segments based on 'Window Size' and 'Overlap'. Each segment is processed individually to generate a raw depth data file (NPZ).\nAfter all segments are processed, they can be merged into a single, continuous depth map video or image sequence using the 'Merged Output Options'.\nThis mode creates a subfolder named '[original_basename]_seg' in your output directory to store these intermediate NPZ files and a _master_meta.json file detailing the segments."
   },
+  "npz_backfill_missing_only": {
+    "text": "Special mode (temporary utility): only process segments where the expected NPZ file is missing.\n\n- Requires 'Process as Segments' to be enabled.\n- Existing NPZ segments are skipped.\n- Avoids resume/overwrite prompts.\n- Skips merge/finalization and does not move original inputs.\n\nUse this to backfill missing raw NPZ depth data quickly."
+  },
   "target_fps": {
     "text": "Desired frames per second for the output depth map. The input video will be sampled (frames possibly skipped or duplicated if necessary, though typically strided/downsampled) to approximate this FPS before processing.\nSet to -1 to use the original video's FPS. If the original FPS is very high, consider reducing it to save processing time."
   },

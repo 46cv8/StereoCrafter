@@ -158,6 +158,8 @@ class DepthCrafterGUI:
         self.window_size = tk.IntVar(value=110)
         self.overlap = tk.IntVar(value=25)
         self.process_as_segments_var = tk.BooleanVar(value=False)
+        # Isolated special mode: only process clips/segments missing NPZ raw outputs.
+        self.npz_backfill_missing_only_var = tk.BooleanVar(value=False)
         self.save_final_output_json_var = tk.BooleanVar(value=False)
         self.merge_output_format_var = tk.StringVar(value="mp4")
         self.merge_alignment_method_var = tk.StringVar(value="Shift & Scale")
@@ -206,6 +208,7 @@ class DepthCrafterGUI:
             "window_size": self.window_size,
             "overlap": self.overlap,
             "process_as_segments_var": self.process_as_segments_var,
+            "npz_backfill_missing_only_var": self.npz_backfill_missing_only_var,
             "save_final_output_json_var": self.save_final_output_json_var,
             "merge_output_format_var": self.merge_output_format_var,
             "merge_alignment_method_var": self.merge_alignment_method_var,
@@ -780,6 +783,37 @@ class DepthCrafterGUI:
         else: # Segment folder does not exist
             return all_potential_segments_from_define, "fresh_processing"
 
+    def _get_missing_segments_npz_only(
+        self,
+        original_basename: str,
+        segment_subfolder_path: str,
+        all_potential_segments_from_define: list,
+    ) -> list:
+        """
+        Isolated special mode:
+        Return only segment jobs whose expected NPZ file is missing.
+        """
+        missing_segments = []
+        for potential_segment_job in all_potential_segments_from_define:
+            seg_id = int(potential_segment_job["segment_id"])
+            total_segs = int(potential_segment_job["total_segments"])
+            expected_npz_filename = get_segment_npz_output_filename(original_basename, seg_id, total_segs)
+            expected_npz_path = os.path.join(segment_subfolder_path, expected_npz_filename)
+            if not os.path.exists(expected_npz_path):
+                missing_segments.append(potential_segment_job)
+
+        missing_count = len(missing_segments)
+        total_count = len(all_potential_segments_from_define)
+        if missing_count > 0:
+            _logger.info(
+                f"NPZ Backfill Mode: {original_basename} has {missing_count}/{total_count} missing NPZ segments. "
+                "Only missing segments will be processed."
+            )
+        else:
+            _logger.info(f"NPZ Backfill Mode: {original_basename} has no missing NPZ segments. Skipping.")
+
+        return missing_segments
+
     def _handle_segment_merging(self, master_meta_filepath, original_basename, main_output_dir, master_meta) -> Tuple[bool, str]:
         """
         Handles the merging of segments, potentially generating a second robustly normalized output.
@@ -857,6 +891,7 @@ class DepthCrafterGUI:
                 "gui_window_size_setting": self.window_size.get(),
                 "gui_overlap_setting": self.overlap.get(),
                 "processed_as_segments": self.process_as_segments_var.get(),
+                "npz_backfill_missing_only_mode": self.npz_backfill_missing_only_var.get(),
             },
             "jobs_info": [], "overall_status": "pending",
             "total_expected_jobs": total_expected_jobs_for_this_video,
@@ -1593,6 +1628,16 @@ class DepthCrafterGUI:
         _create_hover_tooltip(self.process_as_segments_cb, "process_as_segments")
         self.widgets_to_disable_during_processing.append(self.process_as_segments_cb); row_idx += 1
 
+        # Special mode: backfill only clips/segments missing NPZ raw outputs.
+        self.npz_backfill_missing_only_cb = ttk.Checkbutton(
+            fs_frame,
+            text="Special: Backfill Missing NPZ Only",
+            variable=self.npz_backfill_missing_only_var
+        )
+        self.npz_backfill_missing_only_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.npz_backfill_missing_only_cb, "npz_backfill_missing_only")
+        self.widgets_to_disable_during_processing.append(self.npz_backfill_missing_only_cb); row_idx += 1
+
         # --- Merged Output Options Frame ---
         merge_opts_frame = ttk.LabelFrame(settings_container_frame, text="Merged Output Options (if segments processed)")
         merge_opts_frame.grid(row=1, column=0, padx=(0,5), pady=5, sticky="nsew") # Placed in new container
@@ -2016,6 +2061,14 @@ class DepthCrafterGUI:
             _logger.error(f"GUI: Input path field is empty or path does not exist: {input_path_str}")
             messagebox.showerror("Error", f"Input path does not exist: {input_path_str}")
             return
+
+        if self.npz_backfill_missing_only_var.get() and not self.process_as_segments_var.get():
+            messagebox.showerror(
+                "Invalid Setting",
+                "Special mode 'Backfill Missing NPZ Only' requires 'Process as Segments' to be enabled."
+            )
+            _logger.error("Start blocked: NPZ backfill mode requires segment processing.")
+            return
         
         # --- ADD THESE LINES HERE ---
         _logger.info("Scanning input folder: Please wait...")
@@ -2123,9 +2176,12 @@ class DepthCrafterGUI:
 
     def start_processing(self, source_specs_to_process, effective_seed_for_run):
         self.stop_event.clear()
+        npz_backfill_mode_active = self.npz_backfill_missing_only_var.get()
         
         # Progress max is already set to len(source_specs_to_process) in start_thread
         _logger.debug(f"Starting lazy batch processing for {len(source_specs_to_process)} sources...")
+        if npz_backfill_mode_active:
+            _logger.info("Special Mode Active: Backfill Missing NPZ Only.")
         self.status_message_var.set("Starting processing...")
 
         # Initialize a dict to store master metadata for each video/sequence path
@@ -2241,19 +2297,30 @@ class DepthCrafterGUI:
                 segment_subfolder_name = get_segment_output_folder_name(original_basename)
                 segment_subfolder_path = os.path.join(self.output_dir.get(), segment_subfolder_name)
                 current_video_base_info_ref = base_job_info_map[current_video_path]
-                
-                # This call handles the resume/overwrite logic
-                jobs_to_process_for_this_source, action_taken = self._get_segments_to_resume_or_overwrite(
-                    current_video_path, original_basename, segment_subfolder_path, 
-                    all_potential_segments_for_video, current_video_base_info_ref
-                )
-                _logger.debug(f"For source '{original_basename}': Action '{action_taken}', {len(jobs_to_process_for_this_source)} segments will be processed.")
-                
-                if not jobs_to_process_for_this_source and not current_video_base_info_ref.get("pre_existing_successful_jobs"):
-                     _logger.info(f"Skipping {original_basename}: Job definition/resume resulted in no segments to process.")
-                     total_sources_processed += 1
-                     self.message_queue.put(("progress", total_sources_processed))
-                     continue
+
+                if npz_backfill_mode_active:
+                    jobs_to_process_for_this_source = self._get_missing_segments_npz_only(
+                        original_basename=original_basename,
+                        segment_subfolder_path=segment_subfolder_path,
+                        all_potential_segments_from_define=all_potential_segments_for_video,
+                    )
+                    if not jobs_to_process_for_this_source:
+                        total_sources_processed += 1
+                        self.message_queue.put(("progress", total_sources_processed))
+                        continue
+                else:
+                    # This call handles the resume/overwrite logic
+                    jobs_to_process_for_this_source, action_taken = self._get_segments_to_resume_or_overwrite(
+                        current_video_path, original_basename, segment_subfolder_path, 
+                        all_potential_segments_for_video, current_video_base_info_ref
+                    )
+                    _logger.debug(f"For source '{original_basename}': Action '{action_taken}', {len(jobs_to_process_for_this_source)} segments will be processed.")
+                    
+                    if not jobs_to_process_for_this_source and not current_video_base_info_ref.get("pre_existing_successful_jobs"):
+                         _logger.info(f"Skipping {original_basename}: Job definition/resume resulted in no segments to process.")
+                         total_sources_processed += 1
+                         self.message_queue.put(("progress", total_sources_processed))
+                         continue
                      
             else: # Full video processing mode
                 full_out_check_path = os.path.join(self.output_dir.get(), get_full_video_output_filename(original_basename, "mp4"))
@@ -2277,7 +2344,13 @@ class DepthCrafterGUI:
                     continue # Skip to next source
             
             # C. Initialize Master Metadata for this video/sequence
-            total_expected_jobs_overall = len(all_potential_segments_for_video) if is_segment_processing else 1
+            if is_segment_processing:
+                if npz_backfill_mode_active:
+                    total_expected_jobs_overall = len(jobs_to_process_for_this_source)
+                else:
+                    total_expected_jobs_overall = len(all_potential_segments_for_video)
+            else:
+                total_expected_jobs_overall = 1
             all_videos_master_metadata[current_video_path] = self._initialize_master_metadata_entry(
                 original_basename, 
                 base_job_info_initial,
@@ -2338,8 +2411,13 @@ class DepthCrafterGUI:
             total_accounted_for_vid = master_meta_for_this_vid["completed_successful_jobs"] + master_meta_for_this_vid["completed_failed_jobs"]
             
             if total_accounted_for_vid >= master_meta_for_this_vid["total_expected_jobs"]:
+                if npz_backfill_mode_active:
+                    _logger.info(
+                        f"NPZ Backfill Mode: Completed processing for {original_basename}. "
+                        "Skipping merge/finalization and source-file move."
+                    )
                 # Finalize only if not cancelled *within* the segment loop
-                if not self.stop_event.is_set():
+                elif not self.stop_event.is_set():
                     self._finalize_video_processing(current_video_path, original_basename, master_meta_for_this_vid)
                 else:
                     _logger.info(f"Skipping finalization of {original_basename} due to user cancellation.")
@@ -2350,7 +2428,10 @@ class DepthCrafterGUI:
 
         if not self.stop_event.is_set():
             _logger.info("All processing sources complete!")
-            self.status_message_var.set("Processing Finished.")
+            if npz_backfill_mode_active:
+                self.status_message_var.set("NPZ backfill complete.")
+            else:
+                self.status_message_var.set("Processing Finished.")
         else:
             self.status_message_var.set("Processing Cancelled.")
         
