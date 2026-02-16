@@ -212,6 +212,9 @@ class DepthCrafterDemo:
             _logger.debug(f"Loaded {len(actual_frames_to_process)} frames from numpy array. Using FPS: {actual_fps_for_save:.2f}")
             if actual_frames_to_process.ndim > 0 and len(actual_frames_to_process) > 0:
                  original_h_loaded, original_w_loaded = actual_frames_to_process.shape[1:3]
+                 # Array input path bypasses read_video_frames, so derive processed dims directly.
+                 job_specific_metadata["processed_height"] = int(original_h_loaded)
+                 job_specific_metadata["processed_width"] = int(original_w_loaded)
 
         elif isinstance(video_path_or_job_info, str):
             video_path_for_read = video_path_or_job_info
@@ -631,7 +634,17 @@ class DepthCrafterDemo:
         original_basename_for_job: str
 
         current_job_spec: dict
-        if segment_job_info_param:
+        if segment_job_info_param and isinstance(video_path_or_frames_or_info, np.ndarray):
+            # Special path for segmented inference from already-loaded frame arrays
+            # (used by spatial/panelized processing workflows).
+            current_job_spec = segment_job_info_param
+            frames_array_input = video_path_or_frames_or_info
+            video_path_or_info_for_infer_load = None
+            original_basename_for_job = current_job_spec.get(
+                "original_basename",
+                original_video_basename_override if original_video_basename_override else "array_segment_job",
+            )
+        elif segment_job_info_param:
             current_job_spec = segment_job_info_param
             video_path_or_info_for_infer_load = current_job_spec["video_path"]
             if current_job_spec["source_type"] != "video_file":

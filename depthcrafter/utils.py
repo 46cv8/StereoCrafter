@@ -559,7 +559,10 @@ def read_video_frames(
     target_width: int = 768,
     start_frame_index: int = 0,
     num_frames_to_load: int = -1,
-    cached_ffprobe_info: Optional[dict] = None
+    cached_ffprobe_info: Optional[dict] = None,
+    round_to_multiple: int = 64,
+    chunk_size_for_loading: int = -1,
+    progress_log_prefix: Optional[str] = None,
 ) -> Tuple[np.ndarray, float, int, int, int, int, Optional[dict], Optional[str]]:
     """
     Reads video frames using decord, optionally resizing and downsampling frame rate.
@@ -638,11 +641,15 @@ def read_video_frames(
         original_width_detected = 128
 
 
-    # Determine height/width for Decord based on GUI's target_height/width
-    # Ensure they are multiples of 64 and at least 64
-    final_height_for_decord = max(64, round(target_height / 64) * 64)
-    final_width_for_decord = max(64, round(target_width / 64) * 64)
-    _logger.debug(f"Targeting final processing resolution (rounded to mult of 64): {final_width_for_decord}x{final_height_for_decord}")
+    # Determine height/width for Decord based on target_height/width.
+    # Default behavior rounds to multiples of 64 for legacy compatibility.
+    round_to_multiple = max(1, int(round_to_multiple))
+    final_height_for_decord = max(round_to_multiple, round(target_height / round_to_multiple) * round_to_multiple)
+    final_width_for_decord = max(round_to_multiple, round(target_width / round_to_multiple) * round_to_multiple)
+    _logger.debug(
+        f"Targeting final processing resolution (rounded to mult of {round_to_multiple}): "
+        f"{final_width_for_decord}x{final_height_for_decord}"
+    )
 
     try:
         vid_reader = VideoReader(video_path, ctx=cpu(0), width=final_width_for_decord, height=final_height_for_decord)
@@ -684,10 +691,44 @@ def read_video_frames(
         _logger.warning(f"No frames selected for processing after stride and process_length filters for {os.path.basename(video_path)}.")
         return np.empty((0, 0, 0, 0), dtype=np.float32), 0.0, original_height_detected, original_width_detected, final_height_for_decord, final_width_for_decord, video_stream_info, None
 
-    _logger.debug(f"Loading {len(frames_idx)} frames using Decord for {os.path.basename(video_path)}.")
-    frames_batch = vid_reader.get_batch(frames_idx)
-    frames_numpy = frames_batch.asnumpy().astype("float32") / 255.0 # Normalize to 0-1 float32
-    _logger.debug(f"Successfully Loaded batch, frames_numpy {frames_numpy.shape}")
+    total_to_load = len(frames_idx)
+    log_prefix = progress_log_prefix if progress_log_prefix else os.path.basename(video_path)
+    chunk_size = int(chunk_size_for_loading) if chunk_size_for_loading is not None else -1
+
+    if chunk_size > 0 and chunk_size < total_to_load:
+        num_chunks = (total_to_load + chunk_size - 1) // chunk_size
+        _logger.info(
+            f"[I/O] {log_prefix}: loading {total_to_load} frames in {num_chunks} chunks "
+            f"(chunk_size={chunk_size})."
+        )
+        load_start = time.perf_counter()
+        frames_numpy = None
+        for chunk_idx, start_i in enumerate(range(0, total_to_load, chunk_size), start=1):
+            end_i = min(start_i + chunk_size, total_to_load)
+            idx_chunk = frames_idx[start_i:end_i]
+            chunk_start = time.perf_counter()
+            chunk_batch = vid_reader.get_batch(idx_chunk)
+            chunk_np = chunk_batch.asnumpy().astype("float32") / 255.0  # Normalize to 0-1 float32
+            if frames_numpy is None:
+                frames_numpy = np.empty((total_to_load, *chunk_np.shape[1:]), dtype=np.float32)
+            frames_numpy[start_i:end_i] = chunk_np
+            del chunk_batch, chunk_np
+            elapsed = time.perf_counter() - load_start
+            chunk_elapsed = time.perf_counter() - chunk_start
+            pct = (100.0 * end_i / total_to_load) if total_to_load > 0 else 100.0
+            _logger.info(
+                f"[I/O] {log_prefix}: chunk {chunk_idx}/{num_chunks} loaded "
+                f"({end_i}/{total_to_load}, {pct:.1f}%) in {chunk_elapsed:.2f}s "
+                f"| total {elapsed:.1f}s"
+            )
+        if frames_numpy is None:
+            frames_numpy = np.empty((0, 0, 0, 0), dtype=np.float32)
+        _logger.info(f"[I/O] {log_prefix}: frame loading complete.")
+    else:
+        _logger.debug(f"Loading {total_to_load} frames using Decord for {os.path.basename(video_path)}.")
+        frames_batch = vid_reader.get_batch(frames_idx)
+        frames_numpy = frames_batch.asnumpy().astype("float32") / 255.0 # Normalize to 0-1 float32
+        _logger.debug(f"Successfully Loaded batch, frames_numpy {frames_numpy.shape}")
 
     del vid_reader
     gc.collect()

@@ -54,6 +54,84 @@
   "npz_backfill_missing_only": {
     "text": "Special mode (temporary utility): only process segments where the expected NPZ file is missing.\n\n- Requires 'Process as Segments' to be enabled.\n- Existing NPZ segments are skipped.\n- Avoids resume/overwrite prompts.\n- Skips merge/finalization and does not move original inputs.\n\nUse this to backfill missing raw NPZ depth data quickly."
   },
+  "spatial_refine_mode": {
+    "text": "Special secondary mode: runs panelized hi-res depth refinement using existing low-res raw NPZ depth as a global anchor.\n\n- Intended to run AFTER low-res segmented depth has already been generated.\n- Preferred input: '[basename]_seg/[basename]_master_meta.json'.\n- Legacy fallback: if master metadata is missing, it will attempt to rebuild from '[basename]_seg/*.npz' segment caches.\n- Produces a new hi-res output video and sidecar JSON.\n- Does not move original input files."
+  },
+  "edge_guided_upscale_mode": {
+    "text": "Special secondary mode: builds a hi-res depth map directly from the low-res raw depth cache using source-video edge guidance.\n\n- Intended to run AFTER low-res segmented depth has already been generated.\n- Uses the low-res depth as global intensity master and adds edge-aligned detail using the native hi-res video.\n- Produces a new hi-res output video and sidecar JSON.\n- Does not move original input files."
+  },
+  "spatial_refine_open_settings": {
+    "text": "Opens the dedicated Spatial Hi-Res Refine settings dialog.\n\nUse this popup to edit tile layout, overlap, hi-res target size, local reliability gating parameters, output suffix, and temp-cache cleanup behavior."
+  },
+  "hires_edge_open_settings": {
+    "text": "Opens the shared Hi-Res Refine / Edge Upscale settings dialog.\n\nUse this popup to edit tile layout, overlap, hi-res target size, local reliability gating, edge-guided fallback behavior, edge-upscale parameters, output suffixes, and temp-cache cleanup."
+  },
+  "spatial_refine_tile_num_x": {
+    "text": "Number of spatial tiles across width (X axis) used for hi-res refinement.\n\nExample: X=3 and Y=2 gives a 3x2 tile layout.\nHigher values reduce per-tile VRAM usage but increase runtime and stitching complexity."
+  },
+  "spatial_refine_tile_num_y": {
+    "text": "Number of spatial tiles across height (Y axis) used for hi-res refinement.\n\nExample: X=3 and Y=2 gives a 3x2 tile layout.\nHigher values reduce per-tile VRAM usage but increase runtime and stitching complexity."
+  },
+  "spatial_refine_tile_overlap_x": {
+    "text": "Target horizontal overlap (X axis, pixels) between neighboring hi-res tiles.\nUse the spinner arrows to adjust in 64px steps.\nThe tiler derives model-safe tile dimensions (mod 64) from this target."
+  },
+  "spatial_refine_tile_overlap_y": {
+    "text": "Target vertical overlap (Y axis, pixels) between neighboring hi-res tiles.\nUse the spinner arrows to adjust in 64px steps.\nThe tiler derives model-safe tile dimensions (mod 64) from this target."
+  },
+  "spatial_refine_target_width": {
+    "text": "Requested hi-res target width for spatial refine mode. The loader rounds to multiples of 8 for model compatibility."
+  },
+  "spatial_refine_target_height": {
+    "text": "Requested hi-res target height for spatial refine mode. The loader rounds to multiples of 8 for model compatibility."
+  },
+  "spatial_refine_anchor_weight": {
+    "text": "Final blend weight (0-1) for low-res global reference depth in spatial refine mode.\n\n0.0 = pure stitched hi-res tiles.\n1.0 = pure upscaled low-res global depth.\nTypical values: 0.1 to 0.3."
+  },
+  "spatial_refine_local_window_size": {
+    "text": "Window size (pixels) used for local reliability analysis inside each hi-res tile.\n\nThe reliability pass compares hi-res tile structure against the corresponding upscaled low-res reference region.\nTypical value: 64."
+  },
+  "spatial_refine_local_window_stride": {
+    "text": "Stride (pixels) between local reliability windows.\n\nSmaller stride increases overlap and smoothness but costs more compute.\nTypical value: 32."
+  },
+  "spatial_refine_local_confidence_low": {
+    "text": "Lower threshold for mapping local reliability score to confidence (0-1).\n\nRegions below this score trend toward fallback-to-lowres blending.\nTypical value: 0.45."
+  },
+  "spatial_refine_local_confidence_high": {
+    "text": "Upper threshold for mapping local reliability score to confidence (0-1).\n\nRegions above this score favor hi-res refined depth.\nTypical value: 0.80.\nMust be greater than Confidence Low."
+  },
+  "spatial_refine_use_edge_fallback": {
+    "text": "If enabled, low-confidence regions in spatial hi-res refine blend toward an edge-guided upscaled low-res reference instead of plain bilinear low-res.\n\nThis can recover sharper structure in fallback areas while keeping low-res depth as the global anchor."
+  },
+  "spatial_refine_edge_fallback_mix": {
+    "text": "Blend weight (0-1) for using the edge-guided fallback map in spatial refine low-confidence regions.\n\n0.0 = use bilinear low-res fallback only.\n1.0 = use edge-guided fallback only.\nTypical values: 0.5 to 0.9."
+  },
+  "edge_guided_strength": {
+    "text": "How strongly hi-res source edges influence edge-guided upscaling.\n\n0.0 = no edge injection (mostly bilinear behavior).\n1.0 = strongest edge influence.\nTypical value: 0.5 to 0.8."
+  },
+  "edge_guided_sigma_color": {
+    "text": "Color-domain sigma for the edge-guided bilateral stage.\n\nLower values preserve edges more aggressively.\nHigher values smooth more broadly across tonal changes.\nMust be > 0."
+  },
+  "edge_guided_sigma_spatial": {
+    "text": "Spatial sigma for the edge-guided bilateral stage.\n\nLower values keep filtering very local.\nHigher values spread smoothing farther.\nMust be > 0."
+  },
+  "edge_guided_iterations": {
+    "text": "Number of edge-guided bilateral passes.\n\nHigher values can improve edge alignment but increase runtime.\nTypical values: 1 to 3."
+  },
+  "edge_guided_temporal_smooth": {
+    "text": "Temporal smoothing strength (0-1) for edge-guided output.\n\nSmoothing is stronger in non-edge regions to reduce flicker.\n0.0 = no temporal smoothing.\nHigher values increase temporal stability."
+  },
+  "edge_guided_reinject_strength": {
+    "text": "Controls how strongly nearest-upsampled depth is re-injected at detected edges after bilateral smoothing.\n\nHigher values create crisper, harder edges.\nLower values keep smoother transitions.\nRange: 0.0 to 1.0.\nTypical sharp preset: 0.6."
+  },
+  "spatial_refine_output_suffix": {
+    "text": "Filename suffix for the hi-res spatial refine output.\nExample: '_hires_refined_depth' -> 'Scene-0001_hires_refined_depth.mp4'."
+  },
+  "edge_guided_output_suffix": {
+    "text": "Filename suffix for the standalone edge-guided hi-res upscale output.\nExample: '_edge_hires_depth' -> 'Scene-0001_edge_hires_depth.mp4'."
+  },
+  "spatial_refine_cleanup_temp": {
+    "text": "If enabled, temporary per-tile NPZ/segment folders used during hi-res refine are deleted after successful output generation."
+  },
   "target_fps": {
     "text": "Desired frames per second for the output depth map. The input video will be sampled (frames possibly skipped or duplicated if necessary, though typically strided/downsampled) to approximate this FPS before processing.\nSet to -1 to use the original video's FPS. If the original FPS is very high, consider reducing it to save processing time."
   },

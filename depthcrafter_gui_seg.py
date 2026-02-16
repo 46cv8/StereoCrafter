@@ -45,6 +45,18 @@ except ImportError as e:
     merge_depth_segments = None
 
 try:
+    from depthcrafter.spatial_refine import run_spatial_hires_refine
+except ImportError as e:
+    _logger.warning(f"Could not import 'spatial_refine'. Hi-Res Spatial Refine mode will be unavailable. Error: {e}")
+    run_spatial_hires_refine = None
+
+try:
+    from depthcrafter.edge_guided_upscale import run_edge_guided_hires_upscale
+except ImportError as e:
+    _logger.warning(f"Could not import 'edge_guided_upscale'. Edge-Guided Hi-Res mode will be unavailable. Error: {e}")
+    run_edge_guided_hires_upscale = None
+
+try:
     import OpenEXR
     import Imath
     OPENEXR_AVAILABLE_GUI = True
@@ -160,6 +172,34 @@ class DepthCrafterGUI:
         self.process_as_segments_var = tk.BooleanVar(value=False)
         # Isolated special mode: only process clips/segments missing NPZ raw outputs.
         self.npz_backfill_missing_only_var = tk.BooleanVar(value=False)
+        # Special secondary mode: panelized hi-res refinement anchored to low-res global depth.
+        self.enable_spatial_refine_mode_var = tk.BooleanVar(value=False)
+        # Special secondary mode: edge-guided hi-res upscaling from low-res raw depth + source RGB edges.
+        self.enable_edge_guided_upscale_mode_var = tk.BooleanVar(value=False)
+        self.spatial_refine_options_expanded_var = tk.BooleanVar(value=False)
+        self.spatial_refine_tile_num_var = tk.IntVar(value=2)
+        self.spatial_refine_tile_num_y_var = tk.IntVar(value=2)
+        self.spatial_refine_tile_overlap_var = tk.IntVar(value=128)  # Legacy single-overlap setting.
+        self.spatial_refine_tile_overlap_x_var = tk.IntVar(value=128)
+        self.spatial_refine_tile_overlap_y_var = tk.IntVar(value=128)
+        self.spatial_refine_target_width_var = tk.IntVar(value=1920)
+        self.spatial_refine_target_height_var = tk.IntVar(value=1080)
+        self.spatial_refine_anchor_weight_var = tk.DoubleVar(value=0.15)
+        self.spatial_refine_local_window_size_var = tk.IntVar(value=64)
+        self.spatial_refine_local_window_stride_var = tk.IntVar(value=32)
+        self.spatial_refine_local_confidence_low_var = tk.DoubleVar(value=0.45)
+        self.spatial_refine_local_confidence_high_var = tk.DoubleVar(value=0.80)
+        self.spatial_refine_use_edge_fallback_var = tk.BooleanVar(value=False)
+        self.spatial_refine_edge_fallback_mix_var = tk.DoubleVar(value=0.75)
+        self.edge_guided_strength_var = tk.DoubleVar(value=0.90)
+        self.edge_guided_sigma_color_var = tk.DoubleVar(value=0.04)
+        self.edge_guided_sigma_spatial_var = tk.DoubleVar(value=0.90)
+        self.edge_guided_iterations_var = tk.IntVar(value=1)
+        self.edge_guided_temporal_smooth_var = tk.DoubleVar(value=0.03)
+        self.edge_guided_reinject_strength_var = tk.DoubleVar(value=0.60)
+        self.edge_guided_output_suffix_var = tk.StringVar(value="_edge_hires_depth")
+        self.spatial_refine_cleanup_temp_var = tk.BooleanVar(value=True)
+        self.spatial_refine_output_suffix_var = tk.StringVar(value="_hires_refined_depth")
         self.save_final_output_json_var = tk.BooleanVar(value=False)
         self.merge_output_format_var = tk.StringVar(value="mp4")
         self.merge_alignment_method_var = tk.StringVar(value="Shift & Scale")
@@ -209,6 +249,32 @@ class DepthCrafterGUI:
             "overlap": self.overlap,
             "process_as_segments_var": self.process_as_segments_var,
             "npz_backfill_missing_only_var": self.npz_backfill_missing_only_var,
+            "enable_spatial_refine_mode_var": self.enable_spatial_refine_mode_var,
+            "enable_edge_guided_upscale_mode_var": self.enable_edge_guided_upscale_mode_var,
+            "spatial_refine_options_expanded_var": self.spatial_refine_options_expanded_var,
+            "spatial_refine_tile_num_var": self.spatial_refine_tile_num_var,
+            "spatial_refine_tile_num_y_var": self.spatial_refine_tile_num_y_var,
+            "spatial_refine_tile_overlap_var": self.spatial_refine_tile_overlap_var,
+            "spatial_refine_tile_overlap_x_var": self.spatial_refine_tile_overlap_x_var,
+            "spatial_refine_tile_overlap_y_var": self.spatial_refine_tile_overlap_y_var,
+            "spatial_refine_target_width_var": self.spatial_refine_target_width_var,
+            "spatial_refine_target_height_var": self.spatial_refine_target_height_var,
+            "spatial_refine_anchor_weight_var": self.spatial_refine_anchor_weight_var,
+            "spatial_refine_local_window_size_var": self.spatial_refine_local_window_size_var,
+            "spatial_refine_local_window_stride_var": self.spatial_refine_local_window_stride_var,
+            "spatial_refine_local_confidence_low_var": self.spatial_refine_local_confidence_low_var,
+            "spatial_refine_local_confidence_high_var": self.spatial_refine_local_confidence_high_var,
+            "spatial_refine_use_edge_fallback_var": self.spatial_refine_use_edge_fallback_var,
+            "spatial_refine_edge_fallback_mix_var": self.spatial_refine_edge_fallback_mix_var,
+            "edge_guided_strength_var": self.edge_guided_strength_var,
+            "edge_guided_sigma_color_var": self.edge_guided_sigma_color_var,
+            "edge_guided_sigma_spatial_var": self.edge_guided_sigma_spatial_var,
+            "edge_guided_iterations_var": self.edge_guided_iterations_var,
+            "edge_guided_temporal_smooth_var": self.edge_guided_temporal_smooth_var,
+            "edge_guided_reinject_strength_var": self.edge_guided_reinject_strength_var,
+            "edge_guided_output_suffix_var": self.edge_guided_output_suffix_var,
+            "spatial_refine_cleanup_temp_var": self.spatial_refine_cleanup_temp_var,
+            "spatial_refine_output_suffix_var": self.spatial_refine_output_suffix_var,
             "save_final_output_json_var": self.save_final_output_json_var,
             "merge_output_format_var": self.merge_output_format_var,
             "merge_alignment_method_var": self.merge_alignment_method_var,
@@ -238,6 +304,8 @@ class DepthCrafterGUI:
         }
         self.initial_default_settings = self._collect_all_settings()
         self._help_data = None
+        self.spatial_refine_settings_dialog = None
+        self.spatial_refine_settings_widgets = []
 
         self.last_settings_dir = os.getcwd()
         self.message_queue = queue.Queue() # Still needed for progress updates
@@ -276,7 +344,25 @@ class DepthCrafterGUI:
         _logger.debug("DepthCrafter GUI initialized successfully.")
 
     def _apply_all_settings(self, settings_data: dict):
-        for key, value_from_json in settings_data.items():
+        normalized_settings = dict(settings_data)
+        # Backward compatibility: old settings had one tile grid field; mirror it into Y when missing.
+        if (
+            "spatial_refine_tile_num_var" in normalized_settings
+            and "spatial_refine_tile_num_y_var" not in normalized_settings
+        ):
+            normalized_settings["spatial_refine_tile_num_y_var"] = normalized_settings["spatial_refine_tile_num_var"]
+        if (
+            "spatial_refine_tile_overlap_var" in normalized_settings
+            and "spatial_refine_tile_overlap_x_var" not in normalized_settings
+        ):
+            normalized_settings["spatial_refine_tile_overlap_x_var"] = normalized_settings["spatial_refine_tile_overlap_var"]
+        if (
+            "spatial_refine_tile_overlap_var" in normalized_settings
+            and "spatial_refine_tile_overlap_y_var" not in normalized_settings
+        ):
+            normalized_settings["spatial_refine_tile_overlap_y_var"] = normalized_settings["spatial_refine_tile_overlap_var"]
+
+        for key, value_from_json in normalized_settings.items():
             if key == "target_fps": # Specific debug
                 _logger.debug(f"_apply_all_settings: Loading target_fps from JSON. Value: {value_from_json}, Type: {type(value_from_json)}")
             if key in self.all_tk_vars:
@@ -292,6 +378,7 @@ class DepthCrafterGUI:
                 _logger.warning(f"Warning: Unknown setting '{key}' found in settings file. Ignoring.")
         if hasattr(self, 'process_as_segments_var'):
             self.toggle_merge_related_options_active_state()
+        self._apply_spatial_refine_options_visibility()
         # Removed update GUI verbosity
 
     def _apply_theme(self, is_startup: bool = False):
@@ -990,6 +1077,170 @@ class DepthCrafterGUI:
                 _logger.warning(f"Move Original: Source path to move does not exist: {current_video_path}")
         except Exception as e:
             _logger.exception(f"ERROR moving original '{original_basename}': {e}")
+
+    def _process_spatial_refine_source(self, demo, source_spec: dict, effective_seed_for_run: int) -> Tuple[bool, str]:
+        """
+        Runs the secondary hi-res spatial refine mode for a single source.
+        Returns (success, output_path_or_reason).
+        """
+        if run_spatial_hires_refine is None:
+            return False, "spatial_refine module unavailable"
+
+        current_video_path = source_spec["path"]
+        original_basename = source_spec["basename"]
+        source_mode = source_spec["type"]
+
+        if source_mode not in ["video_file", "single_video_file"]:
+            msg = f"unsupported source mode '{source_mode}' (video files only)"
+            _logger.warning(f"Skipping hi-res spatial refine for {original_basename}: {msg}")
+            return False, msg
+
+        lowres_segment_folder = os.path.join(
+            self.output_dir.get(),
+            get_segment_output_folder_name(original_basename),
+        )
+        lowres_master_meta_path = os.path.join(
+            lowres_segment_folder,
+            f"{original_basename}_master_meta.json",
+        )
+        if not os.path.isdir(lowres_segment_folder):
+            msg = f"missing low-res segment cache folder: {lowres_segment_folder}"
+            _logger.warning(f"Skipping hi-res spatial refine for {original_basename}: {msg}")
+            return False, msg
+        if not os.path.exists(lowres_master_meta_path):
+            _logger.warning(
+                f"Spatial refine for {original_basename}: missing _master_meta.json. "
+                f"Attempting legacy NPZ fallback from {lowres_segment_folder}."
+            )
+
+        target_w = int(self.spatial_refine_target_width_var.get())
+        target_h = int(self.spatial_refine_target_height_var.get())
+        tile_num_x = int(self.spatial_refine_tile_num_var.get())
+        tile_num_y = int(self.spatial_refine_tile_num_y_var.get())
+        tile_overlap_x = int(self.spatial_refine_tile_overlap_x_var.get())
+        tile_overlap_y = int(self.spatial_refine_tile_overlap_y_var.get())
+        anchor_weight = float(self.spatial_refine_anchor_weight_var.get())
+        local_window_size = int(self.spatial_refine_local_window_size_var.get())
+        local_window_stride = int(self.spatial_refine_local_window_stride_var.get())
+        local_conf_low = float(self.spatial_refine_local_confidence_low_var.get())
+        local_conf_high = float(self.spatial_refine_local_confidence_high_var.get())
+        edge_fallback_enabled = bool(self.spatial_refine_use_edge_fallback_var.get())
+        edge_fallback_mix = float(self.spatial_refine_edge_fallback_mix_var.get())
+        edge_strength = float(self.edge_guided_strength_var.get())
+        edge_sigma_color = float(self.edge_guided_sigma_color_var.get())
+        edge_sigma_spatial = float(self.edge_guided_sigma_spatial_var.get())
+        edge_iters = int(self.edge_guided_iterations_var.get())
+        edge_temporal_smooth = float(self.edge_guided_temporal_smooth_var.get())
+        edge_reinject_strength = float(self.edge_guided_reinject_strength_var.get())
+        output_suffix = str(self.spatial_refine_output_suffix_var.get()).strip() or "_hires_refined_depth"
+
+        output_path, summary = run_spatial_hires_refine(
+            demo=demo,
+            source_video_path=current_video_path,
+            original_basename=original_basename,
+            output_dir=self.output_dir.get(),
+            lowres_master_meta_path=lowres_master_meta_path,
+            lowres_segment_folder=lowres_segment_folder,
+            target_height=target_h,
+            target_width=target_w,
+            tile_num_x=tile_num_x,
+            tile_num_y=tile_num_y,
+            tile_overlap_x_px=tile_overlap_x,
+            tile_overlap_y_px=tile_overlap_y,
+            temporal_window_frames=int(self.window_size.get()),
+            temporal_overlap_frames=int(self.overlap.get()),
+            guidance_scale=float(self.guidance_scale.get()),
+            inference_steps=int(self.inference_steps.get()),
+            seed=int(effective_seed_for_run),
+            target_fps_setting=float(self.target_fps.get()),
+            lowres_anchor_weight=anchor_weight,
+            output_suffix=output_suffix,
+            output_format="main10_mp4",
+            cleanup_temp=bool(self.spatial_refine_cleanup_temp_var.get()),
+            temporal_merge_alignment="shift_scale",
+            allow_legacy_npz_fallback=True,
+            local_reliability_window_size=local_window_size,
+            local_reliability_window_stride=local_window_stride,
+            local_reliability_score_confidence_low=local_conf_low,
+            local_reliability_score_confidence_high=local_conf_high,
+            edge_guided_fallback_enabled=edge_fallback_enabled,
+            edge_guided_fallback_mix=edge_fallback_mix,
+            edge_guided_strength=edge_strength,
+            edge_guided_sigma_color=edge_sigma_color,
+            edge_guided_sigma_spatial=edge_sigma_spatial,
+            edge_guided_bilateral_iterations=edge_iters,
+            edge_guided_temporal_smooth=edge_temporal_smooth,
+            edge_guided_reinject_strength=edge_reinject_strength,
+        )
+
+        self.current_resolution_var.set(f"{summary['processed_width']}x{summary['processed_height']}")
+        self.current_frames_var.set(str(summary["frames"]))
+        return True, output_path
+
+    def _process_edge_guided_upscale_source(self, source_spec: dict) -> Tuple[bool, str]:
+        """
+        Runs the standalone edge-guided hi-res upscale mode for a single source.
+        Returns (success, output_path_or_reason).
+        """
+        if run_edge_guided_hires_upscale is None:
+            return False, "edge_guided_upscale module unavailable"
+
+        current_video_path = source_spec["path"]
+        original_basename = source_spec["basename"]
+        source_mode = source_spec["type"]
+
+        if source_mode not in ["video_file", "single_video_file"]:
+            msg = f"unsupported source mode '{source_mode}' (video files only)"
+            _logger.warning(f"Skipping edge-guided upscale for {original_basename}: {msg}")
+            return False, msg
+
+        lowres_segment_folder = os.path.join(
+            self.output_dir.get(),
+            get_segment_output_folder_name(original_basename),
+        )
+        lowres_master_meta_path = os.path.join(
+            lowres_segment_folder,
+            f"{original_basename}_master_meta.json",
+        )
+        if not os.path.isdir(lowres_segment_folder):
+            msg = f"missing low-res segment cache folder: {lowres_segment_folder}"
+            _logger.warning(f"Skipping edge-guided upscale for {original_basename}: {msg}")
+            return False, msg
+        if not os.path.exists(lowres_master_meta_path):
+            _logger.warning(
+                f"Edge-guided mode for {original_basename}: missing _master_meta.json. "
+                f"Attempting legacy NPZ fallback from {lowres_segment_folder}."
+            )
+
+        target_w = int(self.spatial_refine_target_width_var.get())
+        target_h = int(self.spatial_refine_target_height_var.get())
+        output_suffix = str(self.edge_guided_output_suffix_var.get()).strip() or "_edge_hires_depth"
+
+        output_path, summary = run_edge_guided_hires_upscale(
+            source_video_path=current_video_path,
+            original_basename=original_basename,
+            output_dir=self.output_dir.get(),
+            lowres_master_meta_path=lowres_master_meta_path,
+            lowres_segment_folder=lowres_segment_folder,
+            target_height=target_h,
+            target_width=target_w,
+            temporal_overlap_frames=int(self.overlap.get()),
+            target_fps_setting=float(self.target_fps.get()),
+            output_suffix=output_suffix,
+            output_format="main10_mp4",
+            allow_legacy_npz_fallback=True,
+            temporal_merge_alignment="shift_scale",
+            edge_strength=float(self.edge_guided_strength_var.get()),
+            sigma_color=float(self.edge_guided_sigma_color_var.get()),
+            sigma_spatial=float(self.edge_guided_sigma_spatial_var.get()),
+            bilateral_iterations=int(self.edge_guided_iterations_var.get()),
+            temporal_smooth=float(self.edge_guided_temporal_smooth_var.get()),
+            edge_reinject_strength=float(self.edge_guided_reinject_strength_var.get()),
+        )
+
+        self.current_resolution_var.set(f"{summary['processed_width']}x{summary['processed_height']}")
+        self.current_frames_var.set(str(summary["frames"]))
+        return True, output_path
 
     def _process_single_job(self, demo, job_info, master_meta_for_this_vid):
         
@@ -1820,6 +2071,50 @@ class DepthCrafterGUI:
         self.secondary_output_widgets_references.extend([lbl_robust_suffix, entry_robust_suffix])
         self.widgets_to_disable_during_processing.extend([lbl_robust_suffix, entry_robust_suffix]); row_idx += 1
 
+        ttk.Separator(secondary_output_frame, orient="horizontal").grid(
+            row=row_idx, column=0, columnspan=2, sticky="ew", padx=5, pady=(6, 4)
+        )
+        row_idx += 1
+
+        # Special mode: panelized hi-res refine using low-res raw global depth as anchor.
+        self.spatial_refine_mode_cb = ttk.Checkbutton(
+            secondary_output_frame,
+            text="Special: Spatial Hi-Res Refine (Secondary Run)",
+            variable=self.enable_spatial_refine_mode_var
+        )
+        self.spatial_refine_mode_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.spatial_refine_mode_cb, "spatial_refine_mode")
+        self.widgets_to_disable_during_processing.append(self.spatial_refine_mode_cb); row_idx += 1
+
+        # Special mode: direct edge-guided upscaling from low-res depth cache.
+        self.edge_guided_mode_cb = ttk.Checkbutton(
+            secondary_output_frame,
+            text="Special: Edge-Guided Hi-Res Upscale (Secondary Run)",
+            variable=self.enable_edge_guided_upscale_mode_var
+        )
+        self.edge_guided_mode_cb.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.edge_guided_mode_cb, "edge_guided_upscale_mode")
+        self.widgets_to_disable_during_processing.append(self.edge_guided_mode_cb); row_idx += 1
+
+        self.spatial_refine_toggle_btn = ttk.Button(
+            secondary_output_frame,
+            text="  ↳ Configure Hi-Res / Edge Settings...",
+            command=self.toggle_spatial_refine_options_visibility,
+        )
+        self.spatial_refine_toggle_btn.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=(15, 5), pady=2)
+        _create_hover_tooltip(self.spatial_refine_toggle_btn, "hires_edge_open_settings")
+        self.widgets_to_disable_during_processing.append(self.spatial_refine_toggle_btn); row_idx += 1
+
+        self.spatial_refine_summary_label = ttk.Label(
+            secondary_output_frame,
+            text="  ↳ Tile/overlap, edge-guided fallback, standalone edge upscale, and output suffixes are in popup settings.",
+            anchor="w",
+        )
+        self.spatial_refine_summary_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=(15, 5), pady=(0, 2))
+        self.widgets_to_disable_during_processing.append(self.spatial_refine_summary_label); row_idx += 1
+
+        self._apply_spatial_refine_options_visibility()
+
         # --- Progress Bar and Status ---
         progress_bar_frame = ttk.Frame(self.root)
         progress_bar_frame.pack(pady=(10, 0), padx=10, fill="x", expand=False)
@@ -1920,6 +2215,21 @@ class DepthCrafterGUI:
         if os.path.exists(self.CONFIG_FILENAME):
             try:
                 with open(self.CONFIG_FILENAME, "r") as f: config = json.load(f)
+                if (
+                    "spatial_refine_tile_num_var" in config
+                    and "spatial_refine_tile_num_y_var" not in config
+                ):
+                    config["spatial_refine_tile_num_y_var"] = config["spatial_refine_tile_num_var"]
+                if (
+                    "spatial_refine_tile_overlap_var" in config
+                    and "spatial_refine_tile_overlap_x_var" not in config
+                ):
+                    config["spatial_refine_tile_overlap_x_var"] = config["spatial_refine_tile_overlap_var"]
+                if (
+                    "spatial_refine_tile_overlap_var" in config
+                    and "spatial_refine_tile_overlap_y_var" not in config
+                ):
+                    config["spatial_refine_tile_overlap_y_var"] = config["spatial_refine_tile_overlap_var"]
                 loaded_settings_for_tkvars = {k: v for k, v in config.items() if k in self.all_tk_vars}
                 for key, value in loaded_settings_for_tkvars.items():
                     if key in self.all_tk_vars:
@@ -1945,6 +2255,7 @@ class DepthCrafterGUI:
             _logger.info(f"GUI: Configuration file '{self.CONFIG_FILENAME}' not found. Using default settings.")
 
     def on_close(self):
+        self._close_spatial_refine_settings_dialog()
         self.save_config()
         if self.processing_thread and self.processing_thread.is_alive():
             _logger.info("Stopping processing before exit...")
@@ -2069,6 +2380,128 @@ class DepthCrafterGUI:
             )
             _logger.error("Start blocked: NPZ backfill mode requires segment processing.")
             return
+
+        npz_backfill_mode = bool(self.npz_backfill_missing_only_var.get())
+        spatial_refine_mode = bool(self.enable_spatial_refine_mode_var.get())
+        edge_guided_mode = bool(self.enable_edge_guided_upscale_mode_var.get())
+        selected_special_modes = int(npz_backfill_mode) + int(spatial_refine_mode) + int(edge_guided_mode)
+        if selected_special_modes > 1:
+            messagebox.showerror(
+                "Invalid Setting",
+                "Select only one special mode at a time: NPZ backfill OR Spatial Hi-Res Refine OR Edge-Guided Hi-Res Upscale."
+            )
+            _logger.error("Start blocked: conflicting special modes selected.")
+            return
+
+        if spatial_refine_mode and run_spatial_hires_refine is None:
+            messagebox.showerror(
+                "Unavailable",
+                "Spatial Hi-Res Refine module could not be imported. Check console for details."
+            )
+            _logger.error("Start blocked: spatial_refine module unavailable.")
+            return
+
+        if edge_guided_mode and run_edge_guided_hires_upscale is None:
+            messagebox.showerror(
+                "Unavailable",
+                "Edge-Guided Hi-Res Upscale module could not be imported. Check console for details."
+            )
+            _logger.error("Start blocked: edge_guided_upscale module unavailable.")
+            return
+
+        if spatial_refine_mode or edge_guided_mode:
+            try:
+                hires_w = int(self.spatial_refine_target_width_var.get())
+                hires_h = int(self.spatial_refine_target_height_var.get())
+            except (ValueError, tk.TclError):
+                messagebox.showerror("Error", "Hi-res target width/height contain invalid values.")
+                _logger.error("Start blocked: invalid hi-res target dimensions.")
+                return
+            if hires_w <= 0 or hires_h <= 0:
+                messagebox.showerror("Error", "Hi-Res Width/Height must be >0.")
+                _logger.error("Start blocked: invalid hi-res target dimensions range.")
+                return
+
+        if spatial_refine_mode:
+            try:
+                tile_num_x = int(self.spatial_refine_tile_num_var.get())
+                tile_num_y = int(self.spatial_refine_tile_num_y_var.get())
+                tile_overlap_x = int(self.spatial_refine_tile_overlap_x_var.get())
+                tile_overlap_y = int(self.spatial_refine_tile_overlap_y_var.get())
+                anchor_weight = float(self.spatial_refine_anchor_weight_var.get())
+                local_window_size = int(self.spatial_refine_local_window_size_var.get())
+                local_window_stride = int(self.spatial_refine_local_window_stride_var.get())
+                local_conf_low = float(self.spatial_refine_local_confidence_low_var.get())
+                local_conf_high = float(self.spatial_refine_local_confidence_high_var.get())
+                edge_fallback_mix = float(self.spatial_refine_edge_fallback_mix_var.get())
+            except (ValueError, tk.TclError):
+                messagebox.showerror("Error", "Spatial refine settings contain invalid values.")
+                _logger.error("Start blocked: invalid spatial refine parameter types.")
+                return
+
+            if (
+                tile_num_x < 1
+                or tile_num_y < 1
+                or tile_overlap_x < 0
+                or tile_overlap_y < 0
+                or local_window_size <= 0
+                or local_window_stride <= 0
+                or not (0.0 <= anchor_weight <= 1.0)
+                or not (0.0 <= local_conf_low <= 1.0)
+                or not (0.0 <= local_conf_high <= 1.0)
+                or local_conf_high <= local_conf_low
+                or not (0.0 <= edge_fallback_mix <= 1.0)
+            ):
+                messagebox.showerror(
+                    "Error",
+                    "Spatial refine values must satisfy: Tile Grid X/Y >=1, Overlap X/Y >=0, "
+                    "Hi-Res Width/Height >0, Anchor Blend 0.0-1.0, "
+                    "Local Window Size/Stride >0, Confidence Low/High in [0,1], High > Low, and Edge Fallback Mix in [0,1]."
+                )
+                _logger.error("Start blocked: invalid spatial refine parameter ranges.")
+                return
+            if (tile_overlap_x % 64) != 0 or (tile_overlap_y % 64) != 0:
+                messagebox.showerror(
+                    "Error",
+                    "Spatial refine Overlap X and Overlap Y must be multiples of 64."
+                )
+                _logger.error("Start blocked: overlap X/Y not aligned to 64px increments.")
+                return
+
+        if spatial_refine_mode and not bool(self.spatial_refine_use_edge_fallback_var.get()):
+            use_edge_param_validation = False
+        else:
+            use_edge_param_validation = bool(spatial_refine_mode and bool(self.spatial_refine_use_edge_fallback_var.get())) or bool(edge_guided_mode)
+
+        if use_edge_param_validation:
+            try:
+                edge_strength = float(self.edge_guided_strength_var.get())
+                edge_sigma_color = float(self.edge_guided_sigma_color_var.get())
+                edge_sigma_spatial = float(self.edge_guided_sigma_spatial_var.get())
+                edge_iters = int(self.edge_guided_iterations_var.get())
+                edge_temporal = float(self.edge_guided_temporal_smooth_var.get())
+                edge_reinject = float(self.edge_guided_reinject_strength_var.get())
+            except (ValueError, tk.TclError):
+                messagebox.showerror("Error", "Edge-guided settings contain invalid values.")
+                _logger.error("Start blocked: invalid edge-guided parameter types.")
+                return
+
+            if (
+                not (0.0 <= edge_strength <= 1.0)
+                or edge_sigma_color <= 0.0
+                or edge_sigma_spatial <= 0.0
+                or edge_iters < 0
+                or edge_iters > 8
+                or not (0.0 <= edge_temporal <= 1.0)
+                or not (0.0 <= edge_reinject <= 1.0)
+            ):
+                messagebox.showerror(
+                    "Error",
+                    "Edge-guided values must satisfy: Strength in [0,1], Sigma Color/Spatial >0, "
+                    "Bilateral Iterations in [0,8], Temporal Smooth in [0,1], and Reinject Strength in [0,1]."
+                )
+                _logger.error("Start blocked: invalid edge-guided parameter ranges.")
+                return
         
         # --- ADD THESE LINES HERE ---
         _logger.info("Scanning input folder: Please wait...")
@@ -2177,11 +2610,17 @@ class DepthCrafterGUI:
     def start_processing(self, source_specs_to_process, effective_seed_for_run):
         self.stop_event.clear()
         npz_backfill_mode_active = self.npz_backfill_missing_only_var.get()
+        spatial_refine_mode_active = self.enable_spatial_refine_mode_var.get()
+        edge_guided_mode_active = self.enable_edge_guided_upscale_mode_var.get()
         
         # Progress max is already set to len(source_specs_to_process) in start_thread
         _logger.debug(f"Starting lazy batch processing for {len(source_specs_to_process)} sources...")
         if npz_backfill_mode_active:
             _logger.info("Special Mode Active: Backfill Missing NPZ Only.")
+        if spatial_refine_mode_active:
+            _logger.info("Special Mode Active: Spatial Hi-Res Refine (Secondary Run).")
+        if edge_guided_mode_active:
+            _logger.info("Special Mode Active: Edge-Guided Hi-Res Upscale (Secondary Run).")
         self.status_message_var.set("Starting processing...")
 
         # Initialize a dict to store master metadata for each video/sequence path
@@ -2189,22 +2628,27 @@ class DepthCrafterGUI:
         base_job_info_map = {} # Map to store base_job_info for each video path
 
         try:
-            # 1. Initialize DepthCrafterDemo (Model Loading)
-            if not self.use_local_models_only_var.get():
-                _logger.info("Attempting to check model at Hugging Face Hub against local.")
+            demo = None
+            # 1. Initialize DepthCrafterDemo only for modes that run model inference.
+            if edge_guided_mode_active:
+                _logger.info("Edge-guided special mode does not require DepthCrafter model initialization.")
             else:
-                _logger.info("Attempting to load local model.")
+                if not self.use_local_models_only_var.get():
+                    _logger.info("Attempting to check model at Hugging Face Hub against local.")
+                else:
+                    _logger.info("Attempting to load local model.")
 
-            disable_xformers_for_run = self.disable_xformers_var.get()
+                disable_xformers_for_run = self.disable_xformers_var.get()
 
-            demo = DepthCrafterDemo(
-                unet_path="tencent/DepthCrafter",
-                pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
-                cpu_offload=self.cpu_offload.get(),
-                use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
-                local_files_only=self.use_local_models_only_var.get(),
-                disable_xformers=disable_xformers_for_run,
-            )
+                demo = DepthCrafterDemo(
+                    unet_path="tencent/DepthCrafter",
+                    pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
+                    cpu_offload=self.cpu_offload.get(),
+                    use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
+                    local_files_only=self.use_local_models_only_var.get(),
+                    disable_xformers=disable_xformers_for_run,
+                )
+                _logger.info("DepthCrafter model initialized. Starting source processing loop.")
         except Exception as e:
             _logger.exception(f"CRITICAL: Failed to initialize DepthCrafterDemo: {e}")
             self.status_message_var.set(f"Error: Model initialization failed. See console.")
@@ -2232,6 +2676,51 @@ class DepthCrafterGUI:
             gui_ov_setting = self.overlap.get()
 
             log_msg_base = f"Source {source_idx+1}/{len(source_specs_to_process)}: {original_basename}"
+
+            if spatial_refine_mode_active:
+                self.current_filename_var.set(f"{original_basename} (Hi-Res Spatial Refine)")
+                self.status_message_var.set(f"Hi-Res Refine {source_idx+1} of {len(source_specs_to_process)}")
+                self.root.update_idletasks()
+                try:
+                    _logger.info(f"Launching Hi-Res Spatial Refine for source '{original_basename}'...")
+                    success_refine, output_or_reason = self._process_spatial_refine_source(
+                        demo=demo,
+                        source_spec=source_spec,
+                        effective_seed_for_run=effective_seed_for_run,
+                    )
+                    if success_refine:
+                        _logger.info(f"Hi-Res Spatial Refine complete for {original_basename}: {output_or_reason}")
+                    else:
+                        _logger.warning(f"Hi-Res Spatial Refine skipped/failed for {original_basename}: {output_or_reason}")
+                except Exception as e_refine:
+                    _logger.exception(f"Hi-Res Spatial Refine exception for {original_basename}: {e_refine}")
+                    self.status_message_var.set(f"Hi-Res Refine Error: {e_refine.__class__.__name__} for {original_basename}")
+
+                total_sources_processed += 1
+                self.message_queue.put(("progress", total_sources_processed))
+                continue
+
+            if edge_guided_mode_active:
+                self.current_filename_var.set(f"{original_basename} (Edge-Guided Hi-Res Upscale)")
+                self.status_message_var.set(f"Edge Upscale {source_idx+1} of {len(source_specs_to_process)}")
+                self.root.update_idletasks()
+                try:
+                    _logger.info(f"Launching Edge-Guided Hi-Res Upscale for source '{original_basename}'...")
+                    success_edge, output_or_reason = self._process_edge_guided_upscale_source(
+                        source_spec=source_spec,
+                    )
+                    if success_edge:
+                        _logger.info(f"Edge-Guided Hi-Res Upscale complete for {original_basename}: {output_or_reason}")
+                    else:
+                        _logger.warning(f"Edge-Guided Hi-Res Upscale skipped/failed for {original_basename}: {output_or_reason}")
+                except Exception as e_edge:
+                    _logger.exception(f"Edge-Guided Hi-Res Upscale exception for {original_basename}: {e_edge}")
+                    self.status_message_var.set(f"Edge Upscale Error: {e_edge.__class__.__name__} for {original_basename}")
+
+                total_sources_processed += 1
+                self.message_queue.put(("progress", total_sources_processed))
+                continue
+
             _logger.debug(f"--- Defining Jobs for {log_msg_base}...")
             self.status_message_var.set(f"Defining jobs for {source_idx+1} of {len(source_specs_to_process)}")
             self.root.update_idletasks()
@@ -2430,6 +2919,10 @@ class DepthCrafterGUI:
             _logger.info("All processing sources complete!")
             if npz_backfill_mode_active:
                 self.status_message_var.set("NPZ backfill complete.")
+            elif spatial_refine_mode_active:
+                self.status_message_var.set("Hi-res spatial refine complete.")
+            elif edge_guided_mode_active:
+                self.status_message_var.set("Edge-guided hi-res upscale complete.")
             else:
                 self.status_message_var.set("Processing Finished.")
         else:
@@ -2469,6 +2962,305 @@ class DepthCrafterGUI:
             with open(self.CONFIG_FILENAME, "w") as f: json.dump(config, f, indent=4)
         except Exception as e: 
             _logger.warning(f"Warning (GUI save_config): Could not save config: {e}")
+
+    def _close_spatial_refine_settings_dialog(self):
+        tracked_widgets = list(self.spatial_refine_settings_widgets)
+        if self.spatial_refine_settings_dialog is not None:
+            try:
+                self.spatial_refine_settings_dialog.destroy()
+            except tk.TclError:
+                pass
+        if tracked_widgets:
+            self.widgets_to_disable_during_processing = [
+                w for w in self.widgets_to_disable_during_processing if w not in tracked_widgets
+            ]
+        self.spatial_refine_settings_dialog = None
+        self.spatial_refine_settings_widgets = []
+        self.spatial_refine_options_expanded_var.set(False)
+        self._apply_spatial_refine_options_visibility()
+
+    def _register_spatial_refine_dialog_widget(self, widget):
+        self.spatial_refine_settings_widgets.append(widget)
+        self.widgets_to_disable_during_processing.append(widget)
+        return widget
+
+    def _open_spatial_refine_settings_dialog(self):
+        if self.spatial_refine_settings_dialog is not None:
+            try:
+                if self.spatial_refine_settings_dialog.winfo_exists():
+                    self.spatial_refine_settings_dialog.lift()
+                    self.spatial_refine_settings_dialog.focus_force()
+                    self.spatial_refine_options_expanded_var.set(True)
+                    self._apply_spatial_refine_options_visibility()
+                    return
+            except tk.TclError:
+                self._close_spatial_refine_settings_dialog()
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Hi-Res Refine / Edge Upscale Settings")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_spatial_refine_settings_dialog)
+
+        self.spatial_refine_settings_dialog = dialog
+        self.spatial_refine_settings_widgets = [dialog]
+        self.spatial_refine_options_expanded_var.set(True)
+
+        outer = ttk.Frame(dialog, padding=12)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(outer, text="Tile Grid X:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_tile_x = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_tile_num_var, width=18)
+        )
+        entry_tile_x.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_tile_x, "spatial_refine_tile_num_x")
+        row += 1
+
+        ttk.Label(outer, text="Tile Grid Y:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_tile_y = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_tile_num_y_var, width=18)
+        )
+        entry_tile_y.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_tile_y, "spatial_refine_tile_num_y")
+        row += 1
+
+        ttk.Label(outer, text="Overlap X (px):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_overlap_x = self._register_spatial_refine_dialog_widget(
+            ttk.Spinbox(
+                outer,
+                from_=0,
+                to=8192,
+                increment=64,
+                textvariable=self.spatial_refine_tile_overlap_x_var,
+                width=16,
+            )
+        )
+        spin_overlap_x.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(spin_overlap_x, "spatial_refine_tile_overlap_x")
+        row += 1
+
+        ttk.Label(outer, text="Overlap Y (px):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_overlap_y = self._register_spatial_refine_dialog_widget(
+            ttk.Spinbox(
+                outer,
+                from_=0,
+                to=8192,
+                increment=64,
+                textvariable=self.spatial_refine_tile_overlap_y_var,
+                width=16,
+            )
+        )
+        spin_overlap_y.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(spin_overlap_y, "spatial_refine_tile_overlap_y")
+        row += 1
+
+        ttk.Label(outer, text="Hi-Res Target W:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_target_w = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_target_width_var, width=18)
+        )
+        entry_target_w.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_target_w, "spatial_refine_target_width")
+        row += 1
+
+        ttk.Label(outer, text="Hi-Res Target H:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_target_h = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_target_height_var, width=18)
+        )
+        entry_target_h.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_target_h, "spatial_refine_target_height")
+        row += 1
+
+        ttk.Label(outer, text="Anchor Blend (0-1):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_anchor = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_anchor_weight_var, width=18)
+        )
+        entry_anchor.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_anchor, "spatial_refine_anchor_weight")
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 4))
+        row += 1
+
+        ttk.Label(outer, text="Local Window Size:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_local_window = self._register_spatial_refine_dialog_widget(
+            ttk.Spinbox(
+                outer,
+                from_=16,
+                to=512,
+                increment=16,
+                textvariable=self.spatial_refine_local_window_size_var,
+                width=16,
+            )
+        )
+        spin_local_window.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(spin_local_window, "spatial_refine_local_window_size")
+        row += 1
+
+        ttk.Label(outer, text="Local Window Stride:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_local_stride = self._register_spatial_refine_dialog_widget(
+            ttk.Spinbox(
+                outer,
+                from_=8,
+                to=512,
+                increment=8,
+                textvariable=self.spatial_refine_local_window_stride_var,
+                width=16,
+            )
+        )
+        spin_local_stride.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(spin_local_stride, "spatial_refine_local_window_stride")
+        row += 1
+
+        ttk.Label(outer, text="Confidence Low:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_conf_low = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_local_confidence_low_var, width=18)
+        )
+        entry_conf_low.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_conf_low, "spatial_refine_local_confidence_low")
+        row += 1
+
+        ttk.Label(outer, text="Confidence High:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_conf_high = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_local_confidence_high_var, width=18)
+        )
+        entry_conf_high.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_conf_high, "spatial_refine_local_confidence_high")
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 4))
+        row += 1
+
+        edge_fallback_cb = self._register_spatial_refine_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Use Edge-Guided Fallback in Spatial Refine",
+                variable=self.spatial_refine_use_edge_fallback_var,
+            )
+        )
+        edge_fallback_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(edge_fallback_cb, "spatial_refine_use_edge_fallback")
+        row += 1
+
+        ttk.Label(outer, text="Edge Fallback Mix (0-1):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_edge_mix = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_edge_fallback_mix_var, width=18)
+        )
+        entry_edge_mix.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_edge_mix, "spatial_refine_edge_fallback_mix")
+        row += 1
+
+        ttk.Label(outer, text="Edge Strength:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_edge_strength = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.edge_guided_strength_var, width=18)
+        )
+        entry_edge_strength.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_edge_strength, "edge_guided_strength")
+        row += 1
+
+        ttk.Label(outer, text="Edge Sigma Color:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_sigma_color = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.edge_guided_sigma_color_var, width=18)
+        )
+        entry_sigma_color.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_sigma_color, "edge_guided_sigma_color")
+        row += 1
+
+        ttk.Label(outer, text="Edge Sigma Spatial:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_sigma_spatial = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.edge_guided_sigma_spatial_var, width=18)
+        )
+        entry_sigma_spatial.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_sigma_spatial, "edge_guided_sigma_spatial")
+        row += 1
+
+        ttk.Label(outer, text="Edge Bilateral Iters:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        spin_edge_iters = self._register_spatial_refine_dialog_widget(
+            ttk.Spinbox(
+                outer,
+                from_=0,
+                to=8,
+                increment=1,
+                textvariable=self.edge_guided_iterations_var,
+                width=16,
+            )
+        )
+        spin_edge_iters.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(spin_edge_iters, "edge_guided_iterations")
+        row += 1
+
+        ttk.Label(outer, text="Edge Temporal Smooth:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_edge_temporal = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.edge_guided_temporal_smooth_var, width=18)
+        )
+        entry_edge_temporal.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_edge_temporal, "edge_guided_temporal_smooth")
+        row += 1
+
+        ttk.Label(outer, text="Edge Reinject Strength:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_edge_reinject = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.edge_guided_reinject_strength_var, width=18)
+        )
+        entry_edge_reinject.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_edge_reinject, "edge_guided_reinject_strength")
+        row += 1
+
+        ttk.Separator(outer, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(6, 4))
+        row += 1
+
+        ttk.Label(outer, text="Hi-Res Output Suffix:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_suffix = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.spatial_refine_output_suffix_var, width=18)
+        )
+        entry_suffix.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_suffix, "spatial_refine_output_suffix")
+        row += 1
+
+        ttk.Label(outer, text="Edge Mode Output Suffix:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_edge_suffix = self._register_spatial_refine_dialog_widget(
+            ttk.Entry(outer, textvariable=self.edge_guided_output_suffix_var, width=18)
+        )
+        entry_edge_suffix.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_edge_suffix, "edge_guided_output_suffix")
+        row += 1
+
+        cleanup_cb = self._register_spatial_refine_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Cleanup Hi-Res Temp Tile Data",
+                variable=self.spatial_refine_cleanup_temp_var,
+            )
+        )
+        cleanup_cb.grid(row=row, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(cleanup_cb, "spatial_refine_cleanup_temp")
+        row += 1
+
+        close_btn = self._register_spatial_refine_dialog_widget(
+            ttk.Button(outer, text="Close", command=self._close_spatial_refine_settings_dialog, width=12)
+        )
+        close_btn.grid(row=row, column=0, columnspan=2, sticky="e", padx=5, pady=(8, 2))
+
+        self._apply_spatial_refine_options_visibility()
+
+    def _apply_spatial_refine_options_visibility(self):
+        if not hasattr(self, 'spatial_refine_toggle_btn'):
+            return
+
+        is_open = (
+            self.spatial_refine_settings_dialog is not None
+            and bool(self.spatial_refine_settings_dialog.winfo_exists())
+        )
+        self.spatial_refine_options_expanded_var.set(bool(is_open))
+        button_text = "  ↳ Hi-Res / Edge Settings Open" if is_open else "  ↳ Configure Hi-Res / Edge Settings..."
+        try:
+            self.spatial_refine_toggle_btn.configure(text=button_text)
+        except tk.TclError:
+            pass
+
+    def toggle_spatial_refine_options_visibility(self):
+        self._open_spatial_refine_settings_dialog()
 
     def toggle_dither_options_active_state(self, *args):
         if not (hasattr(self, 'process_as_segments_var') and hasattr(self, 'merge_dither_var')): return
