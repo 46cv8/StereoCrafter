@@ -168,6 +168,7 @@ class DepthCrafterGUI:
     IMAGE_EXTENSIONS = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.exr"]
     DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
     CLOUD_BLACKLIST_PATH = os.path.join("cloud", "cloud_blacklist.json")
+    CLOUD_PROVIDER_HISTORY_PATH = os.path.join("cloud", "cloud_provider_history.json")
     CLOUD_PROFILE_DEFAULTS = {
         "5090_32gb": {
             "label": "RTX 5090 32GB",
@@ -3561,6 +3562,10 @@ class DepthCrafterGUI:
         repo_root = os.path.dirname(os.path.abspath(__file__))
         return os.path.normpath(os.path.join(repo_root, self.CLOUD_BLACKLIST_PATH))
 
+    def _resolve_cloud_provider_history_path(self) -> str:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        return os.path.normpath(os.path.join(repo_root, self.CLOUD_PROVIDER_HISTORY_PATH))
+
     def _normalize_cloud_blacklist_data(self, raw_data: Optional[Dict[str, Any]]) -> Dict[str, set]:
         normalized = {
             "blocked_offer_ids": set(),
@@ -3620,6 +3625,215 @@ class DepthCrafterGUI:
         host_count = len(data.get("blocked_host_ids", set()))
         self.cloud_blacklist_summary_var.set(
             f"Blacklist: offers={offer_count}, machines={machine_count}, hosts={host_count}"
+        )
+
+    def _normalize_cloud_provider_history_data(self, raw_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        def _normalize_count_map(value: Any) -> Dict[str, int]:
+            normalized_map: Dict[str, int] = {}
+            if not isinstance(value, dict):
+                return normalized_map
+            for key, count_value in value.items():
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                try:
+                    count_int = int(count_value)
+                except Exception:
+                    continue
+                if count_int > 0:
+                    normalized_map[key_text] = count_int
+            return normalized_map
+
+        normalized = {
+            "provider_counts": {},
+            "offer_counts": {},
+            "machine_counts": {},
+            "host_counts": {},
+            "recent_connections": [],
+        }
+        if not isinstance(raw_data, dict):
+            return normalized
+
+        normalized["provider_counts"] = _normalize_count_map(raw_data.get("provider_counts"))
+        normalized["offer_counts"] = _normalize_count_map(raw_data.get("offer_counts"))
+        normalized["machine_counts"] = _normalize_count_map(raw_data.get("machine_counts"))
+        normalized["host_counts"] = _normalize_count_map(raw_data.get("host_counts"))
+
+        recent = raw_data.get("recent_connections")
+        if isinstance(recent, list):
+            normalized["recent_connections"] = [row for row in recent[-200:] if isinstance(row, dict)]
+
+        return normalized
+
+    def _load_cloud_provider_history_data(self) -> Dict[str, Any]:
+        history_path = self._resolve_cloud_provider_history_path()
+        if not os.path.isfile(history_path):
+            return self._normalize_cloud_provider_history_data(None)
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+            return self._normalize_cloud_provider_history_data(raw_data)
+        except Exception as exc:
+            _logger.warning(f"[CLOUD] Failed to parse provider history '{history_path}': {exc}")
+            return self._normalize_cloud_provider_history_data(None)
+
+    def _save_cloud_provider_history_data(self, history_data: Dict[str, Any]):
+        history_path = self._resolve_cloud_provider_history_path()
+        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+
+        def _sort_map(source: Dict[str, Any]) -> Dict[str, int]:
+            sortable: List[Tuple[str, int]] = []
+            for key, value in source.items():
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                try:
+                    value_int = int(value)
+                except Exception:
+                    continue
+                if value_int > 0:
+                    sortable.append((key_text, value_int))
+            sortable.sort(key=lambda item: item[0])
+            return {key: value for key, value in sortable}
+
+        serializable = {
+            "provider_counts": _sort_map(history_data.get("provider_counts", {})),
+            "offer_counts": _sort_map(history_data.get("offer_counts", {})),
+            "machine_counts": _sort_map(history_data.get("machine_counts", {})),
+            "host_counts": _sort_map(history_data.get("host_counts", {})),
+            "recent_connections": list(history_data.get("recent_connections", []))[-200:],
+            "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_by": "depthcrafter_gui_seg.py",
+        }
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, indent=2)
+
+    def _cloud_provider_key_from_ids(
+        self,
+        offer_id: int,
+        machine_id: int,
+        host_id: int,
+        host: str = "",
+    ) -> str:
+        if host_id > 0:
+            return f"host:{host_id}"
+        if machine_id > 0:
+            return f"machine:{machine_id}"
+        if offer_id > 0:
+            return f"offer:{offer_id}"
+        host_text = str(host or "").strip().lower()
+        if host_text:
+            return f"ssh:{host_text}"
+        return "unknown"
+
+    def _cloud_provider_label_from_key(self, provider_key: str) -> str:
+        key = str(provider_key or "").strip()
+        if key.startswith("host:"):
+            return f"Host {key.split(':', 1)[1]}"
+        if key.startswith("machine:"):
+            return f"Machine {key.split(':', 1)[1]}"
+        if key.startswith("offer:"):
+            return f"Offer {key.split(':', 1)[1]}"
+        if key.startswith("ssh:"):
+            return f"SSH {key.split(':', 1)[1]}"
+        return "Unknown provider"
+
+    def _cloud_provider_identity_for_offer(self, offer_entry: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            offer_id = int(offer_entry.get("id", 0) or 0)
+        except Exception:
+            offer_id = 0
+        try:
+            machine_id = int(offer_entry.get("machine_id", 0) or 0)
+        except Exception:
+            machine_id = 0
+        try:
+            host_id = int(offer_entry.get("host_id", 0) or 0)
+        except Exception:
+            host_id = 0
+        provider_key = self._cloud_provider_key_from_ids(
+            offer_id=offer_id,
+            machine_id=machine_id,
+            host_id=host_id,
+        )
+        return {
+            "provider_key": provider_key,
+            "provider_label": self._cloud_provider_label_from_key(provider_key),
+            "offer_id": offer_id,
+            "machine_id": machine_id,
+            "host_id": host_id,
+        }
+
+    def _record_cloud_connection_history(
+        self,
+        connection_info: Dict[str, object],
+        profile_key: str,
+        connection_origin: str,
+    ):
+        try:
+            offer_id = int(connection_info.get("offer_id", 0) or 0)
+            machine_id = int(connection_info.get("machine_id", 0) or 0)
+            host_id = int(connection_info.get("host_id", 0) or 0)
+            host = str(connection_info.get("host", "") or "").strip()
+            port = int(connection_info.get("port", 0) or 0)
+        except Exception as exc:
+            _logger.warning(f"[CLOUD] Could not parse connection info for history: {exc}")
+            return
+
+        provider_key = self._cloud_provider_key_from_ids(
+            offer_id=offer_id,
+            machine_id=machine_id,
+            host_id=host_id,
+            host=host,
+        )
+
+        history_data = self._load_cloud_provider_history_data()
+        provider_counts = dict(history_data.get("provider_counts", {}))
+        offer_counts = dict(history_data.get("offer_counts", {}))
+        machine_counts = dict(history_data.get("machine_counts", {}))
+        host_counts = dict(history_data.get("host_counts", {}))
+
+        provider_counts[provider_key] = int(provider_counts.get(provider_key, 0)) + 1
+        if offer_id > 0:
+            offer_key = str(offer_id)
+            offer_counts[offer_key] = int(offer_counts.get(offer_key, 0)) + 1
+        if machine_id > 0:
+            machine_key = str(machine_id)
+            machine_counts[machine_key] = int(machine_counts.get(machine_key, 0)) + 1
+        if host_id > 0:
+            host_key = str(host_id)
+            host_counts[host_key] = int(host_counts.get(host_key, 0)) + 1
+
+        record = {
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "profile": str(profile_key or ""),
+            "origin": str(connection_origin or ""),
+            "instance_id": int(connection_info.get("instance_id", 0) or 0),
+            "offer_id": offer_id,
+            "machine_id": machine_id,
+            "host_id": host_id,
+            "provider_key": provider_key,
+            "provider_label": self._cloud_provider_label_from_key(provider_key),
+            "ssh_host": host,
+            "ssh_port": port,
+            "gpu_name": str(connection_info.get("gpu_name", "") or ""),
+            "geolocation": str(connection_info.get("geolocation", "") or ""),
+        }
+        recent_connections = list(history_data.get("recent_connections", []))
+        recent_connections.append(record)
+        history_data["recent_connections"] = recent_connections[-200:]
+        history_data["provider_counts"] = provider_counts
+        history_data["offer_counts"] = offer_counts
+        history_data["machine_counts"] = machine_counts
+        history_data["host_counts"] = host_counts
+
+        self._save_cloud_provider_history_data(history_data)
+        _logger.info(
+            "[CLOUD] History updated | provider=%s count=%s offer=%s offer_count=%s",
+            provider_key,
+            provider_counts.get(provider_key, 0),
+            offer_id,
+            offer_counts.get(str(offer_id), 0) if offer_id > 0 else 0,
         )
 
     def _is_cloud_offer_blacklisted(
@@ -4618,86 +4832,207 @@ class DepthCrafterGUI:
         )
         return ranked_offers
 
-    def _build_cloud_pricing_confirmation_message(
+    def _format_cloud_offer_selection_entry(
+        self,
+        rank_idx: int,
+        offer: Dict[str, Any],
+        history_data: Dict[str, Any],
+    ) -> str:
+        identity = self._cloud_provider_identity_for_offer(offer)
+        provider_key = identity["provider_key"]
+        provider_label = identity["provider_label"]
+        offer_id = int(identity["offer_id"])
+        machine_id = int(identity["machine_id"])
+        host_id = int(identity["host_id"])
+
+        provider_count = int(history_data.get("provider_counts", {}).get(provider_key, 0) or 0)
+        offer_count = int(history_data.get("offer_counts", {}).get(str(offer_id), 0) or 0) if offer_id > 0 else 0
+
+        gpu_name = str(offer.get("gpu_name", "Unknown"))
+        location = str(offer.get("geolocation", "Unknown"))
+        reliability = float(offer.get("reliability", 0.0) or 0.0)
+        vram_gb = float(offer.get("_vram_gb", 0.0) or 0.0)
+        inet_down = float(offer.get("inet_down", 0.0) or 0.0)
+        inet_up = float(offer.get("inet_up", 0.0) or 0.0)
+        hourly = float(offer.get("_hourly", 0.0) or 0.0)
+        up_tb = float(offer.get("_up_tb", 0.0) or 0.0)
+        down_tb = float(offer.get("_down_tb", 0.0) or 0.0)
+        runtime_cost = float(offer.get("_runtime_cost", 0.0) or 0.0)
+        transfer_cost = float(offer.get("_transfer_cost", 0.0) or 0.0)
+        total_cost = float(offer.get("_total_cost", 0.0) or 0.0)
+
+        return (
+            f"#{rank_idx}  Offer ID {offer_id} | Projected total ${total_cost:.4f} "
+            f"(runtime ${runtime_cost:.4f} + transfer ${transfer_cost:.4f})\n"
+            f"GPU: {gpu_name} ({vram_gb:.1f} GB VRAM) | Location: {location} | Reliability: {reliability:.3f}\n"
+            f"Network down/up: {inet_down:.0f}/{inet_up:.0f} Mbps | $/hour ${hourly:.4f} | "
+            f"up TB ${up_tb:.4f} | down TB ${down_tb:.4f}\n"
+            f"Provider: {provider_label} | Provider connections: {provider_count} | "
+            f"Offer connections: {offer_count} | machine={machine_id if machine_id > 0 else 'n/a'} | "
+            f"host={host_id if host_id > 0 else 'n/a'}"
+        )
+
+    def _show_cloud_offer_selection_dialog(
         self,
         profile_key: str,
         source_count: int,
+        ranked_offers: List[Dict[str, Any]],
         reason: str = "",
-    ) -> str:
-        profile_defaults = self._get_cloud_profile_defaults(profile_key)
+    ) -> Optional[int]:
+        if not ranked_offers:
+            return None
+
+        top_offers = ranked_offers[:10]
+        top_count = len(top_offers)
         settings = self._get_effective_cloud_processing_settings()
-        lines: List[str] = [
-            f"Launch cloud worker profile '{profile_key}' and process {source_count} clip(s)?",
-            "",
-            f"Effective cloud params: {settings['target_width']}x{settings['target_height']}, "
-            f"window={settings['window_size']}, overlap={settings['overlap']}",
-        ]
-        if reason:
-            lines.extend(["", reason])
-
-        ranked_offers = self._fetch_ranked_cloud_offers_for_confirmation(profile_key)
-        best = ranked_offers[0]
-        offer_id = int(best.get("id", 0) or 0)
-        gpu_name = str(best.get("gpu_name", "Unknown"))
-        location = str(best.get("geolocation", "Unknown"))
-        reliability = float(best.get("reliability", 0.0) or 0.0)
-        vram_gb = float(best.get("_vram_gb", 0.0) or 0.0)
-        inet_down = float(best.get("inet_down", 0.0) or 0.0)
-        inet_up = float(best.get("inet_up", 0.0) or 0.0)
-
-        lines.extend([
-            "",
-            "Selected cheapest estimated offer:",
-            f"  Offer ID: {offer_id}",
-            f"  GPU: {gpu_name} ({vram_gb:.1f} GB VRAM)",
-            f"  Location: {location}",
-            f"  Reliability: {reliability:.3f}",
-            f"  Network (down/up): {inet_down:.0f} / {inet_up:.0f} Mbps",
-            "",
-            "Pricing sanity check:",
-            f"  $/hour: ${float(best.get('_hourly', 0.0)):.4f}",
-            f"  Upload cost per TB: ${float(best.get('_up_tb', 0.0)):.4f}",
-            f"  Download cost per TB: ${float(best.get('_down_tb', 0.0)):.4f}",
-            "",
-            "Estimated total cost:",
-            f"  Runtime: {self.cloud_expected_runtime_hours_var.get()} h -> ${float(best.get('_runtime_cost', 0.0)):.4f}",
-            (
-                f"  Transfer: {self.cloud_expected_upload_gb_var.get()} GB up, "
-                f"{self.cloud_expected_download_gb_var.get()} GB down -> "
-                f"${float(best.get('_transfer_cost', 0.0)):.4f}"
-            ),
-            f"  Estimated total: ${float(best.get('_total_cost', 0.0)):.4f}",
-        ])
-
-        if len(ranked_offers) > 1:
-            lines.extend(["", "Alternatives (estimated total / $hr / offer):"])
-            for alt in ranked_offers[1:4]:
-                alt_offer_id = int(alt.get("id", 0) or 0)
-                alt_total = float(alt.get("_total_cost", 0.0) or 0.0)
-                alt_hourly = float(alt.get("_hourly", 0.0) or 0.0)
-                alt_gpu = str(alt.get("gpu_name", "Unknown"))
-                lines.append(
-                    f"  ${alt_total:.4f} / ${alt_hourly:.4f}h / id={alt_offer_id} / {alt_gpu}"
-                )
-
+        profile_defaults = self._get_cloud_profile_defaults(profile_key)
         blacklist_data = self._load_cloud_blacklist_data()
         blocked_offer_count = len(blacklist_data.get("blocked_offer_ids", set()))
         blocked_machine_count = len(blacklist_data.get("blocked_machine_ids", set()))
         blocked_host_count = len(blacklist_data.get("blocked_host_ids", set()))
-        lines.extend([
-            "",
-            f"Offer filter profile: {profile_defaults.get('label', profile_key)}",
-            f"Require verified hosts: {'Yes' if bool(self.cloud_require_verified_hosts_var.get()) else 'No'}",
-            f"Blacklist active: offers={blocked_offer_count}, machines={blocked_machine_count}, hosts={blocked_host_count}",
-            "Continue with instance creation?",
-        ])
-        return "\n".join(lines)
+        history_data = self._load_cloud_provider_history_data()
+        history_path = self._resolve_cloud_provider_history_path()
 
-    def _confirm_new_cloud_launch(self, profile_key: str, source_count: int, reason: str = "") -> bool:
+        expected_runtime_hours = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_runtime_hours_var, 1.0))
+        expected_upload_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_upload_gb_var, 0.0))
+        expected_download_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_download_gb_var, 0.0))
+
+        header_lines = [
+            f"Choose cloud offer for profile '{profile_defaults.get('label', profile_key)}' and {source_count} clip(s).",
+            f"Effective cloud params: {settings['target_width']}x{settings['target_height']}, "
+            f"window={settings['window_size']}, overlap={settings['overlap']}.",
+            f"Showing top {top_count} offers sorted by projected total cost (blacklisted entries excluded).",
+            f"Cost model: runtime={expected_runtime_hours:.3f}h, upload={expected_upload_gb:.3f}GB, "
+            f"download={expected_download_gb:.3f}GB.",
+            f"Require verified hosts: {'Yes' if bool(self.cloud_require_verified_hosts_var.get()) else 'No'} | "
+            f"Blacklist active: offers={blocked_offer_count}, machines={blocked_machine_count}, hosts={blocked_host_count}.",
+            f"Provider history file: {history_path}",
+        ]
+        if reason:
+            header_lines.extend(["", f"Launch note: {reason}"])
+
+        first_offer_id = int(top_offers[0].get("id", 0) or 0)
+        selected_offer_var = tk.IntVar(value=first_offer_id if first_offer_id > 0 else 0)
+        selection_result: Dict[str, Optional[int]] = {"offer_id": None}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Cloud Offer Selection")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("1080x780")
+        dialog.minsize(860, 560)
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        header_label = ttk.Label(
+            outer,
+            text="\n".join(header_lines),
+            justify=tk.LEFT,
+            anchor="w",
+            wraplength=1040,
+        )
+        header_label.pack(fill=tk.X, anchor="w", pady=(0, 8))
+
+        list_container = ttk.Frame(outer)
+        list_container.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(list_container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        scrollable_frame = ttk.Frame(canvas)
+        canvas_window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        offer_labels: List[ttk.Label] = []
+
+        def _set_selection(offer_id_value: int):
+            selected_offer_var.set(int(offer_id_value))
+
+        for idx, offer in enumerate(top_offers, start=1):
+            offer_id = int(offer.get("id", 0) or 0)
+            row_frame = ttk.Frame(scrollable_frame, padding=(8, 8), relief=tk.GROOVE, borderwidth=1)
+            row_frame.pack(fill=tk.X, expand=True, pady=(0, 6))
+            row_frame.columnconfigure(1, weight=1)
+
+            offer_radio = ttk.Radiobutton(row_frame, variable=selected_offer_var, value=offer_id)
+            offer_radio.grid(row=0, column=0, sticky="n", padx=(0, 8))
+            offer_text = self._format_cloud_offer_selection_entry(
+                rank_idx=idx,
+                offer=offer,
+                history_data=history_data,
+            )
+            offer_label = ttk.Label(row_frame, text=offer_text, justify=tk.LEFT, anchor="w", wraplength=980)
+            offer_label.grid(row=0, column=1, sticky="w")
+            offer_labels.append(offer_label)
+
+            row_frame.bind("<Button-1>", lambda _event, oid=offer_id: _set_selection(oid))
+            offer_label.bind("<Button-1>", lambda _event, oid=offer_id: _set_selection(oid))
+
+        def _on_scrollable_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(canvas_window_id, width=event.width)
+            wraplength = max(500, int(event.width) - 90)
+            for label in offer_labels:
+                label.configure(wraplength=wraplength)
+            header_label.configure(wraplength=max(500, int(event.width) - 20))
+
+        scrollable_frame.bind("<Configure>", _on_scrollable_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        button_frame = ttk.Frame(outer)
+        button_frame.pack(fill=tk.X, pady=(8, 0))
+
+        def _cancel():
+            selection_result["offer_id"] = None
+            dialog.destroy()
+
+        def _confirm():
+            try:
+                selected_offer_id = int(selected_offer_var.get())
+            except Exception:
+                selected_offer_id = 0
+            if selected_offer_id <= 0:
+                messagebox.showerror("Cloud Dispatch", "Select an offer before launching.", parent=dialog)
+                return
+            selection_result["offer_id"] = selected_offer_id
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="Cancel", command=_cancel, width=14).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(button_frame, text="Launch Selected Offer", command=_confirm, width=24).pack(side=tk.RIGHT)
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
         try:
-            msg = self._build_cloud_pricing_confirmation_message(
+            dialog.focus_set()
+        except tk.TclError:
+            pass
+        try:
+            if dialog.winfo_exists():
+                dialog.wait_visibility()
+        except tk.TclError:
+            # Window can be closed before map/visibility event settles.
+            pass
+        try:
+            if dialog.winfo_exists():
+                self.root.wait_window(dialog)
+        except tk.TclError:
+            pass
+        return selection_result["offer_id"]
+
+    def _confirm_new_cloud_launch(
+        self,
+        profile_key: str,
+        source_count: int,
+        reason: str = "",
+    ) -> Optional[int]:
+        try:
+            ranked_offers = self._fetch_ranked_cloud_offers_for_confirmation(profile_key)
+            return self._show_cloud_offer_selection_dialog(
                 profile_key=profile_key,
                 source_count=source_count,
+                ranked_offers=ranked_offers,
                 reason=reason,
             )
         except Exception as preflight_exc:
@@ -4709,13 +5044,13 @@ class DepthCrafterGUI:
                 fallback_lines.extend(["", reason])
             fallback_lines.extend([
                 "",
-                "Could not fetch pricing preflight from Vast right now.",
+                "Could not fetch cloud offer ranking from Vast right now.",
                 f"Reason: {preflight_exc}",
                 "",
-                "Continue anyway?",
+                "Continue and let launcher pick the cheapest available offer?",
             ])
-            msg = "\n".join(fallback_lines)
-        return messagebox.askyesno("Cloud Dispatch", msg)
+            should_continue = messagebox.askyesno("Cloud Dispatch", "\n".join(fallback_lines))
+            return 0 if should_continue else None
 
     def _get_cloud_instance_status(self, instance_id: int) -> str:
         row = self._get_cloud_instance_row(instance_id)
@@ -4967,6 +5302,7 @@ class DepthCrafterGUI:
         repo_root: str,
         base_cfg_path: str,
         generated_cfg_path: str,
+        selected_offer_id: int = 0,
     ) -> List[str]:
         cloud_settings = self._get_effective_cloud_processing_settings()
         cloud_image = self.cloud_image_var.get().strip()
@@ -5035,6 +5371,9 @@ class DepthCrafterGUI:
         if max_dph_value > 0.0:
             cmd.extend(["--max-dph", str(max_dph_value)])
 
+        if int(selected_offer_id) > 0:
+            cmd.extend(["--offer-id", str(int(selected_offer_id))])
+
         identity_file = self.cloud_identity_file_var.get().strip()
         if identity_file:
             cmd.extend(["--identity", os.path.expanduser(identity_file)])
@@ -5060,6 +5399,7 @@ class DepthCrafterGUI:
         self,
         source_specs_to_process: List[Dict],
         effective_seed_for_run: int,
+        selected_offer_id: int = 0,
     ) -> Dict[str, object]:
         repo_root = os.path.dirname(os.path.abspath(__file__))
         cloud_tmp_root = os.path.join(self.output_dir.get(), ".cloud_gui_tmp")
@@ -5082,6 +5422,7 @@ class DepthCrafterGUI:
             repo_root=repo_root,
             base_cfg_path=base_cfg_path,
             generated_cfg_path=generated_cfg_path,
+            selected_offer_id=selected_offer_id,
         )
 
         self.status_message_var.set("Cloud: selecting offer and launching worker...")
@@ -5110,6 +5451,10 @@ class DepthCrafterGUI:
             "offer_id": int(cloud_remote.get("vast_offer_id", 0) or 0),
             "machine_id": int(cloud_remote.get("vast_machine_id", 0) or 0),
             "host_id": int(cloud_remote.get("vast_host_id", 0) or 0),
+            "gpu_name": str(cloud_remote.get("vast_gpu_name", "") or ""),
+            "geolocation": str(cloud_remote.get("vast_geolocation", "") or ""),
+            "hourly_cost": float(cloud_remote.get("vast_hourly_cost", 0.0) or 0.0),
+            "reliability": float(cloud_remote.get("vast_reliability", 0.0) or 0.0),
             "user": str(cloud_remote.get("vast_user", "root") or "root"),
             "remote_root": str(cloud_remote.get("remote_root", self.cloud_remote_root_var.get()) or self.cloud_remote_root_var.get()),
             "remote_venv": str(cloud_remote.get("remote_venv", self.cloud_remote_venv_var.get()) or self.cloud_remote_venv_var.get()),
@@ -5265,6 +5610,7 @@ class DepthCrafterGUI:
         connection_info: Optional[Dict[str, object]] = None
         should_prompt_new_launch = False
         new_launch_reason = ""
+        selected_offer_id_for_launch = 0
 
         if reuse_enabled and cached_instance_id > 0 and cached_profile == selected_profile:
             cached_host = self.cloud_last_host_var.get().strip()
@@ -5318,21 +5664,31 @@ class DepthCrafterGUI:
                 )
 
         if connection_info is None and should_prompt_new_launch:
-            launch_confirm = self._confirm_new_cloud_launch(
+            selected_offer_id_or_none = self._confirm_new_cloud_launch(
                 profile_key=selected_profile,
                 source_count=len(source_specs_to_process),
                 reason=new_launch_reason,
             )
-            if not launch_confirm:
+            if selected_offer_id_or_none is None:
                 _logger.info("Cloud dispatch cancelled by user before worker launch.")
                 self.status_message_var.set("Cloud dispatch cancelled.")
                 return
+            selected_offer_id_for_launch = int(selected_offer_id_or_none)
 
         if connection_info is None:
             connection_info = self._launch_cloud_worker_for_gui_run(
                 source_specs_to_process=source_specs_to_process,
                 effective_seed_for_run=effective_seed_for_run,
+                selected_offer_id=selected_offer_id_for_launch,
             )
+            connection_origin = "new_launch"
+        else:
+            connection_origin = "reused_instance"
+        self._record_cloud_connection_history(
+            connection_info=connection_info,
+            profile_key=selected_profile,
+            connection_origin=connection_origin,
+        )
         instance_id = int(connection_info.get("instance_id", 0) or 0)
         total_sources_processed = 0
 

@@ -1,6 +1,7 @@
 # Prevent local secrets/state from entering Docker build context.
 cloud/*.env
 cloud/cloud_blacklist.json
+cloud/cloud_provider_history.json
 
 # VCS and local caches.
 .git

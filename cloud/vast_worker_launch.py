@@ -65,8 +65,15 @@ def redact_sensitive_cmd(parts: Sequence[str]) -> List[str]:
     return redacted
 
 
-def run_cmd(cmd: Sequence[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    log("$ " + shell_join(redact_sensitive_cmd(list(cmd))))
+def run_cmd(
+    cmd: Sequence[str],
+    *,
+    check: bool = True,
+    capture: bool = True,
+    log_command: bool = True,
+) -> subprocess.CompletedProcess:
+    if log_command:
+        log("$ " + shell_join(redact_sensitive_cmd(list(cmd))))
     return subprocess.run(
         list(cmd),
         check=check,
@@ -521,6 +528,9 @@ def update_config_for_profile(
         "vast_offer_id": as_int(selected_offer.get("id"), 0),
         "vast_machine_id": as_int(selected_offer.get("machine_id"), 0),
         "vast_host_id": as_int(selected_offer.get("host_id"), 0),
+        "vast_geolocation": str(selected_offer.get("geolocation", "")),
+        "vast_reliability": as_float(selected_offer.get("reliability"), 0.0),
+        "vast_hourly_cost": as_float(selected_offer.get("_hourly_cost"), as_float(selected_offer.get("dph_total"), 0.0)),
         "vast_gpu_name": str(selected_offer.get("gpu_name", "")),
         "vast_gpu_ram_gb": round(normalized_gpu_ram_gb(selected_offer), 3),
         "vast_host": host,
@@ -732,6 +742,21 @@ def fetch_instance_row_cli(instance_id: int, api_key: str) -> Optional[Dict[str,
     return extract_instance_row_from_payload(payload, instance_id)
 
 
+def fetch_instance_logs_lines(instance_id: int, api_key: str) -> Tuple[int, List[str]]:
+    logs_cmd = with_api_key(
+        ["vastai", "logs", str(instance_id)],
+        api_key,
+    )
+    logs_proc = run_cmd(logs_cmd, check=False, capture=True, log_command=False)
+    raw_logs = (logs_proc.stdout or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not raw_logs.strip():
+        return logs_proc.returncode, []
+    lines = [line.rstrip() for line in raw_logs.split("\n")]
+    # Keep non-empty lines only for cleaner console output.
+    filtered = [line for line in lines if line.strip()]
+    return logs_proc.returncode, filtered
+
+
 def tcp_endpoint_ready(host: str, port: int, timeout_sec: float = 3.0) -> Tuple[bool, str]:
     host_str = str(host or "").strip()
     try:
@@ -751,6 +776,8 @@ def wait_for_instance_ready(instance_id: int, api_key: str, timeout_sec: int, po
     deadline = time.time() + timeout_sec
     last_status = ""
     last_probe_error = ""
+    last_log_lines: List[str] = []
+    last_log_error = ""
     while time.time() < deadline:
         row = fetch_instance_row_http(instance_id, api_key)
         if row is None:
@@ -771,6 +798,36 @@ def wait_for_instance_ready(instance_id: int, api_key: str, timeout_sec: int, po
         if status_text != last_status:
             log(f"Instance {instance_id} status: {status_text}")
             last_status = status_text
+
+        log_rc, log_lines = fetch_instance_logs_lines(instance_id, api_key)
+        if log_rc == 0 and log_lines:
+            # Print only unseen tail lines to avoid duplicating full log output each poll.
+            new_lines: List[str] = []
+            if last_log_lines and len(log_lines) >= len(last_log_lines) and log_lines[: len(last_log_lines)] == last_log_lines:
+                new_lines = log_lines[len(last_log_lines):]
+            elif last_log_lines:
+                anchor = last_log_lines[-1]
+                anchor_idx = -1
+                for idx in range(len(log_lines) - 1, -1, -1):
+                    if log_lines[idx] == anchor:
+                        anchor_idx = idx
+                        break
+                if anchor_idx >= 0:
+                    new_lines = log_lines[anchor_idx + 1:]
+                else:
+                    new_lines = log_lines
+            else:
+                new_lines = log_lines
+
+            for line in new_lines:
+                log(f"[instance-log] {line}")
+            last_log_lines = log_lines
+            last_log_error = ""
+        elif log_rc != 0 and log_lines:
+            log_error = log_lines[-1]
+            if log_error != last_log_error:
+                log(f"Instance {instance_id} log poll warning: {log_error}")
+                last_log_error = log_error
 
         if ssh_host and ssh_port > 0:
             is_open, probe_error = tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)

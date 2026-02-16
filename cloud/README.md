@@ -89,6 +89,7 @@ Fill:
 - `cloud/hf.env` with your accepted-terms HF token.
 - If your `--image` is private on GHCR: fill `cloud/ghcr.env` (`GHCR_USERNAME`, `GHCR_PAT` with at least `read:packages`).
 - Optional blacklist file: `cloud/cloud_blacklist.json` (auto-created by GUI when you blacklist failed hosts).
+- Optional provider history file: `cloud/cloud_provider_history.json` (auto-created by GUI to track prior provider usage).
 
 Launch a 5090 worker using your current config as base:
 

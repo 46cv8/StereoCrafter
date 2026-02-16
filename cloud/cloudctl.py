@@ -13,6 +13,7 @@ import argparse
 import dataclasses
 import posixpath
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -59,6 +60,71 @@ def run_cmd(
     )
 
 
+def run_cmd_stream(
+    cmd: Sequence[str],
+    check: bool = True,
+    *,
+    log_command: bool = True,
+    line_prefix: str = "",
+    heartbeat_sec: int = 30,
+) -> subprocess.CompletedProcess:
+    if log_command:
+        log("$ " + " ".join(shlex.quote(c) for c in cmd))
+
+    process = subprocess.Popen(
+        list(cmd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    output_lines: List[str] = []
+    start_ts = time.time()
+    last_heartbeat = start_ts
+
+    try:
+        if process.stdout is not None:
+            stdout_fd = process.stdout.fileno()
+            while True:
+                ready, _, _ = select.select([stdout_fd], [], [], 0.25)
+                if ready:
+                    line = process.stdout.readline()
+                    if line:
+                        text = line.rstrip("\n")
+                        output_lines.append(text)
+                        log(f"{line_prefix}{text}" if line_prefix else text)
+
+                now = time.time()
+                if process.poll() is None and (now - last_heartbeat) >= max(1, int(heartbeat_sec)):
+                    elapsed = now - start_ts
+                    log(
+                        f"{line_prefix}(still running, elapsed {elapsed:.0f}s)"
+                        if line_prefix
+                        else f"(still running, elapsed {elapsed:.0f}s)"
+                    )
+                    last_heartbeat = now
+
+                if process.poll() is not None:
+                    remaining = process.stdout.read() or ""
+                    if remaining:
+                        for tail in remaining.splitlines():
+                            output_lines.append(tail)
+                            log(f"{line_prefix}{tail}" if line_prefix else tail)
+                    break
+        returncode = process.wait()
+    finally:
+        if process.stdout is not None:
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+
+    stdout_joined = "\n".join(output_lines)
+    if check and returncode != 0:
+        raise subprocess.CalledProcessError(returncode, list(cmd), output=stdout_joined)
+    return subprocess.CompletedProcess(list(cmd), returncode, stdout_joined)
+
+
 def ssh_base_args(cfg: SSHConfig) -> List[str]:
     cmd = ["ssh", "-p", str(cfg.port)]
     if cfg.identity:
@@ -88,6 +154,25 @@ def ssh_run(
 ) -> subprocess.CompletedProcess:
     wrapped = f"bash -lc {shlex.quote(remote_script)}"
     return run_cmd(ssh_base_args(cfg) + [wrapped], check=check, capture=capture, log_command=log_command)
+
+
+def ssh_run_stream(
+    cfg: SSHConfig,
+    remote_script: str,
+    check: bool = True,
+    *,
+    log_command: bool = True,
+    line_prefix: str = "",
+    heartbeat_sec: int = 30,
+) -> subprocess.CompletedProcess:
+    wrapped = f"bash -lc {shlex.quote(remote_script)}"
+    return run_cmd_stream(
+        ssh_base_args(cfg) + [wrapped],
+        check=check,
+        log_command=log_command,
+        line_prefix=line_prefix,
+        heartbeat_sec=heartbeat_sec,
+    )
 
 
 def rsync_to_remote(
@@ -340,6 +425,7 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
     status_json = remote_join(remote_job_output_dir, "job_status.json")
     runner_args = [
         "python",
+        "-u",
         "cloud/run_depth_job.py",
         "--input",
         remote_input_path,
@@ -440,7 +526,13 @@ def _run_one_job(
 
     remote_cmd = _build_remote_job_cmd(args, remote_input_path, remote_job_output_dir, job_name)
     log(f"{log_prefix}Running remote inference...")
-    result = ssh_run(cfg, remote_cmd, check=False)
+    result = ssh_run_stream(
+        cfg,
+        remote_cmd,
+        check=False,
+        line_prefix=f"{log_prefix}[remote] ",
+        heartbeat_sec=30,
+    )
 
     local_job_dir = Path(args.download_dir).expanduser().resolve() / job_name
     if not args.skip_download:
