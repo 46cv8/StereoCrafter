@@ -1116,24 +1116,25 @@ def _remote_worker_running(cfg: SSHConfig, queue_paths: dict) -> bool:
 def _list_remote_running_queue_workers(cfg: SSHConfig, args: argparse.Namespace) -> list[dict]:
     remote_root = args.remote_root.rstrip("/")
     queues_root = remote_join(remote_root, "cloud_jobs", "queues")
+    queues_root_q = shlex.quote(queues_root)
+    probe_script = (
+        f"queues_root={queues_root_q}\n"
+        "if [ -d \"$queues_root\" ]; then\n"
+        "  for qdir in \"$queues_root\"/*; do\n"
+        "    [ -d \"$qdir\" ] || continue\n"
+        "    pid_file=\"$qdir/worker.pid\"\n"
+        "    [ -f \"$pid_file\" ] || continue\n"
+        "    pid=\"$(cat \"$pid_file\" 2>/dev/null || true)\"\n"
+        "    case \"$pid\" in ''|*[!0-9]*) continue ;; esac\n"
+        "    if kill -0 \"$pid\" 2>/dev/null; then\n"
+        "      printf '%s\\t%s\\n' \"$(basename \"$qdir\")\" \"$pid\"\n"
+        "    fi\n"
+        "  done\n"
+        "fi\n"
+    )
     proc = ssh_run(
         cfg,
-        " ; ".join(
-            [
-                f"if [ -d {shlex.quote(queues_root)} ]; then",
-                f"for qdir in {shlex.quote(queues_root)}/*; do",
-                "[ -d \"$qdir\" ] || continue",
-                "pid_file=\"$qdir/worker.pid\"",
-                "[ -f \"$pid_file\" ] || continue",
-                "pid=\"$(cat \"$pid_file\" 2>/dev/null || true)\"",
-                "case \"$pid\" in ''|*[!0-9]*) continue ;; esac",
-                "if kill -0 \"$pid\" 2>/dev/null; then",
-                "printf '%s\\t%s\\n' \"$(basename \"$qdir\")\" \"$pid\"",
-                "fi",
-                "done",
-                "fi",
-            ]
-        ),
+        probe_script,
         check=False,
         capture=True,
         log_command=False,
@@ -1270,19 +1271,24 @@ def _stop_remote_queue_worker(
     if not force_kill_on_timeout:
         return
     pid_file = queue_paths["worker_pid"]
+    pid_file_q = shlex.quote(pid_file)
+    force_stop_script = (
+        f"pid_file={pid_file_q}\n"
+        "if [ -f \"$pid_file\" ]; then\n"
+        "  pid=\"$(cat \"$pid_file\" 2>/dev/null || true)\"\n"
+        "  if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then\n"
+        "    kill \"$pid\" 2>/dev/null || true\n"
+        "  fi\n"
+        "  sleep 1\n"
+        "  if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then\n"
+        "    kill -9 \"$pid\" 2>/dev/null || true\n"
+        "  fi\n"
+        "  rm -f \"$pid_file\"\n"
+        "fi\n"
+    )
     ssh_run(
         cfg,
-        " && ".join(
-            [
-                f"if [ -f {shlex.quote(pid_file)} ]; then",
-                f"pid=\"$(cat {shlex.quote(pid_file)} 2>/dev/null || true)\"",
-                "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then kill \"$pid\" 2>/dev/null || true; fi",
-                "sleep 1",
-                "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null || true; fi",
-                f"rm -f {shlex.quote(pid_file)}",
-                "fi",
-            ]
-        ),
+        force_stop_script,
         check=False,
         log_command=False,
     )
