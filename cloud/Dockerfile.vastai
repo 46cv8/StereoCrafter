@@ -82,3 +82,47 @@ RUN set -eux; \
       git -C "${APP_ROOT}" checkout --detach "${GIT_COMMIT}"; \
     fi; \
     git -C "${APP_ROOT}" rev-parse HEAD | tee /opt/stereocrafter_git_commit.txt
+
+# Optional accelerator: best-effort flash-attn install.
+# Kept near the end to avoid invalidating earlier cached layers.
+ARG FLASH_ATTN_PIP_SPEC=flash-attn
+RUN set -eux; \
+    FLASH_ATTN_PIP_SPEC="${FLASH_ATTN_PIP_SPEC}" python - <<'PY'
+import importlib
+import os
+import subprocess
+import sys
+
+spec = os.environ.get("FLASH_ATTN_PIP_SPEC", "flash-attn").strip() or "flash-attn"
+print(f"[docker] Optional flash-attn check (spec={spec})", flush=True)
+
+try:
+    importlib.import_module("flash_attn")
+    print("[docker] flash-attn already installed.", flush=True)
+    raise SystemExit(0)
+except Exception:
+    pass
+
+# Best-effort only: keep image build succeeding even when no compatible wheel/build is available.
+subprocess.run([sys.executable, "-m", "pip", "install", "--no-build-isolation", "ninja"], check=False)
+proc = subprocess.run(
+    [sys.executable, "-m", "pip", "install", "--no-build-isolation", spec],
+    check=False,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+if proc.returncode != 0:
+    output = (proc.stdout or "").strip()
+    tail = "\n".join(output.splitlines()[-20:]) if output else ""
+    print("[docker] Optional flash-attn install failed; continuing image build.", flush=True)
+    if tail:
+        print(tail, flush=True)
+    raise SystemExit(0)
+
+try:
+    importlib.import_module("flash_attn")
+    print("[docker] flash-attn installed successfully.", flush=True)
+except Exception as exc:
+    print(f"[docker] flash-attn install completed but import failed ({exc}); continuing.", flush=True)
+PY

@@ -88,6 +88,106 @@ def _ensure_python_module(module_name: str, pip_spec: str, logger: logging.Logge
         raise RuntimeError(f"Module '{module_name}' is still unavailable after install.") from exc
 
 
+def _ensure_optional_python_module(
+    module_name: str,
+    pip_spec: str,
+    logger: logging.Logger,
+    *,
+    extra_pip_args: List[str] | None = None,
+) -> bool:
+    """Best-effort installer for optional modules. Never raises; returns availability."""
+    try:
+        __import__(module_name)
+        return True
+    except Exception:
+        pass
+
+    cmd = [sys.executable, "-m", "pip", "install"]
+    if extra_pip_args:
+        cmd.extend(list(extra_pip_args))
+    cmd.append(pip_spec)
+    pretty = " ".join(cmd)
+    logger.info("[setup] Optional dependency missing: %s; trying '%s'", module_name, pretty)
+
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if proc.returncode != 0:
+        output = (proc.stdout or "").strip()
+        output_tail = "\n".join(output.splitlines()[-20:]) if output else ""
+        if output_tail:
+            logger.warning(
+                "Optional install failed for '%s' (%s). Continuing without it.\n%s",
+                module_name,
+                pip_spec,
+                output_tail,
+            )
+        else:
+            logger.warning(
+                "Optional install failed for '%s' (%s). Continuing without it.",
+                module_name,
+                pip_spec,
+            )
+        return False
+
+    try:
+        __import__(module_name)
+        return True
+    except Exception:
+        logger.warning(
+            "Optional install for '%s' completed but import still failed. Continuing without it.",
+            module_name,
+        )
+        return False
+
+
+def _maybe_install_optional_flash_attn(logger: logging.Logger) -> None:
+    """
+    Try to install flash-attn when running StereoPilot, but don't fail jobs if unavailable.
+    """
+    flag = str(os.environ.get("STEREOCRAFTER_ENABLE_FLASH_ATTN", "1")).strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        logger.info("Optional flash-attn install disabled by STEREOCRAFTER_ENABLE_FLASH_ATTN=%s.", flag)
+        return
+
+    try:
+        __import__("flash_attn")
+        logger.info("Optional flash-attn already available.")
+        return
+    except Exception:
+        pass
+
+    try:
+        import torch as _torch  # local import to keep startup lightweight
+
+        if not _torch.cuda.is_available():
+            logger.info("Optional flash-attn skipped: CUDA unavailable in this runtime.")
+            return
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.info("Optional flash-attn skipped: torch unavailable during probe (%s).", exc)
+        return
+
+    if not sys.platform.startswith("linux"):
+        logger.info("Optional flash-attn skipped: unsupported platform '%s'.", sys.platform)
+        return
+
+    pip_spec = str(os.environ.get("FLASH_ATTN_PIP_SPEC", "flash-attn")).strip() or "flash-attn"
+    installed = _ensure_optional_python_module(
+        "flash_attn",
+        pip_spec,
+        logger,
+        extra_pip_args=["--no-build-isolation"],
+    )
+    if installed:
+        logger.info("Optional flash-attn is available and will be used by StereoPilot when supported.")
+    else:
+        logger.warning("Optional flash-attn unavailable; StereoPilot will use attention fallback (slower).")
+
+
 def _ensure_runtime_python_deps(
     *,
     model_backend: str,
@@ -139,6 +239,9 @@ def _ensure_runtime_python_deps(
             continue
         seen.add(key)
         _ensure_python_module(module_name, pip_spec, logger)
+
+    if model_backend == "stereopilot":
+        _maybe_install_optional_flash_attn(logger)
 
 
 def _is_geometry_repo(path: Path) -> bool:
