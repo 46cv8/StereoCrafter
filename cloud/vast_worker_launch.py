@@ -43,7 +43,7 @@ class VastWorkerLaunchError(RuntimeError):
 
 
 def log(msg: str) -> None:
-    print(f"[vast-worker] {msg}")
+    print(f"[vast-worker] {msg}", flush=True)
 
 
 def shell_join(parts: Sequence[str]) -> str:
@@ -772,10 +772,62 @@ def tcp_endpoint_ready(host: str, port: int, timeout_sec: float = 3.0) -> Tuple[
         return False, str(exc)
 
 
-def wait_for_instance_ready(instance_id: int, api_key: str, timeout_sec: int, poll_sec: int) -> Tuple[str, str, int]:
+def ssh_auth_ready(
+    host: str,
+    port: int,
+    user: str,
+    identity_path: str,
+    timeout_sec: float = 5.0,
+) -> Tuple[bool, str]:
+    host_str = str(host or "").strip()
+    user_str = str(user or "").strip()
+    identity_str = str(identity_path or "").strip()
+    try:
+        port_int = int(port)
+    except Exception:
+        port_int = 0
+    if not host_str or port_int <= 0 or not user_str:
+        return False, "missing ssh auth probe params"
+    if not identity_str:
+        return False, "missing identity key"
+
+    cmd = [
+        "ssh",
+        "-p",
+        str(port_int),
+        "-i",
+        identity_str,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={max(1, int(timeout_sec))}",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"{user_str}@{host_str}",
+        "echo vast_worker_auth_ready",
+    ]
+    proc = run_cmd(cmd, check=False, capture=True, log_command=False)
+    output = (proc.stdout or "").strip()
+    if proc.returncode == 0:
+        return True, ""
+    if output:
+        return False, output.splitlines()[-1].strip()
+    return False, f"ssh exit {proc.returncode}"
+
+
+def wait_for_instance_ready(
+    instance_id: int,
+    api_key: str,
+    timeout_sec: int,
+    poll_sec: int,
+    *,
+    ssh_user: str = "root",
+    identity_path: str = "",
+) -> Tuple[str, str, int]:
     deadline = time.time() + timeout_sec
     last_status = ""
     last_probe_error = ""
+    last_auth_error = ""
     last_log_lines: List[str] = []
     last_log_error = ""
     while time.time() < deadline:
@@ -830,21 +882,71 @@ def wait_for_instance_ready(instance_id: int, api_key: str, timeout_sec: int, po
                 last_log_error = log_error
 
         if ssh_host and ssh_port > 0:
-            is_open, probe_error = tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
-            if is_open:
-                return "root", ssh_host, ssh_port
-            if probe_error and probe_error != last_probe_error:
-                log(
-                    f"Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
-                    f"but not accepting connections yet: {probe_error}"
+            if identity_path:
+                auth_ready, auth_error = ssh_auth_ready(
+                    host=ssh_host,
+                    port=ssh_port,
+                    user=ssh_user,
+                    identity_path=identity_path,
+                    timeout_sec=5.0,
                 )
-                last_probe_error = probe_error
+                if auth_ready:
+                    return ssh_user, ssh_host, ssh_port
+                if auth_error and auth_error != last_auth_error:
+                    log(
+                        f"Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
+                        f"but auth is not ready yet: {auth_error}"
+                    )
+                    last_auth_error = auth_error
+            else:
+                is_open, probe_error = tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
+                if is_open:
+                    return ssh_user, ssh_host, ssh_port
+                if probe_error and probe_error != last_probe_error:
+                    log(
+                        f"Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
+                        f"but not accepting connections yet: {probe_error}"
+                    )
+                    last_probe_error = probe_error
 
         time.sleep(max(1, poll_sec))
 
     raise VastWorkerLaunchError(
         f"Timed out waiting for instance {instance_id} to become ready after {timeout_sec}s."
     )
+
+
+def maybe_attach_identity_to_instance(instance_id: int, identity_path: str, api_key: str) -> None:
+    identity_str = str(identity_path or "").strip()
+    if not identity_str:
+        return
+    pub_path = Path(identity_str + ".pub")
+    if not pub_path.is_file():
+        log(f"Identity public key not found for auto-attach: {pub_path}. Skipping attach ssh.")
+        return
+    try:
+        public_key_text = pub_path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        log(f"Failed reading public key {pub_path}: {exc}. Skipping attach ssh.")
+        return
+    if not public_key_text:
+        log(f"Public key file {pub_path} is empty. Skipping attach ssh.")
+        return
+
+    attach_cmd = with_api_key(
+        ["vastai", "attach", "ssh", str(instance_id), public_key_text, "--raw"],
+        api_key,
+    )
+    attach_proc = run_cmd(attach_cmd, check=False, capture=True, log_command=False)
+    attach_output = (attach_proc.stdout or "").strip()
+    if attach_proc.returncode == 0:
+        log(f"Attached SSH key to instance {instance_id} using {pub_path}.")
+        return
+    if attach_output:
+        short = attach_output.splitlines()[-1].strip()
+    else:
+        short = f"exit {attach_proc.returncode}"
+    log(f"Warning: attach ssh for instance {instance_id} failed: {short}")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -951,6 +1053,9 @@ def main() -> int:
     profile = PROFILES[args.profile]
     base_config_path = Path(args.base_config).expanduser().resolve()
     base_config = load_json_config(base_config_path)
+    identity_path = str(Path(args.identity).expanduser().resolve()) if str(args.identity or "").strip() else ""
+    if identity_path and not Path(identity_path).is_file():
+        raise VastWorkerLaunchError(f"SSH identity file not found: {identity_path}")
 
     api_key = resolve_api_key(args)
     if not api_key:
@@ -1098,11 +1203,14 @@ def main() -> int:
         )
 
     log(f"Created instance id: {instance_id}. Waiting for readiness...")
+    maybe_attach_identity_to_instance(instance_id=instance_id, identity_path=identity_path, api_key=api_key)
     ssh_user, ssh_host, ssh_port = wait_for_instance_ready(
         instance_id=instance_id,
         api_key=api_key,
         timeout_sec=args.ready_timeout_sec,
         poll_sec=args.poll_sec,
+        ssh_user=str(args.remote_user or "root"),
+        identity_path=identity_path,
     )
 
     log(f"READY: instance={instance_id} ssh={ssh_user}@{ssh_host}:{ssh_port}")

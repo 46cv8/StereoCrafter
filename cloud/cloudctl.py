@@ -10,7 +10,10 @@ Design goals:
 from __future__ import annotations
 
 import argparse
+import codecs
 import dataclasses
+import json
+import os
 import posixpath
 import re
 import select
@@ -39,7 +42,7 @@ class CloudCtlError(RuntimeError):
 
 
 def log(msg: str) -> None:
-    print(f"[cloudctl] {msg}")
+    print(f"[cloudctl] {msg}", flush=True)
 
 
 def run_cmd(
@@ -73,14 +76,64 @@ def run_cmd_stream(
 
     process = subprocess.Popen(
         list(cmd),
-        text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        bufsize=1,
+        bufsize=0,
     )
     output_lines: List[str] = []
     start_ts = time.time()
     last_heartbeat = start_ts
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    line_buffer = ""
+    latest_progress_text = ""
+    progress_last_emit_ts = 0.0
+    progress_emit_interval_sec = 1.0
+    progress_updates_seen = 0
+    progress_updates_emitted = 0
+
+    def _emit_line(text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        output_lines.append(cleaned)
+        log(f"{line_prefix}{cleaned}" if line_prefix else cleaned)
+
+    def _emit_progress(text: str, force: bool = False) -> bool:
+        nonlocal progress_last_emit_ts
+        nonlocal progress_updates_emitted
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        now = time.time()
+        if not force and (now - progress_last_emit_ts) < progress_emit_interval_sec:
+            return False
+        progress_last_emit_ts = now
+        progress_updates_emitted += 1
+        _emit_line(cleaned)
+        return True
+
+    def _consume_text(decoded_text: str) -> None:
+        nonlocal line_buffer
+        nonlocal latest_progress_text
+        nonlocal progress_updates_seen
+        for ch in decoded_text:
+            if ch == "\r":
+                candidate = line_buffer
+                line_buffer = ""
+                if candidate.strip():
+                    latest_progress_text = candidate
+                    progress_updates_seen += 1
+                    _emit_progress(latest_progress_text, force=False)
+                continue
+            if ch == "\n":
+                if line_buffer.strip():
+                    _emit_line(line_buffer)
+                elif latest_progress_text.strip():
+                    _emit_progress(latest_progress_text, force=True)
+                line_buffer = ""
+                latest_progress_text = ""
+                continue
+            line_buffer += ch
 
     try:
         if process.stdout is not None:
@@ -88,13 +141,16 @@ def run_cmd_stream(
             while True:
                 ready, _, _ = select.select([stdout_fd], [], [], 0.25)
                 if ready:
-                    line = process.stdout.readline()
-                    if line:
-                        text = line.rstrip("\n")
-                        output_lines.append(text)
-                        log(f"{line_prefix}{text}" if line_prefix else text)
+                    chunk = os.read(stdout_fd, 4096)
+                    if chunk:
+                        _consume_text(decoder.decode(chunk))
+                    else:
+                        break
 
                 now = time.time()
+                if latest_progress_text.strip() and (now - progress_last_emit_ts) >= progress_emit_interval_sec:
+                    _emit_progress(latest_progress_text, force=True)
+
                 if process.poll() is None and (now - last_heartbeat) >= max(1, int(heartbeat_sec)):
                     elapsed = now - start_ts
                     log(
@@ -105,12 +161,16 @@ def run_cmd_stream(
                     last_heartbeat = now
 
                 if process.poll() is not None:
-                    remaining = process.stdout.read() or ""
+                    remaining = process.stdout.read() or b""
                     if remaining:
-                        for tail in remaining.splitlines():
-                            output_lines.append(tail)
-                            log(f"{line_prefix}{tail}" if line_prefix else tail)
+                        _consume_text(decoder.decode(remaining))
                     break
+
+            _consume_text(decoder.decode(b"", final=True))
+            if line_buffer.strip():
+                _emit_line(line_buffer)
+            elif latest_progress_text.strip():
+                _emit_progress(latest_progress_text, force=True)
         returncode = process.wait()
     finally:
         if process.stdout is not None:
@@ -118,6 +178,14 @@ def run_cmd_stream(
                 process.stdout.close()
             except Exception:
                 pass
+
+    suppressed = progress_updates_seen - progress_updates_emitted
+    if suppressed > 0:
+        log(
+            f"{line_prefix}(suppressed {suppressed} carriage-return progress updates)"
+            if line_prefix
+            else f"(suppressed {suppressed} carriage-return progress updates)"
+        )
 
     stdout_joined = "\n".join(output_lines)
     if check and returncode != 0:
@@ -239,6 +307,8 @@ def wait_for_ssh_ready(cfg: SSHConfig, timeout_sec: int = 180, poll_sec: int = 4
     deadline = time.time() + timeout_sec
     attempt = 0
     last_error = ""
+    heartbeat_sec = 20
+    next_heartbeat = time.time() + heartbeat_sec
 
     while time.time() < deadline:
         attempt += 1
@@ -255,6 +325,8 @@ def wait_for_ssh_ready(cfg: SSHConfig, timeout_sec: int = 180, poll_sec: int = 4
                     f"SSH became ready after {attempt} probe(s) at "
                     f"{cfg.user}@{cfg.host}:{cfg.port}."
                 )
+            else:
+                log(f"SSH ready at {cfg.user}@{cfg.host}:{cfg.port}.")
             return
 
         probe_output = (probe.stdout or "").strip()
@@ -265,6 +337,14 @@ def wait_for_ssh_ready(cfg: SSHConfig, timeout_sec: int = 180, poll_sec: int = 4
                 f"(attempt {attempt}): {short_error}"
             )
             last_error = short_error
+        now = time.time()
+        if now >= next_heartbeat:
+            elapsed = max(0, timeout_sec - int(max(0.0, deadline - now)))
+            log(
+                f"Still waiting for SSH readiness at {cfg.user}@{cfg.host}:{cfg.port} "
+                f"(attempt {attempt}, elapsed {elapsed}s/{timeout_sec}s, last: {short_error})"
+            )
+            next_heartbeat = now + heartbeat_sec
         time.sleep(poll_sec)
 
     raise CloudCtlError(
@@ -328,8 +408,58 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-xformers", action="store_true")
     parser.add_argument("--use-cudnn-benchmark", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument(
+        "--auto-git-sync",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Before inference, attempt fast-forward sync of remote repo from origin/<current-branch>.",
+    )
     parser.add_argument("--unet-path", default="tencent/DepthCrafter")
     parser.add_argument("--pretrain-path", default="stabilityai/stable-video-diffusion-img2vid-xt")
+
+
+def maybe_sync_remote_repo(cfg: SSHConfig, args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "auto_git_sync", True)):
+        log("Remote git sync disabled (--no-auto-git-sync).")
+        return
+
+    remote_root = str(args.remote_root).rstrip("/")
+    sync_script = (
+        f"cd {shlex.quote(remote_root)}"
+        " && if ! command -v git >/dev/null 2>&1; then echo 'skip: git not found'; exit 0; fi"
+        " && if [ ! -d .git ]; then echo 'skip: no .git folder'; exit 0; fi"
+        " && branch=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)\""
+        " && if [ -z \"$branch\" ] || [ \"$branch\" = \"HEAD\" ]; then echo 'skip: detached/unknown branch'; exit 0; fi"
+        " && if ! git remote get-url origin >/dev/null 2>&1; then echo 'skip: no origin remote'; exit 0; fi"
+        " && if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then "
+        "echo 'skip: dirty worktree'; exit 0; fi"
+        " && echo \"sync: checking origin/$branch\""
+        " && if ! git fetch origin \"$branch\" --prune; then echo 'skip: fetch failed'; exit 0; fi"
+        " && local_sha=\"$(git rev-parse HEAD 2>/dev/null || true)\""
+        " && remote_sha=\"$(git rev-parse \"origin/$branch\" 2>/dev/null || true)\""
+        " && if [ -z \"$local_sha\" ] || [ -z \"$remote_sha\" ]; then echo 'skip: could not resolve commit shas'; exit 0; fi"
+        " && if [ \"$local_sha\" = \"$remote_sha\" ]; then echo \"up-to-date: $local_sha\"; exit 0; fi"
+        " && if git merge-base --is-ancestor \"$local_sha\" \"$remote_sha\"; then "
+        "git reset --hard \"$remote_sha\" && echo \"updated: $local_sha -> $remote_sha\"; exit 0; fi"
+        " && echo 'skip: local branch is ahead or diverged'; exit 0"
+    )
+
+    log("Remote git sync: checking for updates...")
+    sync_result = ssh_run(
+        cfg,
+        sync_script,
+        check=False,
+        capture=True,
+        log_command=False,
+    )
+    output = (sync_result.stdout or "").strip()
+    if output:
+        for line in output.splitlines():
+            line_clean = line.strip()
+            if line_clean:
+                log(f"[repo-sync] {line_clean}")
+    if sync_result.returncode != 0:
+        log(f"[repo-sync] warning: sync command exited with {sync_result.returncode}; continuing with current remote code.")
 
 
 def cfg_from_args(args: argparse.Namespace) -> SSHConfig:
@@ -534,11 +664,83 @@ def _run_one_job(
         heartbeat_sec=30,
     )
 
-    local_job_dir = Path(args.download_dir).expanduser().resolve() / job_name
+    download_root = Path(args.download_dir).expanduser().resolve()
+    download_into_job_subdir = bool(getattr(args, "download_into_job_subdir", False))
+    local_job_dir = download_root / job_name if download_into_job_subdir else download_root
     if not args.skip_download:
         local_job_dir.mkdir(parents=True, exist_ok=True)
         log(f"{log_prefix}Downloading outputs to: {local_job_dir}")
         rsync_from_remote(cfg, f"{remote_job_output_dir}/", f"{local_job_dir}/")
+        status_path = local_job_dir / "job_status.json"
+        status_alias_path = local_job_dir / f"{job_name}_job_status.json"
+        if status_path.is_file() and status_alias_path != status_path:
+            try:
+                status_alias_path.write_text(status_path.read_text(encoding="utf-8"), encoding="utf-8")
+                if not download_into_job_subdir:
+                    status_path.unlink(missing_ok=True)
+                    status_path = status_alias_path
+            except Exception as status_copy_exc:
+                log(f"{log_prefix}Warning: could not materialize per-job status alias: {status_copy_exc}")
+        if status_path.is_file():
+            try:
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+            except Exception as status_exc:
+                log(f"{log_prefix}Warning: could not parse job_status.json for VRAM summary: {status_exc}")
+            else:
+                if isinstance(payload, dict):
+                    logged_gpu_stats = False
+                    gpu_memory_smi = payload.get("gpu_memory_nvidia_smi", {})
+                    if isinstance(gpu_memory_smi, dict) and int(gpu_memory_smi.get("device_count", 0) or 0) > 0:
+                        peak_used = float(gpu_memory_smi.get("peak_used_mib_all_devices", 0.0) or 0.0)
+                        peak_used_pct = float(gpu_memory_smi.get("peak_used_pct_total_all_devices", 0.0) or 0.0)
+                        sample_count = int(gpu_memory_smi.get("sample_count", 0) or 0)
+                        sample_interval = float(gpu_memory_smi.get("sample_interval_sec", 0.0) or 0.0)
+                        device_count = int(gpu_memory_smi.get("device_count", 0) or 0)
+                        log(
+                            f"{log_prefix}GPU peak VRAM (nvidia-smi) | used={peak_used:.1f} MiB ({peak_used_pct:.2f}%), "
+                            f"devices={device_count}, samples={sample_count}, dt={sample_interval:.2f}s"
+                        )
+                        logged_gpu_stats = True
+                        per_device_smi = gpu_memory_smi.get("per_device", [])
+                        if isinstance(per_device_smi, list):
+                            for device_entry in per_device_smi:
+                                if not isinstance(device_entry, dict):
+                                    continue
+                                log(
+                                    f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (nvidia-smi) | "
+                                    f"used={float(device_entry.get('peak_used_mib', 0.0) or 0.0):.1f} MiB, "
+                                    f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
+                                    f"util_peak={float(device_entry.get('peak_util_gpu_pct', 0.0) or 0.0):.1f}%, "
+                                    f"name={str(device_entry.get('name', ''))}"
+                                )
+
+                    gpu_memory = payload.get("gpu_memory", {})
+                    if isinstance(gpu_memory, dict):
+                        peak_alloc = float(gpu_memory.get("peak_alloc_mib_all_devices", 0.0) or 0.0)
+                        peak_reserved = float(gpu_memory.get("peak_reserved_mib_all_devices", 0.0) or 0.0)
+                        peak_alloc_pct = float(gpu_memory.get("peak_alloc_pct_total_all_devices", 0.0) or 0.0)
+                        peak_reserved_pct = float(gpu_memory.get("peak_reserved_pct_total_all_devices", 0.0) or 0.0)
+                        device_count = int(gpu_memory.get("device_count", 0) or 0)
+                        if device_count > 0:
+                            log(
+                                f"{log_prefix}GPU peak VRAM (torch) | alloc={peak_alloc:.1f} MiB ({peak_alloc_pct:.2f}%), "
+                                f"reserved={peak_reserved:.1f} MiB ({peak_reserved_pct:.2f}%), devices={device_count}"
+                            )
+                            logged_gpu_stats = True
+                            per_device = gpu_memory.get("per_device", [])
+                            if isinstance(per_device, list):
+                                for device_entry in per_device:
+                                    if not isinstance(device_entry, dict):
+                                        continue
+                                    log(
+                                        f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (torch) | "
+                                        f"alloc={float(device_entry.get('peak_alloc_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"reserved={float(device_entry.get('peak_reserved_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"name={str(device_entry.get('name', ''))}"
+                                    )
+                    if not logged_gpu_stats:
+                        log(f"{log_prefix}GPU peak VRAM stats were not present in job status JSON.")
 
     if not args.keep_remote_input:
         ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False)
@@ -562,6 +764,7 @@ def cmd_run_job(args: argparse.Namespace) -> int:
         timeout_sec=args.ssh_ready_timeout_sec,
         poll_sec=args.ssh_ready_poll_sec,
     )
+    maybe_sync_remote_repo(cfg, args)
     local_input = Path(args.local_input).expanduser().resolve()
     return _run_one_job(cfg, args, local_input, explicit_job_name=args.job_name)
 
@@ -596,6 +799,7 @@ def cmd_run_batch(args: argparse.Namespace) -> int:
         timeout_sec=args.ssh_ready_timeout_sec,
         poll_sec=args.ssh_ready_poll_sec,
     )
+    maybe_sync_remote_repo(cfg, args)
     input_dir = Path(args.input_dir).expanduser().resolve()
     if not input_dir.exists():
         raise CloudCtlError(f"Input dir does not exist: {input_dir}")
@@ -677,6 +881,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_job.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
     p_job.add_argument("--remote-output-subdir", default="cloud_jobs/output")
     p_job.add_argument("--download-dir", default="./cloud_downloads")
+    p_job.add_argument(
+        "--download-into-job-subdir",
+        action="store_true",
+        help="Store downloads under <download-dir>/<job-name>/ instead of directly in <download-dir>.",
+    )
     p_job.add_argument("--skip-download", action="store_true")
     p_job.add_argument("--keep-remote-input", action="store_true")
     p_job.add_argument("--keep-remote-output", action="store_true")
@@ -694,6 +903,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
     p_batch.add_argument("--remote-output-subdir", default="cloud_jobs/output")
     p_batch.add_argument("--download-dir", default="./cloud_downloads")
+    p_batch.add_argument(
+        "--download-into-job-subdir",
+        action="store_true",
+        help="Store each job under <download-dir>/<job-name>/ instead of directly in <download-dir>.",
+    )
     p_batch.add_argument("--skip-download", action="store_true")
     p_batch.add_argument("--keep-remote-input", action="store_true")
     p_batch.add_argument("--keep-remote-output", action="store_true")

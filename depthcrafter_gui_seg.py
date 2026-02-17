@@ -1,4 +1,5 @@
 import threading
+import codecs
 import gc
 import os
 import sys
@@ -1421,6 +1422,86 @@ class DepthCrafterGUI:
             _logger.exception(f"  Exception during job for {original_basename} ({log_msg_prefix_local}): {e}")
             self.status_message_var.set(f"Error: {e.__class__.__name__} during {original_basename}")
         return job_successful, returned_job_specific_metadata
+
+    def _reset_gpu_peak_tracking_for_clip(self, clip_label: str) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            device_count = int(torch.cuda.device_count())
+        except Exception:
+            return False
+        if device_count <= 0:
+            return False
+
+        reset_count = 0
+        for idx in range(device_count):
+            try:
+                torch.cuda.reset_peak_memory_stats(idx)
+                reset_count += 1
+            except Exception:
+                continue
+
+        if reset_count <= 0:
+            return False
+
+        _logger.info(f"{clip_label}: GPU peak VRAM tracking reset for {reset_count} CUDA device(s).")
+        return True
+
+    def _log_gpu_peak_tracking_summary_for_clip(self, clip_label: str):
+        if not torch.cuda.is_available():
+            return
+        try:
+            device_count = int(torch.cuda.device_count())
+        except Exception:
+            return
+        if device_count <= 0:
+            return
+
+        max_peak_alloc_mib = 0.0
+        max_peak_reserved_mib = 0.0
+        for idx in range(device_count):
+            try:
+                peak_alloc_mib = float(torch.cuda.max_memory_allocated(idx)) / (1024.0 ** 2)
+            except Exception:
+                peak_alloc_mib = 0.0
+            try:
+                peak_reserved_mib = float(torch.cuda.max_memory_reserved(idx)) / (1024.0 ** 2)
+            except Exception:
+                peak_reserved_mib = 0.0
+
+            max_peak_alloc_mib = max(max_peak_alloc_mib, peak_alloc_mib)
+            max_peak_reserved_mib = max(max_peak_reserved_mib, peak_reserved_mib)
+
+        _logger.info(
+            f"{clip_label}: GPU peak VRAM summary | alloc_max={max_peak_alloc_mib:.1f} MiB, "
+            f"reserved_max={max_peak_reserved_mib:.1f} MiB, devices={device_count}"
+        )
+
+        for idx in range(device_count):
+            try:
+                device_name = str(torch.cuda.get_device_name(idx))
+            except Exception:
+                device_name = f"cuda:{idx}"
+            try:
+                total_mib = float(torch.cuda.get_device_properties(idx).total_memory) / (1024.0 ** 2)
+            except Exception:
+                total_mib = 0.0
+            try:
+                peak_alloc_mib = float(torch.cuda.max_memory_allocated(idx)) / (1024.0 ** 2)
+            except Exception:
+                peak_alloc_mib = 0.0
+            try:
+                peak_reserved_mib = float(torch.cuda.max_memory_reserved(idx)) / (1024.0 ** 2)
+            except Exception:
+                peak_reserved_mib = 0.0
+
+            alloc_pct = (peak_alloc_mib / total_mib * 100.0) if total_mib > 0.0 else 0.0
+            reserved_pct = (peak_reserved_mib / total_mib * 100.0) if total_mib > 0.0 else 0.0
+            _logger.info(
+                f"{clip_label}: GPU{idx} peak | alloc={peak_alloc_mib:.1f} MiB ({alloc_pct:.2f}%), "
+                f"reserved={peak_reserved_mib:.1f} MiB ({reserved_pct:.2f}%), total={total_mib:.1f} MiB, "
+                f"name={device_name}"
+            )
 
     def _recolor_tk_widgets(self, parent, bg_color, fg_color, entry_bg):
         """Recursively recolors raw tk widgets within a parent container."""
@@ -2859,6 +2940,7 @@ class DepthCrafterGUI:
             current_video_path = source_spec["path"] 
             original_basename = source_spec["basename"]
             current_gui_mode = source_spec["type"] 
+            clip_gpu_tracking_enabled = self._reset_gpu_peak_tracking_for_clip(original_basename)
             
             gui_fps_setting = self.target_fps.get()
             gui_len_setting = self.process_length.get()
@@ -2886,6 +2968,8 @@ class DepthCrafterGUI:
                     _logger.exception(f"Hi-Res Spatial Refine exception for {original_basename}: {e_refine}")
                     self.status_message_var.set(f"Hi-Res Refine Error: {e_refine.__class__.__name__} for {original_basename}")
 
+                if clip_gpu_tracking_enabled:
+                    self._log_gpu_peak_tracking_summary_for_clip(original_basename)
                 total_sources_processed += 1
                 self.message_queue.put(("progress", total_sources_processed))
                 continue
@@ -2907,6 +2991,8 @@ class DepthCrafterGUI:
                     _logger.exception(f"Edge-Guided Hi-Res Upscale exception for {original_basename}: {e_edge}")
                     self.status_message_var.set(f"Edge Upscale Error: {e_edge.__class__.__name__} for {original_basename}")
 
+                if clip_gpu_tracking_enabled:
+                    self._log_gpu_peak_tracking_summary_for_clip(original_basename)
                 total_sources_processed += 1
                 self.message_queue.put(("progress", total_sources_processed))
                 continue
@@ -3100,6 +3186,9 @@ class DepthCrafterGUI:
                     self._finalize_video_processing(current_video_path, original_basename, master_meta_for_this_vid)
                 else:
                     _logger.info(f"Skipping finalization of {original_basename} due to user cancellation.")
+
+            if clip_gpu_tracking_enabled:
+                self._log_gpu_peak_tracking_summary_for_clip(original_basename)
 
             # F. Update Main Progress Bar (1 unit per source file/folder)
             total_sources_processed += 1
@@ -5072,10 +5161,109 @@ class DepthCrafterGUI:
         except Exception as tcp_exc:
             return False, str(tcp_exc)
 
+    def _resolve_cloud_identity_path(self) -> str:
+        candidate = self.cloud_identity_file_var.get().strip()
+        if not candidate:
+            return ""
+        return os.path.expanduser(candidate)
+
+    def _is_cloud_ssh_auth_ready(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        identity_path: str,
+        timeout_sec: float = 5.0,
+    ) -> Tuple[bool, str]:
+        host_str = str(host or "").strip()
+        user_str = str(user or "").strip()
+        identity_str = str(identity_path or "").strip()
+        try:
+            port_int = int(port)
+        except Exception:
+            port_int = 0
+        if not host_str or port_int <= 0 or not user_str:
+            return False, "missing host/port/user"
+        if not identity_str:
+            return False, "missing identity path"
+        if not os.path.isfile(identity_str):
+            return False, f"identity file not found: {identity_str}"
+
+        cmd = [
+            "ssh",
+            "-p",
+            str(port_int),
+            "-i",
+            identity_str,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={max(1, int(timeout_sec))}",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            f"{user_str}@{host_str}",
+            "echo gui_cloud_auth_ready",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except Exception as auth_exc:
+            return False, str(auth_exc)
+
+        output = (result.stdout or "").strip()
+        if result.returncode == 0:
+            return True, ""
+        if output:
+            return False, output.splitlines()[-1].strip()
+        return False, f"ssh exit {result.returncode}"
+
+    def _attach_cloud_identity_to_instance(self, instance_id: int, identity_pub_path: str) -> bool:
+        pub_path = str(identity_pub_path or "").strip()
+        if instance_id <= 0:
+            return False
+        if not pub_path or not os.path.isfile(pub_path):
+            _logger.warning(f"[CLOUD] SSH public key not found for attach: {pub_path}")
+            return False
+
+        try:
+            with open(pub_path, "r", encoding="utf-8") as f:
+                public_key_text = f.read().strip()
+        except Exception as read_exc:
+            _logger.warning(f"[CLOUD] Failed reading SSH public key '{pub_path}': {read_exc}")
+            return False
+        if not public_key_text:
+            _logger.warning(f"[CLOUD] SSH public key file is empty: {pub_path}")
+            return False
+
+        attach_cmd = self._build_vast_cli_cmd(["attach", "ssh", str(instance_id), public_key_text, "--raw"])
+        attach_rc, attach_lines = self._run_external_command_with_logging(
+            attach_cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        if attach_rc == 0:
+            _logger.info(f"[CLOUD] Attached SSH key '{pub_path}' to instance {instance_id}.")
+            return True
+
+        attach_tail = (attach_lines[-1].strip() if attach_lines else f"exit code {attach_rc}")
+        _logger.warning(
+            f"[CLOUD] Failed to attach SSH key '{pub_path}' to instance {instance_id}: {attach_tail}"
+        )
+        return False
+
     def _wait_for_cloud_instance_ready(self, instance_id: int, timeout_sec: int = 900, poll_sec: int = 8) -> Dict[str, object]:
         deadline = time.time() + max(15, int(timeout_sec))
         last_status = ""
         last_probe_error = ""
+        last_auth_error = ""
+        attach_attempted = False
+        identity_path = self._resolve_cloud_identity_path()
+        identity_pub_path = f"{identity_path}.pub" if identity_path else ""
+        remote_user = self.cloud_remote_user_var.get().strip() or "root"
         while time.time() < deadline:
             if self.stop_event.is_set():
                 raise RuntimeError("Cancelled while waiting for cloud instance readiness.")
@@ -5099,8 +5287,23 @@ class DepthCrafterGUI:
                     _, ssh_host, ssh_port = self._parse_ssh_url_text("\n".join(ssh_lines))
 
             if ssh_host and ssh_port > 0:
-                tcp_ready, probe_error = self._is_cloud_tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
-                if tcp_ready:
+                auth_ready = False
+                auth_error = ""
+                if identity_path:
+                    auth_ready, auth_error = self._is_cloud_ssh_auth_ready(
+                        host=ssh_host,
+                        port=ssh_port,
+                        user=remote_user,
+                        identity_path=identity_path,
+                        timeout_sec=5.0,
+                    )
+                else:
+                    # Backward-compat fallback when no identity file is configured.
+                    tcp_ready, probe_error = self._is_cloud_tcp_endpoint_ready(ssh_host, ssh_port, timeout_sec=3.0)
+                    auth_ready = bool(tcp_ready)
+                    auth_error = probe_error if not tcp_ready else ""
+
+                if auth_ready:
                     row_offer_id = 0
                     row_machine_id = 0
                     row_host_id = 0
@@ -5128,13 +5331,27 @@ class DepthCrafterGUI:
                         "remote_root": self.cloud_remote_root_var.get().strip() or "/opt/StereoCrafter",
                         "remote_venv": self.cloud_remote_venv_var.get().strip() or "/opt/venv",
                     }
-                if probe_error and probe_error != last_probe_error:
-                    _logger.info(
-                        f"[CLOUD] Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
-                        f"but it is not accepting connections yet: {probe_error}"
-                    )
-                    self.message_queue.put(("status", f"Cloud instance {instance_id}: waiting for SSH service..."))
-                    last_probe_error = probe_error
+                if identity_path and not attach_attempted and identity_pub_path and os.path.isfile(identity_pub_path):
+                    attach_attempted = True
+                    self.message_queue.put(("status", f"Cloud instance {instance_id}: attaching SSH key..."))
+                    self._attach_cloud_identity_to_instance(instance_id, identity_pub_path)
+
+                if auth_error:
+                    if identity_path:
+                        if auth_error != last_auth_error:
+                            _logger.info(
+                                f"[CLOUD] Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
+                                f"but auth is not ready yet: {auth_error}"
+                            )
+                            self.message_queue.put(("status", f"Cloud instance {instance_id}: waiting for SSH auth..."))
+                            last_auth_error = auth_error
+                    elif auth_error != last_probe_error:
+                        _logger.info(
+                            f"[CLOUD] Instance {instance_id} has SSH endpoint {ssh_host}:{ssh_port} "
+                            f"but it is not accepting connections yet: {auth_error}"
+                        )
+                        self.message_queue.put(("status", f"Cloud instance {instance_id}: waiting for SSH service..."))
+                        last_probe_error = auth_error
             time.sleep(max(1, int(poll_sec)))
 
         raise RuntimeError(f"Timed out waiting for cloud instance {instance_id} readiness.")
@@ -5255,11 +5472,62 @@ class DepthCrafterGUI:
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            bufsize=0,
         )
         self.active_external_process = process
         terminate_requested = False
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        line_buffer = ""
+        latest_progress_text = ""
+        progress_last_emit_ts = 0.0
+        progress_emit_interval_sec = 1.0
+        progress_updates_seen = 0
+        progress_updates_emitted = 0
+
+        def _emit_line(text: str) -> None:
+            cleaned = text.strip()
+            if not cleaned:
+                return
+            output_lines.append(cleaned)
+            _logger.info(cleaned)
+
+        def _emit_progress(text: str, force: bool = False) -> bool:
+            nonlocal progress_last_emit_ts
+            nonlocal progress_updates_emitted
+            cleaned = text.strip()
+            if not cleaned:
+                return False
+            now = time.time()
+            if not force and (now - progress_last_emit_ts) < progress_emit_interval_sec:
+                return False
+            progress_last_emit_ts = now
+            progress_updates_emitted += 1
+            _emit_line(cleaned)
+            return True
+
+        def _consume_text(decoded_text: str) -> None:
+            nonlocal line_buffer
+            nonlocal latest_progress_text
+            nonlocal progress_updates_seen
+            for ch in decoded_text:
+                if ch == "\r":
+                    candidate = line_buffer
+                    line_buffer = ""
+                    if candidate.strip():
+                        latest_progress_text = candidate
+                        progress_updates_seen += 1
+                        _emit_progress(latest_progress_text, force=False)
+                    continue
+                if ch == "\n":
+                    if line_buffer.strip():
+                        _emit_line(line_buffer)
+                    elif latest_progress_text.strip():
+                        _emit_progress(latest_progress_text, force=True)
+                    line_buffer = ""
+                    latest_progress_text = ""
+                    continue
+                line_buffer += ch
+
         try:
             if process.stdout is not None:
                 stdout_fd = process.stdout.fileno()
@@ -5274,20 +5542,31 @@ class DepthCrafterGUI:
 
                     ready, _, _ = select.select([stdout_fd], [], [], 0.25)
                     if ready:
-                        line = process.stdout.readline()
-                        if line:
-                            stripped = line.rstrip("\n")
-                            output_lines.append(stripped)
-                            _logger.info(stripped)
+                        chunk = os.read(stdout_fd, 4096)
+                        if chunk:
+                            _consume_text(decoder.decode(chunk))
+                        else:
+                            break
+
+                    now = time.time()
+                    if latest_progress_text.strip() and (now - progress_last_emit_ts) >= progress_emit_interval_sec:
+                        _emit_progress(latest_progress_text, force=True)
 
                     if process.poll() is not None:
-                        remaining = process.stdout.read() or ""
+                        remaining = process.stdout.read() or b""
                         if remaining:
-                            for tail_line in remaining.splitlines():
-                                output_lines.append(tail_line)
-                                _logger.info(tail_line)
+                            _consume_text(decoder.decode(remaining))
                         break
+
+                _consume_text(decoder.decode(b"", final=True))
+                if line_buffer.strip():
+                    _emit_line(line_buffer)
+                elif latest_progress_text.strip():
+                    _emit_progress(latest_progress_text, force=True)
             returncode = process.wait()
+            suppressed = progress_updates_seen - progress_updates_emitted
+            if suppressed > 0:
+                _logger.info(f"[CLOUD] (suppressed {suppressed} carriage-return progress updates)")
             return returncode, output_lines
         finally:
             self.active_external_process = None
@@ -5485,17 +5764,15 @@ class DepthCrafterGUI:
         cloud_overlap = int(connection_info.get("overlap", int(cloud_settings["overlap"])))
         cloud_cpu_offload = str(connection_info.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get())
         original_basename = source_spec["basename"]
-        job_name = (
-            f"{original_basename}_cloud_{source_idx + 1:03d}"
-            if total_sources > 1
-            else f"{original_basename}_cloud"
-        )
+        # Keep cloud output naming identical to local naming to avoid downstream pipeline mismatches.
+        job_name = original_basename
         cloud_output_format = str(self.merge_output_format_var.get())
         if cloud_output_format not in ("mp4", "main10_mp4"):
             cloud_output_format = "main10_mp4"
 
         cmd = [
             sys.executable,
+            "-u",
             os.path.join(repo_root, "cloud", "cloudctl.py"),
             "run-job",
             "--host",
@@ -5559,6 +5836,18 @@ class DepthCrafterGUI:
         if not isinstance(metadata, dict):
             return
         self._update_gui_info_on_job_finish(job_info_stub, metadata)
+
+    def _resolve_cloud_status_json_path(self, job_name: str) -> str:
+        output_root = self.output_dir.get()
+        candidates = [
+            os.path.join(output_root, f"{job_name}_job_status.json"),
+            os.path.join(output_root, "job_status.json"),
+            os.path.join(output_root, job_name, "job_status.json"),  # Legacy layout fallback.
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return candidates[0]
 
     def _destroy_cloud_instance(self, instance_id: int):
         if instance_id <= 0:
@@ -5731,7 +6020,7 @@ class DepthCrafterGUI:
                     if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
                         self._move_original_source(current_video_path, original_basename, "failed")
                 else:
-                    status_json_path = os.path.join(self.output_dir.get(), job_name, "job_status.json")
+                    status_json_path = self._resolve_cloud_status_json_path(job_name)
                     self._update_gui_info_from_cloud_status(job_stub, status_json_path)
                     if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
                         self._move_original_source(current_video_path, original_basename, "finished")

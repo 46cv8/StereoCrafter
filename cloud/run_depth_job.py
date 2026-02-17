@@ -11,11 +11,13 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -41,6 +43,265 @@ def _safe_json_dump(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _query_nvidia_smi_totals_mib() -> Dict[int, Dict[str, Any]]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+
+    totals: Dict[int, Dict[str, Any]] = {}
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) < 3:
+            continue
+        try:
+            idx = int(parts[0])
+            total_mib = float(parts[2])
+        except Exception:
+            continue
+        totals[idx] = {
+            "name": parts[1],
+            "total_mib": total_mib,
+        }
+    return totals
+
+
+def _query_nvidia_smi_snapshot() -> List[Dict[str, Any]]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",", 4)]
+        if len(parts) < 5:
+            continue
+        try:
+            idx = int(parts[0])
+            used_mib = float(parts[2])
+            total_mib = float(parts[3])
+            util_gpu = float(parts[4])
+        except Exception:
+            continue
+        rows.append(
+            {
+                "index": idx,
+                "name": parts[1],
+                "used_mib": used_mib,
+                "total_mib": total_mib,
+                "util_gpu_pct": util_gpu,
+            }
+        )
+    return rows
+
+
+class _NvidiaSmiPeakTracker:
+    def __init__(self, interval_sec: float = 0.5):
+        self.interval_sec = max(0.2, float(interval_sec))
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._sample_count = 0
+        self._peak_used_sum_mib = 0.0
+        self._totals_mib_sum = 0.0
+        self._per_device: Dict[int, Dict[str, Any]] = {}
+
+    def _sample_once(self) -> None:
+        rows = _query_nvidia_smi_snapshot()
+        if not rows:
+            return
+        used_sum = 0.0
+        totals_sum = 0.0
+        with self._lock:
+            self._sample_count += 1
+            for row in rows:
+                idx = int(row["index"])
+                used_mib = float(row["used_mib"])
+                total_mib = float(row["total_mib"])
+                util_gpu = float(row["util_gpu_pct"])
+                used_sum += max(0.0, used_mib)
+                totals_sum += max(0.0, total_mib)
+
+                existing = self._per_device.get(idx)
+                if existing is None:
+                    self._per_device[idx] = {
+                        "index": idx,
+                        "name": str(row["name"]),
+                        "total_mib": float(total_mib),
+                        "peak_used_mib": float(used_mib),
+                        "peak_util_gpu_pct": float(util_gpu),
+                    }
+                else:
+                    existing["name"] = str(row["name"])
+                    if total_mib > 0.0:
+                        existing["total_mib"] = float(total_mib)
+                    if used_mib > float(existing.get("peak_used_mib", 0.0) or 0.0):
+                        existing["peak_used_mib"] = float(used_mib)
+                    if util_gpu > float(existing.get("peak_util_gpu_pct", 0.0) or 0.0):
+                        existing["peak_util_gpu_pct"] = float(util_gpu)
+            if totals_sum > 0.0:
+                self._totals_mib_sum = max(self._totals_mib_sum, totals_sum)
+            self._peak_used_sum_mib = max(self._peak_used_sum_mib, used_sum)
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._sample_once()
+            self._stop_event.wait(self.interval_sec)
+
+    def start(self) -> bool:
+        # Validate nvidia-smi availability with a quick probe.
+        probe_rows = _query_nvidia_smi_snapshot()
+        if not probe_rows:
+            return False
+        self._sample_once()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop_and_summary(self) -> Dict[str, Any]:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._sample_once()
+        with self._lock:
+            per_device = []
+            for idx in sorted(self._per_device.keys()):
+                item = self._per_device[idx]
+                total_mib = float(item.get("total_mib", 0.0) or 0.0)
+                peak_used_mib = float(item.get("peak_used_mib", 0.0) or 0.0)
+                used_pct = (peak_used_mib / total_mib * 100.0) if total_mib > 0.0 else 0.0
+                per_device.append(
+                    {
+                        "index": idx,
+                        "name": str(item.get("name", f"cuda:{idx}")),
+                        "total_mib": round(total_mib, 3),
+                        "peak_used_mib": round(peak_used_mib, 3),
+                        "peak_used_pct_total": round(used_pct, 3),
+                        "peak_util_gpu_pct": round(float(item.get("peak_util_gpu_pct", 0.0) or 0.0), 3),
+                    }
+                )
+            totals_sum = float(self._totals_mib_sum)
+            peak_used_sum = float(self._peak_used_sum_mib)
+            peak_used_pct_total = (peak_used_sum / totals_sum * 100.0) if totals_sum > 0.0 else 0.0
+            return {
+                "device_count": int(len(per_device)),
+                "sample_count": int(self._sample_count),
+                "sample_interval_sec": round(float(self.interval_sec), 3),
+                "per_device": per_device,
+                "peak_used_mib_all_devices": round(peak_used_sum, 3),
+                "total_mib_all_devices": round(totals_sum, 3),
+                "peak_used_pct_total_all_devices": round(peak_used_pct_total, 3),
+            }
+
+
+def _compute_gpu_memory_stats(torch_module: Any, gpu_totals_mib: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    if torch_module is None:
+        return {}
+    if not getattr(torch_module, "cuda", None):
+        return {}
+    if not torch_module.cuda.is_available():
+        return {}
+
+    device_count = int(torch_module.cuda.device_count())
+    per_device: List[Dict[str, Any]] = []
+    peak_alloc_all = 0.0
+    peak_reserved_all = 0.0
+    total_all = 0.0
+
+    for idx in range(device_count):
+        try:
+            name_default = str(torch_module.cuda.get_device_name(idx))
+        except Exception:
+            name_default = f"cuda:{idx}"
+        totals_entry = gpu_totals_mib.get(idx, {})
+        total_mib = float(totals_entry.get("total_mib", 0.0) or 0.0)
+        name = str(totals_entry.get("name", name_default) or name_default)
+
+        try:
+            peak_alloc_mib = float(torch_module.cuda.max_memory_allocated(idx)) / (1024.0 ** 2)
+        except Exception:
+            peak_alloc_mib = 0.0
+        try:
+            peak_reserved_mib = float(torch_module.cuda.max_memory_reserved(idx)) / (1024.0 ** 2)
+        except Exception:
+            peak_reserved_mib = 0.0
+        try:
+            current_alloc_mib = float(torch_module.cuda.memory_allocated(idx)) / (1024.0 ** 2)
+        except Exception:
+            current_alloc_mib = 0.0
+        try:
+            current_reserved_mib = float(torch_module.cuda.memory_reserved(idx)) / (1024.0 ** 2)
+        except Exception:
+            current_reserved_mib = 0.0
+
+        peak_alloc_all = max(peak_alloc_all, peak_alloc_mib)
+        peak_reserved_all = max(peak_reserved_all, peak_reserved_mib)
+        if total_mib > 0.0:
+            total_all += total_mib
+
+        alloc_pct = (peak_alloc_mib / total_mib * 100.0) if total_mib > 0.0 else 0.0
+        reserved_pct = (peak_reserved_mib / total_mib * 100.0) if total_mib > 0.0 else 0.0
+        per_device.append(
+            {
+                "index": idx,
+                "name": name,
+                "total_mib": round(total_mib, 3),
+                "peak_alloc_mib": round(peak_alloc_mib, 3),
+                "peak_reserved_mib": round(peak_reserved_mib, 3),
+                "peak_alloc_pct_total": round(alloc_pct, 3),
+                "peak_reserved_pct_total": round(reserved_pct, 3),
+                "current_alloc_mib": round(current_alloc_mib, 3),
+                "current_reserved_mib": round(current_reserved_mib, 3),
+            }
+        )
+
+    return {
+        "device_count": device_count,
+        "per_device": per_device,
+        "peak_alloc_mib_all_devices": round(peak_alloc_all, 3),
+        "peak_reserved_mib_all_devices": round(peak_reserved_all, 3),
+        "total_mib_all_devices": round(total_all, 3),
+        "peak_alloc_pct_total_all_devices": round((peak_alloc_all / total_all * 100.0), 3) if total_all > 0.0 else 0.0,
+        "peak_reserved_pct_total_all_devices": round((peak_reserved_all / total_all * 100.0), 3)
+        if total_all > 0.0
+        else 0.0,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,10 +405,14 @@ def main() -> int:
             "pretrain_path": args.pretrain_path,
         },
     }
+    torch_module = None
+    gpu_totals_mib: Dict[int, Dict[str, Any]] = {}
+    nvidia_peak_tracker: _NvidiaSmiPeakTracker | None = None
 
     try:
         _validate_runtime_args(args)
         from depthcrafter.depthcrafter_logic import DepthCrafterDemo
+        import torch as torch_module
 
         target_w = _coerce_multiple_of_8(int(args.target_width), "target width")
         target_h = _coerce_multiple_of_8(int(args.target_height), "target height")
@@ -170,6 +435,21 @@ def main() -> int:
             local_files_only=bool(args.local_files_only),
             disable_xformers=bool(args.disable_xformers),
         )
+
+        if torch_module.cuda.is_available():
+            gpu_totals_mib = _query_nvidia_smi_totals_mib()
+            device_count = int(torch_module.cuda.device_count())
+            for idx in range(device_count):
+                try:
+                    torch_module.cuda.reset_peak_memory_stats(idx)
+                except Exception:
+                    continue
+            logger.info("GPU peak VRAM tracking enabled for %d CUDA device(s).", device_count)
+        nvidia_peak_tracker = _NvidiaSmiPeakTracker(interval_sec=0.5)
+        if nvidia_peak_tracker.start():
+            logger.info("nvidia-smi peak VRAM sampling enabled (interval=%.2fs).", nvidia_peak_tracker.interval_sec)
+        else:
+            nvidia_peak_tracker = None
 
         if args.prewarm_only:
             status["status"] = "success"
@@ -233,6 +513,58 @@ def main() -> int:
         status["traceback"] = traceback.format_exc()
         logging.getLogger("cloud.run_depth_job").exception("Depth job failed: %s", exc)
     finally:
+        nvidia_smi_stats: Dict[str, Any] = {}
+        if nvidia_peak_tracker is not None:
+            try:
+                nvidia_smi_stats = nvidia_peak_tracker.stop_and_summary()
+            except Exception:
+                nvidia_smi_stats = {}
+        if nvidia_smi_stats and int(nvidia_smi_stats.get("device_count", 0) or 0) > 0:
+            status["gpu_memory_nvidia_smi"] = nvidia_smi_stats
+            logging.getLogger("cloud.run_depth_job").info(
+                "GPU peak VRAM summary (nvidia-smi) | used=%.1f MiB (%.2f%% total), devices=%d, samples=%d",
+                float(nvidia_smi_stats.get("peak_used_mib_all_devices", 0.0) or 0.0),
+                float(nvidia_smi_stats.get("peak_used_pct_total_all_devices", 0.0) or 0.0),
+                int(nvidia_smi_stats.get("device_count", 0) or 0),
+                int(nvidia_smi_stats.get("sample_count", 0) or 0),
+            )
+            for device_entry in nvidia_smi_stats.get("per_device", []):
+                if not isinstance(device_entry, dict):
+                    continue
+                logging.getLogger("cloud.run_depth_job").info(
+                    "GPU%d peak (nvidia-smi) | used=%.1f MiB (%.2f%%), total=%.1f MiB, util_peak=%.1f%%, name=%s",
+                    int(device_entry.get("index", 0) or 0),
+                    float(device_entry.get("peak_used_mib", 0.0) or 0.0),
+                    float(device_entry.get("peak_used_pct_total", 0.0) or 0.0),
+                    float(device_entry.get("total_mib", 0.0) or 0.0),
+                    float(device_entry.get("peak_util_gpu_pct", 0.0) or 0.0),
+                    str(device_entry.get("name", "")),
+                )
+
+        gpu_memory_stats = _compute_gpu_memory_stats(torch_module, gpu_totals_mib)
+        if gpu_memory_stats:
+            status["gpu_memory"] = gpu_memory_stats
+            logging.getLogger("cloud.run_depth_job").info(
+                "GPU peak VRAM summary | alloc=%.1f MiB (%.2f%% total), reserved=%.1f MiB (%.2f%% total), devices=%d",
+                float(gpu_memory_stats.get("peak_alloc_mib_all_devices", 0.0) or 0.0),
+                float(gpu_memory_stats.get("peak_alloc_pct_total_all_devices", 0.0) or 0.0),
+                float(gpu_memory_stats.get("peak_reserved_mib_all_devices", 0.0) or 0.0),
+                float(gpu_memory_stats.get("peak_reserved_pct_total_all_devices", 0.0) or 0.0),
+                int(gpu_memory_stats.get("device_count", 0) or 0),
+            )
+            for device_entry in gpu_memory_stats.get("per_device", []):
+                if not isinstance(device_entry, dict):
+                    continue
+                logging.getLogger("cloud.run_depth_job").info(
+                    "GPU%d peak | alloc=%.1f MiB (%.2f%%), reserved=%.1f MiB (%.2f%%), total=%.1f MiB, name=%s",
+                    int(device_entry.get("index", 0) or 0),
+                    float(device_entry.get("peak_alloc_mib", 0.0) or 0.0),
+                    float(device_entry.get("peak_alloc_pct_total", 0.0) or 0.0),
+                    float(device_entry.get("peak_reserved_mib", 0.0) or 0.0),
+                    float(device_entry.get("peak_reserved_pct_total", 0.0) or 0.0),
+                    float(device_entry.get("total_mib", 0.0) or 0.0),
+                    str(device_entry.get("name", "")),
+                )
         end_ts = time.time()
         status["end_time_unix"] = end_ts
         status["end_time_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ts))
