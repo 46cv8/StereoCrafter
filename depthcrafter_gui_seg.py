@@ -46,6 +46,7 @@ from depthcrafter.utils import (
     save_depth_visual_as_png_sequence_util,
     save_depth_visual_as_exr_sequence_util,
     save_depth_visual_as_single_exr_util,
+    get_video_stream_info,
 )
 
 try:
@@ -188,6 +189,18 @@ class DepthCrafterGUI:
             "target_height": 1040,
             "window_size": 75,
             "overlap": 25,
+        },
+        "nvidia_48gb_single": {
+            "label": "Any NVIDIA 48GB+ (Input Res)",
+            # Empty filter means "all offers", then CUDA/VRAM guards select NVIDIA-capable cards.
+            "offer_gpu_filter": "",
+            "min_gpu_ram_gb": 48.0,
+            "target_width": 1920,
+            "target_height": 1040,
+            "window_size": 75,
+            "overlap": 25,
+            # When no explicit cloud override is set, use each source clip's native resolution.
+            "use_source_resolution": True,
         },
     }
 
@@ -3571,6 +3584,7 @@ class DepthCrafterGUI:
 
     def _get_effective_cloud_processing_settings(self) -> Dict[str, object]:
         profile_defaults = self._get_cloud_profile_defaults()
+        use_source_resolution = bool(profile_defaults.get("use_source_resolution", False))
         width_override = max(0, self._safe_int_from_tk_var(self.cloud_target_width_override_var, 0))
         height_override = max(0, self._safe_int_from_tk_var(self.cloud_target_height_override_var, 0))
         window_override = self._safe_int_from_tk_var(self.cloud_window_size_override_var, 0)
@@ -3584,11 +3598,12 @@ class DepthCrafterGUI:
         effective_window = window_override if window_override > 0 else base_window
         effective_overlap = overlap_override if overlap_override >= 0 else base_overlap
 
-        target_source = (
-            "cloud override"
-            if width_override > 0 or height_override > 0
-            else f"profile default ({profile_defaults['key']})"
-        )
+        if width_override > 0 or height_override > 0:
+            target_source = "cloud override"
+        elif use_source_resolution:
+            target_source = "source clip resolution (auto per file)"
+        else:
+            target_source = f"profile default ({profile_defaults['key']})"
         window_source = "cloud override" if window_override > 0 else "main window"
         overlap_source = "cloud override" if overlap_override >= 0 else "main window"
 
@@ -3599,6 +3614,7 @@ class DepthCrafterGUI:
             "profile_target_height": int(profile_defaults["target_height"]),
             "profile_window_size": int(profile_defaults["window_size"]),
             "profile_overlap": int(profile_defaults["overlap"]),
+            "use_source_resolution": bool(use_source_resolution),
             "target_width_override": width_override,
             "target_height_override": height_override,
             "window_size_override": window_override,
@@ -3617,31 +3633,50 @@ class DepthCrafterGUI:
     def _refresh_cloud_processing_summary(self):
         settings = self._get_effective_cloud_processing_settings()
         require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
-        self.cloud_profile_default_summary_var.set(
-            (
-                f"{settings['profile_label']} defaults: "
-                f"{settings['profile_target_width']}x{settings['profile_target_height']}, "
-                f"window={settings['profile_window_size']}, overlap={settings['profile_overlap']}"
+        if bool(settings.get("use_source_resolution", False)) and int(settings.get("target_width_override", 0)) <= 0 and int(settings.get("target_height_override", 0)) <= 0:
+            self.cloud_profile_default_summary_var.set(
+                (
+                    f"{settings['profile_label']} defaults: source clip resolution (auto), "
+                    f"window={settings['profile_window_size']}, overlap={settings['profile_overlap']}"
+                )
             )
-        )
-        self.cloud_effective_processing_summary_var.set(
-            (
-                f"Effective cloud run: {settings['target_width']}x{settings['target_height']} "
-                f"({settings['target_source']}), window={settings['window_size']} "
-                f"({settings['window_source']}), overlap={settings['overlap']} "
-                f"({settings['overlap_source']})."
+            self.cloud_effective_processing_summary_var.set(
+                (
+                    f"Effective cloud run: source clip resolution (auto per file), "
+                    f"window={settings['window_size']} ({settings['window_source']}), "
+                    f"overlap={settings['overlap']} ({settings['overlap_source']})."
+                )
             )
-        )
+        else:
+            self.cloud_profile_default_summary_var.set(
+                (
+                    f"{settings['profile_label']} defaults: "
+                    f"{settings['profile_target_width']}x{settings['profile_target_height']}, "
+                    f"window={settings['profile_window_size']}, overlap={settings['profile_overlap']}"
+                )
+            )
+            self.cloud_effective_processing_summary_var.set(
+                (
+                    f"Effective cloud run: {settings['target_width']}x{settings['target_height']} "
+                    f"({settings['target_source']}), window={settings['window_size']} "
+                    f"({settings['window_source']}), overlap={settings['overlap']} "
+                    f"({settings['overlap_source']})."
+                )
+            )
         self.cloud_inherited_processing_summary_var.set(
             (
                 f"Main dialog currently: window={settings['base_window']}, overlap={settings['base_overlap']}. "
                 "Advanced cloud overrides replace these only when set."
             )
         )
+        if bool(settings.get("use_source_resolution", False)) and int(settings.get("target_width_override", 0)) <= 0 and int(settings.get("target_height_override", 0)) <= 0:
+            target_hint = "source clip resolution (auto)"
+        else:
+            target_hint = f"{settings['target_width']}x{settings['target_height']}"
         self.cloud_secondary_summary_var.set(
             (
                 "  ↳ Launches a Vast worker, uploads clip(s), runs remote depth, downloads outputs. "
-                f"Cloud target: {settings['target_width']}x{settings['target_height']}. "
+                f"Cloud target: {target_hint}. "
                 f"Verified hosts: {'required' if require_verified_hosts else 'optional'}."
             )
         )
@@ -4109,7 +4144,7 @@ class DepthCrafterGUI:
             ttk.Combobox(
                 outer,
                 textvariable=self.cloud_profile_var,
-                values=["5090_32gb", "rtx_pro_6000_96gb"],
+                values=["5090_32gb", "rtx_pro_6000_96gb", "nvidia_48gb_single"],
                 width=30,
                 state="readonly",
             )
@@ -4825,7 +4860,7 @@ class DepthCrafterGUI:
 
     def _build_cloud_offer_search_query(self, profile_key: str) -> Tuple[str, Dict[str, object]]:
         profile_defaults = self._get_cloud_profile_defaults(profile_key)
-        offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "gpu_name=RTX_5090"))
+        offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "")).strip()
         require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
         min_reliability = 0.97
         min_cuda = 12.8
@@ -4836,7 +4871,6 @@ class DepthCrafterGUI:
         max_dph = max(0.0, self._safe_float_from_tk_var(self.cloud_max_dph_var, 0.0))
 
         query_parts = [
-            offer_gpu_filter,
             "rentable=true",
             "num_gpus=1",
             f"cuda_vers>={min_cuda}",
@@ -4846,6 +4880,8 @@ class DepthCrafterGUI:
             f"inet_down>={min_inet_down}",
             f"inet_up>={min_inet_up}",
         ]
+        if offer_gpu_filter:
+            query_parts.insert(0, offer_gpu_filter)
         if require_verified_hosts:
             query_parts.append("verified=true")
         if max_dph > 0.0:
@@ -5748,6 +5784,37 @@ class DepthCrafterGUI:
         self._cache_cloud_instance_connection(connection, self.cloud_profile_var.get().strip())
         return connection
 
+    def _detect_source_video_resolution_for_cloud(self, source_path: str) -> Tuple[int, int]:
+        path = str(source_path or "").strip()
+        if not path:
+            return 0, 0
+        if not os.path.isfile(path):
+            return 0, 0
+        try:
+            stream_info_result = get_video_stream_info(path)
+        except Exception as meta_exc:
+            _logger.warning(f"[CLOUD] Could not probe source resolution for '{os.path.basename(path)}': {meta_exc}")
+            return 0, 0
+
+        stream_info = None
+        if isinstance(stream_info_result, tuple) and len(stream_info_result) >= 1:
+            if isinstance(stream_info_result[0], dict):
+                stream_info = stream_info_result[0]
+        elif isinstance(stream_info_result, dict):
+            stream_info = stream_info_result
+
+        if not isinstance(stream_info, dict):
+            return 0, 0
+
+        try:
+            width = int(stream_info.get("width", 0) or 0)
+            height = int(stream_info.get("height", 0) or 0)
+        except Exception:
+            return 0, 0
+        if width <= 0 or height <= 0:
+            return 0, 0
+        return width, height
+
     def _build_cloudctl_run_job_command(
         self,
         connection_info: Dict[str, object],
@@ -5764,6 +5831,26 @@ class DepthCrafterGUI:
         cloud_overlap = int(connection_info.get("overlap", int(cloud_settings["overlap"])))
         cloud_cpu_offload = str(connection_info.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get())
         original_basename = source_spec["basename"]
+
+        if (
+            bool(cloud_settings.get("use_source_resolution", False))
+            and int(cloud_settings.get("target_width_override", 0)) <= 0
+            and int(cloud_settings.get("target_height_override", 0)) <= 0
+        ):
+            src_w, src_h = self._detect_source_video_resolution_for_cloud(source_spec.get("path", ""))
+            if src_w > 0 and src_h > 0:
+                cloud_target_width = int(src_w)
+                cloud_target_height = int(src_h)
+                _logger.info(
+                    f"[CLOUD] {original_basename}: using source resolution {cloud_target_width}x{cloud_target_height} "
+                    f"for profile '{cloud_settings.get('profile_key', '')}'."
+                )
+            else:
+                _logger.warning(
+                    f"[CLOUD] {original_basename}: source resolution probe failed; falling back to "
+                    f"{cloud_target_width}x{cloud_target_height}."
+                )
+
         # Keep cloud output naming identical to local naming to avoid downstream pipeline mismatches.
         job_name = original_basename
         cloud_output_format = str(self.merge_output_format_var.get())

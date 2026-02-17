@@ -67,7 +67,7 @@ python cloud/release_vast_image.py \
 This flow avoids editing your default `config_depthcrafter.json`.
 It will:
 
-1. search offers for profile `5090_32gb` or `rtx_pro_6000_96gb`,
+1. search offers for profile `5090_32gb`, `rtx_pro_6000_96gb`, or `nvidia_48gb_single`,
 2. show candidate costs,
 3. ask approval,
 4. create one instance,
@@ -117,6 +117,7 @@ Notes:
 
 - `5090_32gb` profile defaults to `1664x896`.
 - `rtx_pro_6000_96gb` profile defaults to `1920x1040`.
+- `nvidia_48gb_single` targets any single-GPU CUDA-capable host with at least 48 GB VRAM and is intended for input-resolution cloud runs.
 - default disk is `40GB` (override with `--disk`).
 - use `--dry-run` to only rank/select offers without creating an instance.
 - The script prompts `Type GO ...` after readiness; that starts remote processing immediately.

@@ -158,6 +158,17 @@ PROFILES: Dict[str, GPUProfile] = {
         window_size=75,
         overlap=25,
     ),
+    "nvidia_48gb_single": GPUProfile(
+        key="nvidia_48gb_single",
+        label="Any NVIDIA 48GB+ (Input Res)",
+        # Empty filter intentionally means broad search; CUDA/VRAM guards do the narrowing.
+        offer_gpu_filter="",
+        min_gpu_ram_gb=48.0,
+        target_width=1920,
+        target_height=1040,
+        window_size=75,
+        overlap=25,
+    ),
 }
 
 
@@ -267,7 +278,6 @@ def with_api_key(cmd: List[str], api_key: str) -> List[str]:
 def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
     require_verified = not bool(getattr(args, "allow_unverified", False))
     parts = [
-        profile.offer_gpu_filter,
         "rentable=true",
         "num_gpus=1",
         f"cuda_vers>={args.min_cuda}",
@@ -277,6 +287,8 @@ def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
         f"inet_down>={args.min_inet_down}",
         f"inet_up>={args.min_inet_up}",
     ]
+    if profile.offer_gpu_filter.strip():
+        parts.insert(0, profile.offer_gpu_filter.strip())
     if require_verified:
         parts.append("verified=true")
     if args.max_dph > 0:
