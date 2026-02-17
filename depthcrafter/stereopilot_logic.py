@@ -223,8 +223,82 @@ class StereoPilotDemo:
             "cache_video": cache_video,
         }
 
+    def _patch_wan_attention_fallback_if_needed(self) -> None:
+        """
+        StereoPilot/Wan imports `flash_attention` directly and may assert when flash-attn
+        is missing. Patch those callsites to Wan's generic attention() fallback.
+        """
+        try:
+            from wan.modules import attention as wan_attention_mod  # pylint: disable=import-error
+            from wan.modules import model as wan_model_mod  # pylint: disable=import-error
+            import wan.modules as wan_modules_pkg  # pylint: disable=import-error
+            try:
+                from wan.modules import clip as wan_clip_mod  # pylint: disable=import-error
+            except Exception:
+                wan_clip_mod = None
+        except Exception:
+            return
+
+        flash2 = bool(getattr(wan_attention_mod, "FLASH_ATTN_2_AVAILABLE", False))
+        flash3 = bool(getattr(wan_attention_mod, "FLASH_ATTN_3_AVAILABLE", False))
+        flash_available = flash2 or flash3
+        if flash_available:
+            _logger.info("StereoPilot: flash-attn available (fa2=%s, fa3=%s).", flash2, flash3)
+            return
+
+        if bool(getattr(wan_model_mod, "_stereocrafter_safe_flash_patched", False)):
+            return
+
+        attention_fn = getattr(wan_attention_mod, "attention", None)
+        if attention_fn is None:
+            return
+
+        def _safe_flash_attention(
+            q,
+            k,
+            v,
+            q_lens=None,
+            k_lens=None,
+            dropout_p=0.0,
+            softmax_scale=None,
+            q_scale=None,
+            causal=False,
+            window_size=(-1, -1),
+            deterministic=False,
+            dtype=torch.bfloat16,
+            version=None,
+            fa_version=None,
+        ):
+            selected_fa_version = fa_version if fa_version is not None else version
+            return attention_fn(
+                q=q,
+                k=k,
+                v=v,
+                q_lens=q_lens,
+                k_lens=k_lens,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                q_scale=q_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic,
+                dtype=dtype,
+                fa_version=selected_fa_version,
+            )
+
+        wan_model_mod.flash_attention = _safe_flash_attention
+        wan_modules_pkg.flash_attention = _safe_flash_attention
+        if wan_clip_mod is not None and hasattr(wan_clip_mod, "flash_attention"):
+            wan_clip_mod.flash_attention = _safe_flash_attention
+        setattr(wan_model_mod, "_stereocrafter_safe_flash_patched", True)
+        _logger.warning(
+            "StereoPilot: flash-attn not available; using SDPA fallback. "
+            "This is slower but avoids assertion failures."
+        )
+
     def _init_stereopilot_pipeline(self) -> None:
         imports = self._import_stereopilot_modules()
+        self._patch_wan_attention_fallback_if_needed()
         dtype_map = imports["dtype_map"]
 
         if self.stereopilot_dtype not in dtype_map:
