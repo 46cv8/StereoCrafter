@@ -20,6 +20,7 @@ import select
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -454,6 +455,10 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pretrain-path", default="stabilityai/stable-video-diffusion-img2vid-xt")
 
 
+def add_queue_name_flag(parser: argparse.ArgumentParser, *, default: str = "default") -> None:
+    parser.add_argument("--queue-name", default=default, help="Queue worker name.")
+
+
 def maybe_sync_remote_repo(cfg: SSHConfig, args: argparse.Namespace) -> None:
     if not bool(getattr(args, "auto_git_sync", True)):
         log("Remote git sync disabled (--no-auto-git-sync).")
@@ -704,6 +709,425 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
     )
 
 
+def _build_remote_batch_session_cmd(args: argparse.Namespace, remote_manifest_path: str) -> str:
+    runner_args = [
+        "python",
+        "-u",
+        "cloud/run_depth_batch_session.py",
+        "--jobs-manifest",
+        remote_manifest_path,
+        "--target-width",
+        str(args.target_width),
+        "--target-height",
+        str(args.target_height),
+        "--window-size",
+        str(args.window_size),
+        "--overlap",
+        str(args.overlap),
+        "--inference-steps",
+        str(args.inference_steps),
+        "--guidance-scale",
+        str(args.guidance_scale),
+        "--seed",
+        str(args.seed),
+        "--target-fps",
+        str(args.target_fps),
+        "--process-length",
+        str(args.process_length),
+        "--output-format",
+        args.output_format,
+        "--cpu-offload",
+        args.cpu_offload,
+        "--model-backend",
+        args.model_backend,
+        "--unet-path",
+        args.unet_path,
+        "--pretrain-path",
+        args.pretrain_path,
+        "--geometry-model-path",
+        args.geometry_model_path,
+        "--geometry-repo-path",
+        args.geometry_repo_path,
+        "--geometry-cache-dir",
+        args.geometry_cache_dir,
+        "--geometry-decode-chunk-size",
+        str(max(1, int(args.geometry_decode_chunk_size))),
+    ]
+
+    if args.disable_xformers:
+        runner_args.append("--disable-xformers")
+    if args.use_cudnn_benchmark:
+        runner_args.append("--use-cudnn-benchmark")
+    if args.local_files_only:
+        runner_args.append("--local-files-only")
+    if bool(args.geometry_low_memory_usage):
+        runner_args.append("--geometry-low-memory-usage")
+    if bool(getattr(args, "continue_on_error", False)):
+        runner_args.append("--continue-on-error")
+    runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
+    runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
+    runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
+
+    quoted_runner = " ".join(shlex.quote(x) for x in runner_args)
+    remote_root = args.remote_root.rstrip("/")
+    return (
+        f"cd {shlex.quote(remote_root)}"
+        f" && source {shlex.quote(remote_join(remote_root, args.venv_name, 'bin', 'activate'))}"
+        f" && {quoted_runner}"
+    )
+
+
+def _normalize_queue_name(raw: str) -> str:
+    value = sanitize_name(str(raw or "").strip())
+    if not value:
+        value = f"queue_{int(time.time())}"
+    return value
+
+
+def _remote_queue_paths(args: argparse.Namespace, queue_name: str) -> dict:
+    remote_root = args.remote_root.rstrip("/")
+    normalized = _normalize_queue_name(queue_name)
+    queue_root = remote_join(remote_root, "cloud_jobs", "queues", normalized)
+    return {
+        "name": normalized,
+        "root": queue_root,
+        "pending": remote_join(queue_root, "pending"),
+        "inprogress": remote_join(queue_root, "inprogress"),
+        "done": remote_join(queue_root, "done"),
+        "failed": remote_join(queue_root, "failed"),
+        "control": remote_join(queue_root, "control"),
+        "stop_file": remote_join(queue_root, "control", "stop"),
+        "worker_pid": remote_join(queue_root, "worker.pid"),
+        "worker_state": remote_join(queue_root, "worker_state.json"),
+        "worker_log": remote_join(queue_root, "worker.log"),
+        "remote_input_dir": remote_join(remote_root, args.remote_input_subdir),
+        "remote_output_dir": remote_join(remote_root, args.remote_output_subdir),
+    }
+
+
+def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) -> str:
+    runner_args = [
+        "python",
+        "-u",
+        "cloud/run_depth_queue_worker.py",
+        "--queue-dir",
+        queue_root,
+        "--poll-interval-sec",
+        str(max(0.1, float(getattr(args, "queue_poll_sec", 1.0) or 1.0))),
+        "--target-width",
+        str(args.target_width),
+        "--target-height",
+        str(args.target_height),
+        "--window-size",
+        str(args.window_size),
+        "--overlap",
+        str(args.overlap),
+        "--inference-steps",
+        str(args.inference_steps),
+        "--guidance-scale",
+        str(args.guidance_scale),
+        "--seed",
+        str(args.seed),
+        "--target-fps",
+        str(args.target_fps),
+        "--process-length",
+        str(args.process_length),
+        "--output-format",
+        args.output_format,
+        "--cpu-offload",
+        args.cpu_offload,
+        "--model-backend",
+        args.model_backend,
+        "--unet-path",
+        args.unet_path,
+        "--pretrain-path",
+        args.pretrain_path,
+        "--geometry-model-path",
+        args.geometry_model_path,
+        "--geometry-repo-path",
+        args.geometry_repo_path,
+        "--geometry-cache-dir",
+        args.geometry_cache_dir,
+        "--geometry-decode-chunk-size",
+        str(max(1, int(args.geometry_decode_chunk_size))),
+    ]
+
+    if args.disable_xformers:
+        runner_args.append("--disable-xformers")
+    if args.use_cudnn_benchmark:
+        runner_args.append("--use-cudnn-benchmark")
+    if args.local_files_only:
+        runner_args.append("--local-files-only")
+    if bool(args.geometry_low_memory_usage):
+        runner_args.append("--geometry-low-memory-usage")
+    if bool(args.continue_on_error):
+        runner_args.append("--continue-on-error")
+    runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
+    runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
+    runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
+
+    quoted_runner = " ".join(shlex.quote(x) for x in runner_args)
+    remote_root = args.remote_root.rstrip("/")
+    return (
+        f"cd {shlex.quote(remote_root)}"
+        f" && source {shlex.quote(remote_join(remote_root, args.venv_name, 'bin', 'activate'))}"
+        f" && {quoted_runner}"
+    )
+
+
+def _remote_worker_running(cfg: SSHConfig, queue_paths: dict) -> bool:
+    pid_file = queue_paths["worker_pid"]
+    proc = ssh_run(
+        cfg,
+        f"if [ -f {shlex.quote(pid_file)} ] && kill -0 \"$(cat {shlex.quote(pid_file)})\" 2>/dev/null; then echo RUNNING; else echo STOPPED; fi",
+        check=False,
+        capture=True,
+        log_command=False,
+    )
+    text = (proc.stdout or "").strip().upper()
+    return "RUNNING" in text
+
+
+def _ensure_remote_queue_dirs(cfg: SSHConfig, queue_paths: dict) -> None:
+    ssh_run(
+        cfg,
+        " && ".join(
+            [
+                f"mkdir -p {shlex.quote(queue_paths['root'])}",
+                f"mkdir -p {shlex.quote(queue_paths['pending'])}",
+                f"mkdir -p {shlex.quote(queue_paths['inprogress'])}",
+                f"mkdir -p {shlex.quote(queue_paths['done'])}",
+                f"mkdir -p {shlex.quote(queue_paths['failed'])}",
+                f"mkdir -p {shlex.quote(queue_paths['control'])}",
+                f"mkdir -p {shlex.quote(queue_paths['remote_input_dir'])}",
+                f"mkdir -p {shlex.quote(queue_paths['remote_output_dir'])}",
+            ]
+        ),
+    )
+
+
+def _start_remote_queue_worker(cfg: SSHConfig, args: argparse.Namespace, queue_paths: dict) -> None:
+    _ensure_remote_queue_dirs(cfg, queue_paths)
+    if _remote_worker_running(cfg, queue_paths):
+        log(f"Queue worker already running for '{queue_paths['name']}'.")
+        return
+
+    remote_cmd = _build_remote_queue_worker_cmd(args, queue_paths["root"])
+    launch_script = " && ".join(
+        [
+            f"rm -f {shlex.quote(queue_paths['stop_file'])}",
+            f"rm -f {shlex.quote(queue_paths['worker_state'])}",
+            f"nohup bash -lc {shlex.quote(remote_cmd)} > {shlex.quote(queue_paths['worker_log'])} 2>&1 < /dev/null & echo $! > {shlex.quote(queue_paths['worker_pid'])}",
+        ]
+    )
+    ssh_run(cfg, launch_script)
+
+    poll_deadline = time.time() + 60.0
+    while time.time() < poll_deadline:
+        if _remote_worker_running(cfg, queue_paths):
+            log(f"Queue worker started for '{queue_paths['name']}'.")
+            return
+        time.sleep(0.5)
+    raise CloudCtlError(f"Queue worker failed to start for '{queue_paths['name']}'.")
+
+
+def _stop_remote_queue_worker(
+    cfg: SSHConfig,
+    queue_paths: dict,
+    *,
+    wait_timeout_sec: float = 60.0,
+) -> None:
+    ssh_run(
+        cfg,
+        f"mkdir -p {shlex.quote(queue_paths['control'])} && touch {shlex.quote(queue_paths['stop_file'])}",
+        check=False,
+    )
+
+    deadline = time.time() + max(0.0, float(wait_timeout_sec))
+    while time.time() < deadline:
+        if not _remote_worker_running(cfg, queue_paths):
+            log(f"Queue worker stopped for '{queue_paths['name']}'.")
+            return
+        time.sleep(0.5)
+    log(f"Queue worker stop timeout for '{queue_paths['name']}' (still running).")
+
+
+def _enqueue_remote_queue_job(cfg: SSHConfig, queue_paths: dict, *, job_id: str, payload: dict) -> str:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix=f"queue_job_{sanitize_name(job_id)}_",
+        delete=False,
+    ) as tmp:
+        tmp.write(json.dumps(payload, indent=2, sort_keys=True))
+        local_payload_path = Path(tmp.name)
+
+    remote_payload_path = remote_join(queue_paths["pending"], f"{sanitize_name(job_id)}.json")
+    try:
+        rsync_to_remote(cfg, str(local_payload_path), remote_payload_path)
+    finally:
+        try:
+            local_payload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return remote_payload_path
+
+
+def _wait_for_remote_queue_job_result(
+    cfg: SSHConfig,
+    queue_paths: dict,
+    *,
+    job_id: str,
+    poll_sec: float,
+) -> tuple[str, str]:
+    safe_job_id = sanitize_name(job_id)
+    done_path = remote_join(queue_paths["done"], f"{safe_job_id}.json")
+    failed_path = remote_join(queue_paths["failed"], f"{safe_job_id}.json")
+    poll = max(0.25, float(poll_sec))
+    while True:
+        probe = ssh_run(
+            cfg,
+            (
+                f"if [ -f {shlex.quote(done_path)} ]; then echo DONE; "
+                f"elif [ -f {shlex.quote(failed_path)} ]; then echo FAILED; "
+                "else echo WAIT; fi"
+            ),
+            check=False,
+            capture=True,
+            log_command=False,
+        )
+        text = (probe.stdout or "").strip()
+        if text == "DONE":
+            return "done", done_path
+        if text == "FAILED":
+            return "failed", failed_path
+        time.sleep(poll)
+
+
+def _read_remote_json(cfg: SSHConfig, remote_path: str) -> dict | None:
+    proc = ssh_run(
+        cfg,
+        f"cat {shlex.quote(remote_path)}",
+        check=False,
+        capture=True,
+        log_command=False,
+    )
+    if proc.returncode != 0:
+        return None
+    text = (proc.stdout or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _download_job_outputs_and_log_stats(
+    cfg: SSHConfig,
+    args: argparse.Namespace,
+    *,
+    job_name: str,
+    remote_job_output_dir: str,
+    log_prefix: str,
+) -> dict | None:
+    download_root = Path(args.download_dir).expanduser().resolve()
+    download_into_job_subdir = bool(getattr(args, "download_into_job_subdir", False))
+    local_job_dir = download_root / job_name if download_into_job_subdir else download_root
+    status_payload = None
+    if not args.skip_download:
+        local_job_dir.mkdir(parents=True, exist_ok=True)
+        log(f"{log_prefix}Downloading outputs to: {local_job_dir}")
+        rsync_from_remote(cfg, f"{remote_job_output_dir}/", f"{local_job_dir}/")
+        status_path = local_job_dir / "job_status.json"
+        status_alias_path = local_job_dir / f"{job_name}_job_status.json"
+        if status_path.is_file() and status_alias_path != status_path:
+            try:
+                status_alias_path.write_text(status_path.read_text(encoding="utf-8"), encoding="utf-8")
+                if not download_into_job_subdir:
+                    status_path.unlink(missing_ok=True)
+                    status_path = status_alias_path
+            except Exception as status_copy_exc:  # pylint: disable=broad-except
+                log(f"{log_prefix}Warning: could not materialize per-job status alias: {status_copy_exc}")
+        if status_path.is_file():
+            try:
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+            except Exception as status_exc:  # pylint: disable=broad-except
+                log(f"{log_prefix}Warning: could not parse job_status.json for VRAM summary: {status_exc}")
+            else:
+                if isinstance(payload, dict):
+                    status_payload = payload
+                    logged_gpu_stats = False
+                    gpu_memory_smi = payload.get("gpu_memory_nvidia_smi", {})
+                    if isinstance(gpu_memory_smi, dict) and int(gpu_memory_smi.get("device_count", 0) or 0) > 0:
+                        peak_used = float(gpu_memory_smi.get("peak_used_mib_all_devices", 0.0) or 0.0)
+                        peak_used_pct = float(gpu_memory_smi.get("peak_used_pct_total_all_devices", 0.0) or 0.0)
+                        sample_count = int(gpu_memory_smi.get("sample_count", 0) or 0)
+                        sample_interval = float(gpu_memory_smi.get("sample_interval_sec", 0.0) or 0.0)
+                        device_count = int(gpu_memory_smi.get("device_count", 0) or 0)
+                        log(
+                            f"{log_prefix}GPU peak VRAM (nvidia-smi) | used={peak_used:.1f} MiB ({peak_used_pct:.2f}%), "
+                            f"devices={device_count}, samples={sample_count}, dt={sample_interval:.2f}s"
+                        )
+                        logged_gpu_stats = True
+                        per_device_smi = gpu_memory_smi.get("per_device", [])
+                        if isinstance(per_device_smi, list):
+                            for device_entry in per_device_smi:
+                                if not isinstance(device_entry, dict):
+                                    continue
+                                log(
+                                    f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (nvidia-smi) | "
+                                    f"used={float(device_entry.get('peak_used_mib', 0.0) or 0.0):.1f} MiB, "
+                                    f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
+                                    f"util_peak={float(device_entry.get('peak_util_gpu_pct', 0.0) or 0.0):.1f}%, "
+                                    f"name={str(device_entry.get('name', ''))}"
+                                )
+
+                    gpu_memory = payload.get("gpu_memory", {})
+                    if isinstance(gpu_memory, dict):
+                        peak_alloc = float(gpu_memory.get("peak_alloc_mib_all_devices", 0.0) or 0.0)
+                        peak_reserved = float(gpu_memory.get("peak_reserved_mib_all_devices", 0.0) or 0.0)
+                        peak_alloc_pct = float(gpu_memory.get("peak_alloc_pct_total_all_devices", 0.0) or 0.0)
+                        peak_reserved_pct = float(gpu_memory.get("peak_reserved_pct_total_all_devices", 0.0) or 0.0)
+                        device_count = int(gpu_memory.get("device_count", 0) or 0)
+                        if device_count > 0:
+                            log(
+                                f"{log_prefix}GPU peak VRAM (torch) | alloc={peak_alloc:.1f} MiB ({peak_alloc_pct:.2f}%), "
+                                f"reserved={peak_reserved:.1f} MiB ({peak_reserved_pct:.2f}%), devices={device_count}"
+                            )
+                            logged_gpu_stats = True
+                            per_device = gpu_memory.get("per_device", [])
+                            if isinstance(per_device, list):
+                                for device_entry in per_device:
+                                    if not isinstance(device_entry, dict):
+                                        continue
+                                    log(
+                                        f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (torch) | "
+                                        f"alloc={float(device_entry.get('peak_alloc_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"reserved={float(device_entry.get('peak_reserved_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"name={str(device_entry.get('name', ''))}"
+                                    )
+                    if not logged_gpu_stats:
+                        log(f"{log_prefix}GPU peak VRAM stats were not present in job status JSON.")
+    return status_payload
+
+
+def _cleanup_remote_job_artifacts(
+    cfg: SSHConfig,
+    args: argparse.Namespace,
+    *,
+    remote_input_path: str,
+    remote_job_output_dir: str,
+) -> None:
+    if not args.keep_remote_input:
+        ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False, log_command=False)
+    if not args.keep_remote_output:
+        ssh_run(cfg, f"rm -rf {shlex.quote(remote_job_output_dir)}", check=False, log_command=False)
+
+
 def _run_one_job(
     cfg: SSHConfig,
     args: argparse.Namespace,
@@ -775,90 +1199,22 @@ def _run_one_job(
             heartbeat_sec=30,
         )
 
-        download_root = Path(args.download_dir).expanduser().resolve()
-        download_into_job_subdir = bool(getattr(args, "download_into_job_subdir", False))
-        local_job_dir = download_root / job_name if download_into_job_subdir else download_root
-        if not args.skip_download:
-            local_job_dir.mkdir(parents=True, exist_ok=True)
-            log(f"{log_prefix}Downloading outputs to: {local_job_dir}")
-            rsync_from_remote(cfg, f"{remote_job_output_dir}/", f"{local_job_dir}/")
-            status_path = local_job_dir / "job_status.json"
-            status_alias_path = local_job_dir / f"{job_name}_job_status.json"
-            if status_path.is_file() and status_alias_path != status_path:
-                try:
-                    status_alias_path.write_text(status_path.read_text(encoding="utf-8"), encoding="utf-8")
-                    if not download_into_job_subdir:
-                        status_path.unlink(missing_ok=True)
-                        status_path = status_alias_path
-                except Exception as status_copy_exc:
-                    log(f"{log_prefix}Warning: could not materialize per-job status alias: {status_copy_exc}")
-            if status_path.is_file():
-                try:
-                    payload = json.loads(status_path.read_text(encoding="utf-8"))
-                except Exception as status_exc:
-                    log(f"{log_prefix}Warning: could not parse job_status.json for VRAM summary: {status_exc}")
-                else:
-                    if isinstance(payload, dict):
-                        logged_gpu_stats = False
-                        gpu_memory_smi = payload.get("gpu_memory_nvidia_smi", {})
-                        if isinstance(gpu_memory_smi, dict) and int(gpu_memory_smi.get("device_count", 0) or 0) > 0:
-                            peak_used = float(gpu_memory_smi.get("peak_used_mib_all_devices", 0.0) or 0.0)
-                            peak_used_pct = float(gpu_memory_smi.get("peak_used_pct_total_all_devices", 0.0) or 0.0)
-                            sample_count = int(gpu_memory_smi.get("sample_count", 0) or 0)
-                            sample_interval = float(gpu_memory_smi.get("sample_interval_sec", 0.0) or 0.0)
-                            device_count = int(gpu_memory_smi.get("device_count", 0) or 0)
-                            log(
-                                f"{log_prefix}GPU peak VRAM (nvidia-smi) | used={peak_used:.1f} MiB ({peak_used_pct:.2f}%), "
-                                f"devices={device_count}, samples={sample_count}, dt={sample_interval:.2f}s"
-                            )
-                            logged_gpu_stats = True
-                            per_device_smi = gpu_memory_smi.get("per_device", [])
-                            if isinstance(per_device_smi, list):
-                                for device_entry in per_device_smi:
-                                    if not isinstance(device_entry, dict):
-                                        continue
-                                    log(
-                                        f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (nvidia-smi) | "
-                                        f"used={float(device_entry.get('peak_used_mib', 0.0) or 0.0):.1f} MiB, "
-                                        f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
-                                        f"util_peak={float(device_entry.get('peak_util_gpu_pct', 0.0) or 0.0):.1f}%, "
-                                        f"name={str(device_entry.get('name', ''))}"
-                                    )
-
-                        gpu_memory = payload.get("gpu_memory", {})
-                        if isinstance(gpu_memory, dict):
-                            peak_alloc = float(gpu_memory.get("peak_alloc_mib_all_devices", 0.0) or 0.0)
-                            peak_reserved = float(gpu_memory.get("peak_reserved_mib_all_devices", 0.0) or 0.0)
-                            peak_alloc_pct = float(gpu_memory.get("peak_alloc_pct_total_all_devices", 0.0) or 0.0)
-                            peak_reserved_pct = float(gpu_memory.get("peak_reserved_pct_total_all_devices", 0.0) or 0.0)
-                            device_count = int(gpu_memory.get("device_count", 0) or 0)
-                            if device_count > 0:
-                                log(
-                                    f"{log_prefix}GPU peak VRAM (torch) | alloc={peak_alloc:.1f} MiB ({peak_alloc_pct:.2f}%), "
-                                    f"reserved={peak_reserved:.1f} MiB ({peak_reserved_pct:.2f}%), devices={device_count}"
-                                )
-                                logged_gpu_stats = True
-                                per_device = gpu_memory.get("per_device", [])
-                                if isinstance(per_device, list):
-                                    for device_entry in per_device:
-                                        if not isinstance(device_entry, dict):
-                                            continue
-                                        log(
-                                            f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (torch) | "
-                                            f"alloc={float(device_entry.get('peak_alloc_mib', 0.0) or 0.0):.1f} MiB, "
-                                            f"reserved={float(device_entry.get('peak_reserved_mib', 0.0) or 0.0):.1f} MiB, "
-                                            f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
-                                            f"name={str(device_entry.get('name', ''))}"
-                                        )
-                        if not logged_gpu_stats:
-                            log(f"{log_prefix}GPU peak VRAM stats were not present in job status JSON.")
+        _download_job_outputs_and_log_stats(
+            cfg,
+            args,
+            job_name=job_name,
+            remote_job_output_dir=remote_job_output_dir,
+            log_prefix=log_prefix,
+        )
     except Exception as exc:  # pylint: disable=broad-except
         caught_exception = exc
     finally:
-        if not args.keep_remote_input:
-            ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False, log_command=False)
-        if not args.keep_remote_output:
-            ssh_run(cfg, f"rm -rf {shlex.quote(remote_job_output_dir)}", check=False, log_command=False)
+        _cleanup_remote_job_artifacts(
+            cfg,
+            args,
+            remote_input_path=remote_input_path,
+            remote_job_output_dir=remote_job_output_dir,
+        )
 
     if caught_exception is not None:
         raise caught_exception
@@ -883,6 +1239,18 @@ def cmd_run_job(args: argparse.Namespace) -> int:
     )
     maybe_sync_remote_repo(cfg, args)
     local_input = Path(args.local_input).expanduser().resolve()
+    if bool(getattr(args, "queue_mode", True)):
+        if not local_input.exists():
+            raise CloudCtlError(f"Input clip not found: {local_input}")
+        if not hasattr(args, "continue_on_error"):
+            setattr(args, "continue_on_error", False)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        explicit_name = str(args.job_name or "").strip()
+        if explicit_name:
+            job_name = sanitize_name(explicit_name)
+        else:
+            job_name = sanitize_name(f"{args.job_prefix}{sanitize_name(local_input.stem)}_{stamp}")
+        return _run_batch_with_worker_queue(cfg, args, [(1, local_input, job_name)])
     return _run_one_job(cfg, args, local_input, explicit_job_name=args.job_name)
 
 
@@ -969,6 +1337,276 @@ def _remote_job_paths(args: argparse.Namespace, job_name: str, clip_suffix: str)
     return remote_input_dir, remote_output_dir, remote_job_output_dir, remote_input_path
 
 
+def _run_batch_with_persistent_sessions(
+    cfg: SSHConfig,
+    args: argparse.Namespace,
+    plans: list[tuple[int, Path, str]],
+    *,
+    started_job_names: set[str],
+    failed: list[str],
+) -> None:
+    session_size = max(2, int(getattr(args, "persistent_session_size", 8) or 8))
+    if bool(getattr(args, "prefetch_upload_all", False)) or int(getattr(args, "prefetch_window", 0) or 0) > 0:
+        log("Persistent sessions enabled: ignoring prefetch flags for this batch mode.")
+
+    remote_root = args.remote_root.rstrip("/")
+    remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
+    remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
+    remote_manifest_dir = remote_join(remote_output_dir, "_session_manifests")
+    ssh_run(
+        cfg,
+        " && ".join(
+            [
+                f"mkdir -p {shlex.quote(remote_input_dir)}",
+                f"mkdir -p {shlex.quote(remote_output_dir)}",
+                f"mkdir -p {shlex.quote(remote_manifest_dir)}",
+            ]
+        ),
+    )
+
+    total = len(plans)
+    for chunk_start in range(0, total, session_size):
+        chunk = plans[chunk_start : chunk_start + session_size]
+        if not chunk:
+            continue
+        first_idx = chunk[0][0]
+        last_idx = chunk[-1][0]
+        log(f"Persistent session chunk [{first_idx}-{last_idx}/{total}] starting.")
+
+        runnable: list[tuple[int, Path, str]] = []
+        for idx, clip, job_name in chunk:
+            _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+            try:
+                ssh_run(
+                    cfg,
+                    f"mkdir -p {shlex.quote(remote_job_output_dir)}",
+                    check=True,
+                    log_command=False,
+                )
+                log(f"[{idx}/{total}] Uploading clip: {clip}")
+                rsync_to_remote(cfg, str(clip), remote_input_path)
+                started_job_names.add(job_name)
+                runnable.append((idx, clip, job_name))
+            except Exception as exc:  # pylint: disable=broad-except
+                msg = f"Upload failed for {clip.name}: {exc}"
+                log(msg)
+                failed.append(msg)
+                if not args.continue_on_error:
+                    return
+
+        if not runnable:
+            continue
+
+        manifest_rows = []
+        for _, clip, job_name in runnable:
+            _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+            manifest_rows.append(
+                {
+                    "input": remote_input_path,
+                    "output_dir": remote_job_output_dir,
+                    "status_json": remote_join(remote_job_output_dir, "job_status.json"),
+                    "job_name": job_name,
+                }
+            )
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".json",
+            prefix="cloud_batch_manifest_",
+            delete=False,
+        ) as manifest_tmp:
+            manifest_tmp.write(json.dumps(manifest_rows, indent=2))
+            local_manifest_path = Path(manifest_tmp.name)
+
+        remote_manifest_path = remote_join(
+            remote_manifest_dir,
+            f"session_{first_idx:05d}_{last_idx:05d}_{int(time.time() * 1000)}.json",
+        )
+
+        result = None
+        try:
+            rsync_to_remote(cfg, str(local_manifest_path), remote_manifest_path)
+            remote_cmd = _build_remote_batch_session_cmd(args, remote_manifest_path)
+            result = ssh_run_stream(
+                cfg,
+                remote_cmd,
+                check=False,
+                line_prefix=f"[{first_idx}-{last_idx}/{total}] [remote] ",
+                heartbeat_sec=30,
+            )
+        finally:
+            try:
+                local_manifest_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            ssh_run(cfg, f"rm -f {shlex.quote(remote_manifest_path)}", check=False, log_command=False)
+
+        chunk_failed = False
+        for idx, clip, job_name in runnable:
+            _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+            status_payload = _download_job_outputs_and_log_stats(
+                cfg,
+                args,
+                job_name=job_name,
+                remote_job_output_dir=remote_job_output_dir,
+                log_prefix=f"[{idx}/{total}] ",
+            )
+            _cleanup_remote_job_artifacts(
+                cfg,
+                args,
+                remote_input_path=remote_input_path,
+                remote_job_output_dir=remote_job_output_dir,
+            )
+
+            if isinstance(status_payload, dict):
+                job_status = str(status_payload.get("status", "")).strip().lower()
+                if job_status != "success":
+                    msg = f"Batch item failed for {clip.name}: status={job_status or 'unknown'}"
+                    log(msg)
+                    failed.append(msg)
+                    chunk_failed = True
+            elif result is not None and result.returncode != 0:
+                msg = f"Batch item failed for {clip.name}: missing status JSON and session exit code {result.returncode}"
+                log(msg)
+                failed.append(msg)
+                chunk_failed = True
+
+        if result is not None and result.returncode != 0:
+            chunk_failed = True
+            msg = f"Persistent session chunk [{first_idx}-{last_idx}/{total}] failed with exit code {result.returncode}."
+            log(msg)
+            failed.append(msg)
+
+        if chunk_failed and not args.continue_on_error:
+            return
+
+
+def _run_batch_with_worker_queue(
+    cfg: SSHConfig,
+    args: argparse.Namespace,
+    plans: list[tuple[int, Path, str]],
+) -> int:
+    queue_name = str(getattr(args, "queue_name", "") or "").strip()
+    if not queue_name:
+        queue_name = f"batch_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    queue_paths = _remote_queue_paths(args, queue_name)
+
+    log(
+        f"Queue mode enabled. queue={queue_paths['name']} "
+        f"(poll={max(0.25, float(getattr(args, 'queue_poll_sec', 1.0) or 1.0)):.2f}s)"
+    )
+    if bool(getattr(args, "prefetch_upload_all", False)) or int(getattr(args, "prefetch_window", 0) or 0) > 0:
+        log("Queue mode: ignoring prefetch flags.")
+    if bool(getattr(args, "persistent_session", True)):
+        log("Queue mode: persistent session chunking is bypassed.")
+
+    _start_remote_queue_worker(cfg, args, queue_paths)
+
+    failed: list[str] = []
+    total = len(plans)
+    enqueued: list[dict] = []
+    try:
+        for idx, clip, job_name in plans:
+            _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+            ssh_run(
+                cfg,
+                f"mkdir -p {shlex.quote(remote_job_output_dir)}",
+                check=True,
+                log_command=False,
+            )
+            log(f"[{idx}/{total}] Uploading clip: {clip}")
+            rsync_to_remote(cfg, str(clip), remote_input_path)
+
+            job_id = sanitize_name(f"{idx:05d}_{job_name}")
+            queue_payload = {
+                "job_id": job_id,
+                "job_name": job_name,
+                "input": remote_input_path,
+                "output_dir": remote_job_output_dir,
+                "status_json": remote_join(remote_job_output_dir, "job_status.json"),
+            }
+            _enqueue_remote_queue_job(cfg, queue_paths, job_id=job_id, payload=queue_payload)
+            enqueued.append(
+                {
+                    "idx": idx,
+                    "clip": clip,
+                    "job_name": job_name,
+                    "job_id": job_id,
+                    "remote_input_path": remote_input_path,
+                    "remote_job_output_dir": remote_job_output_dir,
+                }
+            )
+            log(f"[{idx}/{total}] Enqueued job: {job_name} ({job_id})")
+
+        poll_sec = max(0.25, float(getattr(args, "queue_poll_sec", 1.0) or 1.0))
+        for item in enqueued:
+            idx = int(item["idx"])
+            clip = item["clip"]
+            job_name = str(item["job_name"])
+            job_id = str(item["job_id"])
+            remote_input_path = str(item["remote_input_path"])
+            remote_job_output_dir = str(item["remote_job_output_dir"])
+
+            result_kind, remote_result_path = _wait_for_remote_queue_job_result(
+                cfg,
+                queue_paths,
+                job_id=job_id,
+                poll_sec=poll_sec,
+            )
+            result_payload = _read_remote_json(cfg, remote_result_path)
+            if result_kind == "failed":
+                status_message = ""
+                if isinstance(result_payload, dict):
+                    status_message = str(result_payload.get("status_message", "")).strip()
+                msg = f"Batch item failed for {clip.name}: {status_message or 'queue worker reported failure'}"
+                log(msg)
+                failed.append(msg)
+                if not bool(getattr(args, "continue_on_error", False)):
+                    break
+
+            status_payload = _download_job_outputs_and_log_stats(
+                cfg,
+                args,
+                job_name=job_name,
+                remote_job_output_dir=remote_job_output_dir,
+                log_prefix=f"[{idx}/{total}] ",
+            )
+
+            if isinstance(status_payload, dict):
+                status_value = str(status_payload.get("status", "")).strip().lower()
+                if status_value != "success":
+                    msg = f"Batch item failed for {clip.name}: status={status_value or 'unknown'}"
+                    log(msg)
+                    failed.append(msg)
+                    if not bool(getattr(args, "continue_on_error", False)):
+                        break
+
+            _cleanup_remote_job_artifacts(
+                cfg,
+                args,
+                remote_input_path=remote_input_path,
+                remote_job_output_dir=remote_job_output_dir,
+            )
+            ssh_run(cfg, f"rm -f {shlex.quote(remote_result_path)}", check=False, log_command=False)
+
+            log(f"[{idx}/{total}] Job complete: {job_name}")
+
+    finally:
+        if not bool(getattr(args, "keep_queue_worker", False)):
+            _stop_remote_queue_worker(cfg, queue_paths, wait_timeout_sec=60.0)
+        else:
+            log(f"Leaving queue worker running for '{queue_paths['name']}'.")
+
+    if failed:
+        for item in failed:
+            log(f"ERROR: {item}")
+        return 1
+
+    log("Batch complete.")
+    return 0
+
+
 def cmd_run_batch(args: argparse.Namespace) -> int:
     require_tool("ssh")
     require_tool("rsync")
@@ -1020,10 +1658,23 @@ def cmd_run_batch(args: argparse.Namespace) -> int:
         )
         plans.append((idx, clip, job_name))
 
+    if bool(getattr(args, "queue_mode", True)):
+        return _run_batch_with_worker_queue(cfg, args, plans)
+
     failed = []
     started_job_names = set()
+    persistent_enabled = (
+        bool(getattr(args, "persistent_session", True))
+        and len(plans) > 1
+        and int(getattr(args, "persistent_session_size", 8) or 8) > 1
+    )
+    if persistent_enabled:
+        log(
+            f"Persistent session mode enabled (chunk size={max(2, int(getattr(args, 'persistent_session_size', 8) or 8))}). "
+            "Models will stay loaded across chunked jobs."
+        )
 
-    if bool(getattr(args, "prefetch_upload_all", False)) and len(plans) > 1:
+    if (not persistent_enabled) and bool(getattr(args, "prefetch_upload_all", False)) and len(plans) > 1:
         remote_root = args.remote_root.rstrip("/")
         remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
         remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
@@ -1048,10 +1699,23 @@ def cmd_run_batch(args: argparse.Namespace) -> int:
                 failed.append(msg)
                 if not args.continue_on_error:
                     break
-    prefetch_window = max(0, int(getattr(args, "prefetch_window", 0) or 0))
-    pipeline_enabled = prefetch_window > 0 and len(plans) > 1 and not bool(getattr(args, "prefetch_upload_all", False))
+    prefetch_window = 0 if persistent_enabled else max(0, int(getattr(args, "prefetch_window", 0) or 0))
+    pipeline_enabled = (
+        prefetch_window > 0
+        and len(plans) > 1
+        and not bool(getattr(args, "prefetch_upload_all", False))
+        and (not persistent_enabled)
+    )
 
-    if pipeline_enabled:
+    if persistent_enabled:
+        _run_batch_with_persistent_sessions(
+            cfg,
+            args,
+            plans,
+            started_job_names=started_job_names,
+            failed=failed,
+        )
+    elif pipeline_enabled:
         remote_root = args.remote_root.rstrip("/")
         remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
         remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
@@ -1210,6 +1874,149 @@ def cmd_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_queue_start(args: argparse.Namespace) -> int:
+    require_tool("ssh")
+    cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
+    maybe_sync_remote_repo(cfg, args)
+    queue_paths = _remote_queue_paths(args, args.queue_name)
+    _start_remote_queue_worker(cfg, args, queue_paths)
+    log(f"Queue worker ready: name={queue_paths['name']} dir={queue_paths['root']}")
+    return 0
+
+
+def cmd_queue_status(args: argparse.Namespace) -> int:
+    require_tool("ssh")
+    cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
+    queue_paths = _remote_queue_paths(args, args.queue_name)
+    running = _remote_worker_running(cfg, queue_paths)
+    state_payload = _read_remote_json(cfg, queue_paths["worker_state"])
+    if state_payload:
+        log(
+            f"Queue '{queue_paths['name']}' status: running={running} "
+            f"processed={int(state_payload.get('processed_count', 0) or 0)} "
+            f"success={int(state_payload.get('success_count', 0) or 0)} "
+            f"failed={int(state_payload.get('failed_count', 0) or 0)} "
+            f"current={state_payload.get('current_job_name', '') or '-'}"
+        )
+    else:
+        log(f"Queue '{queue_paths['name']}' status: running={running} (no state JSON)")
+    return 0
+
+
+def cmd_queue_stop(args: argparse.Namespace) -> int:
+    require_tool("ssh")
+    cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
+    queue_paths = _remote_queue_paths(args, args.queue_name)
+    _stop_remote_queue_worker(
+        cfg,
+        queue_paths,
+        wait_timeout_sec=max(0.0, float(getattr(args, "queue_stop_timeout_sec", 60.0) or 60.0)),
+    )
+    return 0
+
+
+def cmd_queue_enqueue(args: argparse.Namespace) -> int:
+    require_tool("ssh")
+    require_tool("rsync")
+    cfg = cfg_from_args(args)
+    wait_for_ssh_ready(
+        cfg,
+        timeout_sec=args.ssh_ready_timeout_sec,
+        poll_sec=args.ssh_ready_poll_sec,
+    )
+    maybe_sync_remote_repo(cfg, args)
+
+    queue_paths = _remote_queue_paths(args, args.queue_name)
+    if bool(getattr(args, "queue_auto_start", True)):
+        _start_remote_queue_worker(cfg, args, queue_paths)
+    elif not _remote_worker_running(cfg, queue_paths):
+        raise CloudCtlError(
+            f"Queue worker '{queue_paths['name']}' is not running. Use queue-start or --queue-auto-start."
+        )
+    else:
+        _ensure_remote_queue_dirs(cfg, queue_paths)
+
+    local_input = Path(args.local_input).expanduser().resolve()
+    if not local_input.exists():
+        raise CloudCtlError(f"Input clip not found: {local_input}")
+
+    job_name = sanitize_name(str(args.job_name or "").strip()) if str(args.job_name or "").strip() else sanitize_name(local_input.stem)
+    _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, local_input.suffix)
+    ssh_run(
+        cfg,
+        f"mkdir -p {shlex.quote(remote_job_output_dir)}",
+        check=True,
+        log_command=False,
+    )
+
+    log(f"Uploading clip: {local_input}")
+    rsync_to_remote(cfg, str(local_input), remote_input_path)
+
+    enqueue_stamp = int(time.time() * 1000)
+    job_id = sanitize_name(f"{enqueue_stamp}_{job_name}")
+    queue_payload = {
+        "job_id": job_id,
+        "job_name": job_name,
+        "input": remote_input_path,
+        "output_dir": remote_job_output_dir,
+        "status_json": remote_join(remote_job_output_dir, "job_status.json"),
+    }
+    _enqueue_remote_queue_job(cfg, queue_paths, job_id=job_id, payload=queue_payload)
+    log(f"Queued job: {job_name} ({job_id}) on queue '{queue_paths['name']}'")
+
+    if not bool(getattr(args, "wait", False)):
+        return 0
+
+    result_kind, remote_result_path = _wait_for_remote_queue_job_result(
+        cfg,
+        queue_paths,
+        job_id=job_id,
+        poll_sec=max(0.25, float(getattr(args, "queue_poll_sec", 1.0) or 1.0)),
+    )
+    if result_kind == "failed":
+        payload = _read_remote_json(cfg, remote_result_path) or {}
+        message = str(payload.get("status_message", "")).strip() or "queue worker reported failure"
+        log(f"ERROR: queued job failed: {message}")
+        if not args.keep_remote_input:
+            ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False, log_command=False)
+        if not args.keep_remote_output:
+            ssh_run(cfg, f"rm -rf {shlex.quote(remote_job_output_dir)}", check=False, log_command=False)
+        ssh_run(cfg, f"rm -f {shlex.quote(remote_result_path)}", check=False, log_command=False)
+        return 1
+
+    _download_job_outputs_and_log_stats(
+        cfg,
+        args,
+        job_name=job_name,
+        remote_job_output_dir=remote_job_output_dir,
+        log_prefix="",
+    )
+    _cleanup_remote_job_artifacts(
+        cfg,
+        args,
+        remote_input_path=remote_input_path,
+        remote_job_output_dir=remote_job_output_dir,
+    )
+    ssh_run(cfg, f"rm -f {shlex.quote(remote_result_path)}", check=False, log_command=False)
+    log(f"Queued job complete: {job_name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SSH-only cloud controller for DepthCrafter jobs.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1236,6 +2043,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_job.add_argument("--job-prefix", default="")
     p_job.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
     p_job.add_argument("--remote-output-subdir", default="cloud_jobs/output")
+    p_job.add_argument(
+        "--queue-mode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use long-lived remote queue worker mode for run-job.",
+    )
+    p_job.add_argument("--queue-name", default="", help="Optional queue worker name. Auto-generated if omitted.")
+    p_job.add_argument("--queue-poll-sec", type=float, default=1.0)
+    p_job.add_argument(
+        "--keep-queue-worker",
+        action="store_true",
+        help="Do not stop the remote queue worker when this job finishes.",
+    )
     p_job.add_argument("--download-dir", default="./cloud_downloads")
     p_job.add_argument(
         "--download-into-job-subdir",
@@ -1271,6 +2091,40 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Stage all batch clips to remote first so inference can run back-to-back with less GPU idle.",
     )
+    p_batch.add_argument(
+        "--queue-mode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use long-lived remote queue worker mode for run-batch.",
+    )
+    p_batch.add_argument(
+        "--queue-name",
+        default="",
+        help="Optional queue worker name. Auto-generated if omitted.",
+    )
+    p_batch.add_argument(
+        "--queue-poll-sec",
+        type=float,
+        default=1.0,
+        help="Polling interval when waiting for queued job completion.",
+    )
+    p_batch.add_argument(
+        "--keep-queue-worker",
+        action="store_true",
+        help="Do not stop the remote queue worker when batch finishes.",
+    )
+    p_batch.add_argument(
+        "--persistent-session",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep one remote model process alive and run chunked jobs per session.",
+    )
+    p_batch.add_argument(
+        "--persistent-session-size",
+        type=int,
+        default=8,
+        help="Number of clips to process per persistent model session (>=2 enables session mode).",
+    )
     p_batch.add_argument("--job-prefix", default="")
     p_batch.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
     p_batch.add_argument("--remote-output-subdir", default="cloud_jobs/output")
@@ -1290,6 +2144,52 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--remote-output-subdir", default="cloud_jobs/output")
     p_collect.add_argument("--download-dir", default="./cloud_downloads")
     p_collect.set_defaults(func=cmd_collect)
+
+    p_qstart = sub.add_parser("queue-start", help="Start (or reuse) a long-lived remote queue worker.")
+    add_ssh_flags(p_qstart)
+    add_model_job_flags(p_qstart)
+    add_queue_name_flag(p_qstart, default="default")
+    p_qstart.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
+    p_qstart.add_argument("--remote-output-subdir", default="cloud_jobs/output")
+    p_qstart.add_argument("--queue-poll-sec", type=float, default=1.0)
+    p_qstart.set_defaults(func=cmd_queue_start)
+
+    p_qstatus = sub.add_parser("queue-status", help="Show queue worker state.")
+    add_ssh_flags(p_qstatus)
+    add_queue_name_flag(p_qstatus, default="default")
+    p_qstatus.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
+    p_qstatus.add_argument("--remote-output-subdir", default="cloud_jobs/output")
+    p_qstatus.set_defaults(func=cmd_queue_status)
+
+    p_qstop = sub.add_parser("queue-stop", help="Request queue worker shutdown and wait.")
+    add_ssh_flags(p_qstop)
+    add_queue_name_flag(p_qstop, default="default")
+    p_qstop.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
+    p_qstop.add_argument("--remote-output-subdir", default="cloud_jobs/output")
+    p_qstop.add_argument("--queue-stop-timeout-sec", type=float, default=60.0)
+    p_qstop.set_defaults(func=cmd_queue_stop)
+
+    p_qenqueue = sub.add_parser("queue-enqueue", help="Enqueue one clip onto a running queue worker.")
+    add_ssh_flags(p_qenqueue)
+    add_model_job_flags(p_qenqueue)
+    add_queue_name_flag(p_qenqueue, default="default")
+    p_qenqueue.add_argument("--local-input", required=True)
+    p_qenqueue.add_argument("--job-name", default="")
+    p_qenqueue.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
+    p_qenqueue.add_argument("--remote-output-subdir", default="cloud_jobs/output")
+    p_qenqueue.add_argument("--queue-auto-start", action=argparse.BooleanOptionalAction, default=True)
+    p_qenqueue.add_argument("--queue-poll-sec", type=float, default=1.0)
+    p_qenqueue.add_argument("--wait", action="store_true")
+    p_qenqueue.add_argument("--download-dir", default="./cloud_downloads")
+    p_qenqueue.add_argument(
+        "--download-into-job-subdir",
+        action="store_true",
+        help="Store downloads under <download-dir>/<job-name>/ instead of directly in <download-dir>.",
+    )
+    p_qenqueue.add_argument("--skip-download", action="store_true")
+    p_qenqueue.add_argument("--keep-remote-input", action="store_true")
+    p_qenqueue.add_argument("--keep-remote-output", action="store_true")
+    p_qenqueue.set_defaults(func=cmd_queue_enqueue)
 
     return parser
 
