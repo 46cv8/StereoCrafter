@@ -478,13 +478,13 @@ def maybe_sync_remote_repo(cfg: SSHConfig, args: argparse.Namespace) -> None:
             f" && branch={shlex.quote(requested_branch)}"
             " && echo \"sync: target origin/$branch\""
             " && if ! git fetch origin \"$branch\" --prune; then echo \"skip: fetch failed for $branch\"; exit 0; fi"
-            " && remote_sha=\"$(git rev-parse \"origin/$branch\" 2>/dev/null || true)\""
-            " && if [ -z \"$remote_sha\" ]; then echo \"skip: origin/$branch not found\"; exit 0; fi"
+            " && remote_sha=\"$(git rev-parse FETCH_HEAD 2>/dev/null || true)\""
+            " && if [ -z \"$remote_sha\" ]; then echo \"skip: could not resolve FETCH_HEAD for $branch\"; exit 0; fi"
             " && current_branch=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)\""
             " && local_sha_before=\"$(git rev-parse HEAD 2>/dev/null || true)\""
             " && if [ \"$current_branch\" != \"$branch\" ]; then "
             "if git show-ref --verify --quiet \"refs/heads/$branch\"; then git checkout \"$branch\"; "
-            "else git checkout -B \"$branch\" \"origin/$branch\"; fi; fi"
+            "else git checkout -B \"$branch\" \"$remote_sha\"; fi; fi"
             " && git reset --hard \"$remote_sha\""
             " && local_sha_after=\"$(git rev-parse HEAD 2>/dev/null || true)\""
             " && if [ \"$local_sha_before\" = \"$local_sha_after\" ]; then "
@@ -504,7 +504,7 @@ def maybe_sync_remote_repo(cfg: SSHConfig, args: argparse.Namespace) -> None:
             " && echo \"sync: checking origin/$branch\""
             " && if ! git fetch origin \"$branch\" --prune; then echo 'skip: fetch failed'; exit 0; fi"
             " && local_sha=\"$(git rev-parse HEAD 2>/dev/null || true)\""
-            " && remote_sha=\"$(git rev-parse \"origin/$branch\" 2>/dev/null || true)\""
+            " && remote_sha=\"$(git rev-parse FETCH_HEAD 2>/dev/null || true)\""
             " && if [ -z \"$local_sha\" ] || [ -z \"$remote_sha\" ]; then echo 'skip: could not resolve commit shas'; exit 0; fi"
             " && if [ \"$local_sha\" = \"$remote_sha\" ]; then echo \"up-to-date: $local_sha\"; exit 0; fi"
             " && if git merge-base --is-ancestor \"$local_sha\" \"$remote_sha\"; then "
@@ -521,12 +521,24 @@ def maybe_sync_remote_repo(cfg: SSHConfig, args: argparse.Namespace) -> None:
         log_command=False,
     )
     output = (sync_result.stdout or "").strip()
+    output_lines: List[str] = []
     if output:
         for line in output.splitlines():
             line_clean = line.strip()
             if line_clean:
+                output_lines.append(line_clean)
                 log(f"[repo-sync] {line_clean}")
-    if sync_result.returncode != 0:
+    has_skip_line = any(line.lower().startswith("skip:") for line in output_lines)
+    has_fatal_line = any("fatal:" in line.lower() for line in output_lines)
+    if requested_branch:
+        if sync_result.returncode != 0 or has_skip_line or has_fatal_line:
+            detail = "; ".join(output_lines[-4:]) if output_lines else f"exit={sync_result.returncode}"
+            raise CloudCtlError(
+                f"Remote git sync did not complete for requested branch '{requested_branch}'. "
+                f"Details: {detail}. "
+                "Push the branch/commits to origin and retry."
+            )
+    elif sync_result.returncode != 0:
         log(f"[repo-sync] warning: sync command exited with {sync_result.returncode}; continuing with current remote code.")
 
 
