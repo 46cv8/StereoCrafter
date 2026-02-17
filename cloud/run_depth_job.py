@@ -87,6 +87,48 @@ def _ensure_python_module(module_name: str, pip_spec: str, logger: logging.Logge
         raise RuntimeError(f"Module '{module_name}' is still unavailable after install.") from exc
 
 
+def _ensure_runtime_python_deps(
+    *,
+    model_backend: str,
+    disable_xformers: bool,
+    logger: logging.Logger,
+) -> None:
+    """Ensure required Python modules exist for the selected backend."""
+    required_modules: List[tuple[str, str]] = [
+        ("numpy", "numpy==1.26.4"),
+        ("torch", "torch==2.9.1"),
+        ("decord", "decord>=0.6.0"),
+        ("diffusers", "diffusers>=0.36.0"),
+        ("transformers", "transformers>=5.1.0"),
+        ("accelerate", "accelerate>=1.12.0"),
+        ("kornia", "kornia>=0.8.2"),
+        ("cv2", "opencv-python>=4.11.0.86"),
+        ("imageio", "imageio>=2.37.2"),
+        ("imageio_ffmpeg", "imageio-ffmpeg>=0.6.0"),
+        ("mediapy", "mediapy>=1.2.6"),
+        ("PIL", "pillow>=10.0"),
+        ("huggingface_hub", "huggingface_hub>=0.29.0"),
+        ("fire", "fire>=0.7.1"),
+    ]
+    if not disable_xformers:
+        required_modules.append(("xformers", "xformers==0.0.33.post2"))
+    if model_backend.startswith("geometrycrafter"):
+        required_modules.extend(
+            [
+                ("scipy", "scipy>=1.10"),
+                ("trimesh", "trimesh>=4.0"),
+            ]
+        )
+
+    seen: set[str] = set()
+    for module_name, pip_spec in required_modules:
+        key = module_name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        _ensure_python_module(module_name, pip_spec, logger)
+
+
 def _is_geometry_repo(path: Path) -> bool:
     return (path / "geometrycrafter").is_dir() and (path / "third_party").is_dir()
 
@@ -827,6 +869,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
         default="depthcrafter",
     )
+    parser.add_argument(
+        "--ensure-python-deps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Install any missing runtime Python dependencies before inference starts.",
+    )
     parser.add_argument("--cpu-offload", choices=["model", "sequential", "none"], default="model")
     parser.add_argument("--disable-xformers", action="store_true")
     parser.add_argument("--use-cudnn-benchmark", action="store_true")
@@ -924,6 +972,7 @@ def main() -> int:
             "process_length": args.process_length,
             "output_format": args.output_format,
             "model_backend": args.model_backend,
+            "ensure_python_deps": bool(args.ensure_python_deps),
             "cpu_offload": args.cpu_offload,
             "disable_xformers": bool(args.disable_xformers),
             "local_files_only": bool(args.local_files_only),
@@ -957,13 +1006,18 @@ def main() -> int:
         if isinstance(status.get("params"), dict):
             status["params"]["model_backend"] = model_backend
 
+        if bool(args.ensure_python_deps):
+            _ensure_runtime_python_deps(
+                model_backend=model_backend,
+                disable_xformers=bool(args.disable_xformers),
+                logger=logger,
+            )
+
         size_multiple = 64 if model_backend.startswith("geometrycrafter") else 8
 
         if model_backend == "depthcrafter":
             from depthcrafter.depthcrafter_logic import DepthCrafterDemo as SelectedDemo
         else:
-            _ensure_python_module("kornia", "kornia>=0.8.2", logger)
-            _ensure_python_module("scipy", "scipy>=1.10", logger)
             geometry_repo = _ensure_geometry_repo_available(args.geometry_repo_path, logger)
             if not str(args.geometry_repo_path or "").strip():
                 args.geometry_repo_path = str(geometry_repo)
