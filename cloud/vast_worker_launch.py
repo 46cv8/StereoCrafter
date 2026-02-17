@@ -16,6 +16,7 @@ import argparse
 import ast
 import json
 import os
+import posixpath
 import re
 import shlex
 import socket
@@ -50,6 +51,15 @@ def log(msg: str) -> None:
 
 def shell_join(parts: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(p)) for p in parts)
+
+
+def remote_join(*parts: str) -> str:
+    if not parts:
+        return ""
+    out = parts[0]
+    for part in parts[1:]:
+        out = posixpath.join(out, part)
+    return out
 
 
 def redact_sensitive_cmd(parts: Sequence[str]) -> List[str]:

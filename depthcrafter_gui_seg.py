@@ -314,6 +314,10 @@ class DepthCrafterGUI:
         self.cloud_effective_processing_summary_var = tk.StringVar(value="")
         self.cloud_inherited_processing_summary_var = tk.StringVar(value="")
         self.cloud_blacklist_summary_var = tk.StringVar(value="Blacklist: offers=0, machines=0, hosts=0")
+        self._legacy_cloud_image_migrations = {
+            "ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud": "ghcr.io/46cv8/stereocrafter-cloud:latest",
+            "ghcr.io/46cv8/stereocrafter-depthcrafter:latest": "ghcr.io/46cv8/stereocrafter-cloud:latest",
+        }
         self.save_final_output_json_var = tk.BooleanVar(value=False)
         self.merge_output_format_var = tk.StringVar(value="mp4")
         self.merge_alignment_method_var = tk.StringVar(value="Shift & Scale")
@@ -2552,6 +2556,15 @@ class DepthCrafterGUI:
                     and "spatial_refine_tile_overlap_y_var" not in config
                 ):
                     config["spatial_refine_tile_overlap_y_var"] = config["spatial_refine_tile_overlap_var"]
+                legacy_cloud_image = str(config.get("cloud_image_var", "")).strip()
+                if legacy_cloud_image in self._legacy_cloud_image_migrations:
+                    migrated_image = self._legacy_cloud_image_migrations[legacy_cloud_image]
+                    config["cloud_image_var"] = migrated_image
+                    _logger.info(
+                        "GUI: Migrated legacy cloud image '%s' -> '%s'.",
+                        legacy_cloud_image,
+                        migrated_image,
+                    )
                 loaded_settings_for_tkvars = {k: v for k, v in config.items() if k in self.all_tk_vars}
                 for key, value in loaded_settings_for_tkvars.items():
                     if key in self.all_tk_vars:
