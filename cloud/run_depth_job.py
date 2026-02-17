@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -229,6 +230,283 @@ class _NvidiaSmiPeakTracker:
                 "peak_used_pct_total_all_devices": round(peak_used_pct_total, 3),
             }
 
+
+class _NvidiaSmiTimelineTracker:
+    """Background nvidia-smi sampler for stage interval analytics."""
+
+    def __init__(self, interval_sec: float = 0.5):
+        self.interval_sec = max(0.2, float(interval_sec))
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._samples: List[Dict[str, Any]] = []
+        self._sample_count = 0
+
+    def _sample_once(self) -> None:
+        rows = _query_nvidia_smi_snapshot()
+        if not rows:
+            return
+        used_sum = 0.0
+        total_sum = 0.0
+        util_sum = 0.0
+        for row in rows:
+            used_sum += max(0.0, float(row.get("used_mib", 0.0) or 0.0))
+            total_sum += max(0.0, float(row.get("total_mib", 0.0) or 0.0))
+            util_sum += max(0.0, float(row.get("util_gpu_pct", 0.0) or 0.0))
+        device_count = len(rows)
+        util_mean = (util_sum / device_count) if device_count > 0 else 0.0
+        used_pct = (used_sum / total_sum * 100.0) if total_sum > 0.0 else 0.0
+        entry = {
+            "time_unix": float(time.time()),
+            "used_mib_all_devices": float(used_sum),
+            "total_mib_all_devices": float(total_sum),
+            "used_pct_total_all_devices": float(used_pct),
+            "util_gpu_pct_mean": float(util_mean),
+            "device_count": int(device_count),
+        }
+        with self._lock:
+            self._sample_count += 1
+            self._samples.append(entry)
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            self._sample_once()
+            self._stop_event.wait(self.interval_sec)
+
+    def start(self) -> bool:
+        probe_rows = _query_nvidia_smi_snapshot()
+        if not probe_rows:
+            return False
+        self._sample_once()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._sample_once()
+
+    def sample_count(self) -> int:
+        with self._lock:
+            return int(self._sample_count)
+
+    def get_samples_between(self, start_ts: float, end_ts: float) -> List[Dict[str, Any]]:
+        if end_ts < start_ts:
+            return []
+        with self._lock:
+            return [
+                dict(sample)
+                for sample in self._samples
+                if float(sample.get("time_unix", 0.0) or 0.0) >= start_ts
+                and float(sample.get("time_unix", 0.0) or 0.0) <= end_ts
+            ]
+
+
+def _build_stage_interval_stats(
+    samples: List[Dict[str, Any]],
+    *,
+    start_ts: float,
+    end_ts: float,
+    bucket_sec: float = 5.0,
+) -> Dict[str, Any]:
+    duration_sec = max(0.0, float(end_ts - start_ts))
+    if not samples:
+        return {
+            "duration_seconds": round(duration_sec, 3),
+            "sample_count": 0,
+            "bucket_seconds": float(bucket_sec),
+            "summary": {},
+            "buckets": [],
+        }
+
+    bucket_sec = max(0.5, float(bucket_sec))
+    bucket_count = max(1, int(math.ceil(duration_sec / bucket_sec)))
+    buckets: List[Dict[str, Any]] = [
+        {
+            "index": idx,
+            "start_offset_sec": round(idx * bucket_sec, 3),
+            "end_offset_sec": round(min(duration_sec, (idx + 1) * bucket_sec), 3),
+            "sample_count": 0,
+            "sum_used_mib": 0.0,
+            "sum_used_pct": 0.0,
+            "sum_util_pct": 0.0,
+            "peak_used_mib": 0.0,
+            "peak_used_pct": 0.0,
+            "peak_util_pct": 0.0,
+        }
+        for idx in range(bucket_count)
+    ]
+
+    sum_used_mib = 0.0
+    sum_used_pct = 0.0
+    sum_util_pct = 0.0
+    peak_used_mib = 0.0
+    peak_used_pct = 0.0
+    peak_util_pct = 0.0
+
+    for sample in samples:
+        sample_ts = float(sample.get("time_unix", start_ts) or start_ts)
+        offset = min(max(0.0, sample_ts - start_ts), duration_sec)
+        idx = int(offset // bucket_sec)
+        if idx >= bucket_count:
+            idx = bucket_count - 1
+
+        used_mib = float(sample.get("used_mib_all_devices", 0.0) or 0.0)
+        used_pct = float(sample.get("used_pct_total_all_devices", 0.0) or 0.0)
+        util_pct = float(sample.get("util_gpu_pct_mean", 0.0) or 0.0)
+
+        bucket = buckets[idx]
+        bucket["sample_count"] = int(bucket["sample_count"]) + 1
+        bucket["sum_used_mib"] += used_mib
+        bucket["sum_used_pct"] += used_pct
+        bucket["sum_util_pct"] += util_pct
+        bucket["peak_used_mib"] = max(float(bucket["peak_used_mib"]), used_mib)
+        bucket["peak_used_pct"] = max(float(bucket["peak_used_pct"]), used_pct)
+        bucket["peak_util_pct"] = max(float(bucket["peak_util_pct"]), util_pct)
+
+        sum_used_mib += used_mib
+        sum_used_pct += used_pct
+        sum_util_pct += util_pct
+        peak_used_mib = max(peak_used_mib, used_mib)
+        peak_used_pct = max(peak_used_pct, used_pct)
+        peak_util_pct = max(peak_util_pct, util_pct)
+
+    bucket_out: List[Dict[str, Any]] = []
+    for bucket in buckets:
+        count = int(bucket["sample_count"])
+        if count <= 0:
+            bucket_out.append(
+                {
+                    "index": int(bucket["index"]),
+                    "start_offset_sec": float(bucket["start_offset_sec"]),
+                    "end_offset_sec": float(bucket["end_offset_sec"]),
+                    "sample_count": 0,
+                    "avg_used_mib": 0.0,
+                    "peak_used_mib": 0.0,
+                    "avg_used_pct": 0.0,
+                    "peak_used_pct": 0.0,
+                    "avg_util_pct": 0.0,
+                    "peak_util_pct": 0.0,
+                }
+            )
+            continue
+        bucket_out.append(
+            {
+                "index": int(bucket["index"]),
+                "start_offset_sec": float(bucket["start_offset_sec"]),
+                "end_offset_sec": float(bucket["end_offset_sec"]),
+                "sample_count": count,
+                "avg_used_mib": round(float(bucket["sum_used_mib"]) / count, 3),
+                "peak_used_mib": round(float(bucket["peak_used_mib"]), 3),
+                "avg_used_pct": round(float(bucket["sum_used_pct"]) / count, 3),
+                "peak_used_pct": round(float(bucket["peak_used_pct"]), 3),
+                "avg_util_pct": round(float(bucket["sum_util_pct"]) / count, 3),
+                "peak_util_pct": round(float(bucket["peak_util_pct"]), 3),
+            }
+        )
+
+    count_all = len(samples)
+    return {
+        "duration_seconds": round(duration_sec, 3),
+        "sample_count": int(count_all),
+        "bucket_seconds": float(bucket_sec),
+        "summary": {
+            "avg_used_mib": round(sum_used_mib / count_all, 3),
+            "peak_used_mib": round(peak_used_mib, 3),
+            "avg_used_pct": round(sum_used_pct / count_all, 3),
+            "peak_used_pct": round(peak_used_pct, 3),
+            "avg_util_pct": round(sum_util_pct / count_all, 3),
+            "peak_util_pct": round(peak_util_pct, 3),
+        },
+        "buckets": bucket_out,
+    }
+
+
+def _log_stage_interval_stats(
+    logger: logging.Logger,
+    *,
+    stage_name: str,
+    start_ts: float,
+    end_ts: float,
+    timeline_tracker: _NvidiaSmiTimelineTracker | None,
+    stage_interval_store: List[Dict[str, Any]],
+    job_start_ts: float,
+    payload: Dict[str, Any] | None = None,
+    bucket_sec: float = 5.0,
+) -> None:
+    if timeline_tracker is None:
+        entry = {
+            "stage": stage_name,
+            "start_elapsed_seconds": round(start_ts - job_start_ts, 3),
+            "end_elapsed_seconds": round(end_ts - job_start_ts, 3),
+            "interval_stats": {
+                "duration_seconds": round(max(0.0, end_ts - start_ts), 3),
+                "sample_count": 0,
+                "bucket_seconds": float(bucket_sec),
+                "summary": {},
+                "buckets": [],
+            },
+        }
+        if payload:
+            entry["payload"] = payload
+        stage_interval_store.append(entry)
+        logger.info(
+            "GPU stage interval | stage=%s | t=%.2fs..%.2fs | duration=%.2fs | no timeline samples",
+            stage_name,
+            start_ts - job_start_ts,
+            end_ts - job_start_ts,
+            max(0.0, end_ts - start_ts),
+        )
+        return
+
+    samples = timeline_tracker.get_samples_between(start_ts, end_ts)
+    stats = _build_stage_interval_stats(samples, start_ts=start_ts, end_ts=end_ts, bucket_sec=bucket_sec)
+    entry = {
+        "stage": stage_name,
+        "start_elapsed_seconds": round(start_ts - job_start_ts, 3),
+        "end_elapsed_seconds": round(end_ts - job_start_ts, 3),
+        "interval_stats": stats,
+    }
+    if payload:
+        entry["payload"] = payload
+    stage_interval_store.append(entry)
+
+    summary = stats.get("summary", {}) if isinstance(stats, dict) else {}
+    logger.info(
+        "GPU stage interval | stage=%s | t=%.2fs..%.2fs | duration=%.2fs | samples=%d | mem avg/peak=%.1f/%.1f MiB (avg/peak %%=%.2f/%.2f) | util avg/peak=%.1f/%.1f%%",
+        stage_name,
+        start_ts - job_start_ts,
+        end_ts - job_start_ts,
+        float(stats.get("duration_seconds", 0.0) or 0.0),
+        int(stats.get("sample_count", 0) or 0),
+        float(summary.get("avg_used_mib", 0.0) or 0.0),
+        float(summary.get("peak_used_mib", 0.0) or 0.0),
+        float(summary.get("avg_used_pct", 0.0) or 0.0),
+        float(summary.get("peak_used_pct", 0.0) or 0.0),
+        float(summary.get("avg_util_pct", 0.0) or 0.0),
+        float(summary.get("peak_util_pct", 0.0) or 0.0),
+    )
+
+    for bucket in stats.get("buckets", []):
+        if not isinstance(bucket, dict):
+            continue
+        logger.info(
+            "GPU stage interval 5s | stage=%s | bucket=%d | dt=%.1f-%.1fs | samples=%d | mem avg/peak=%.1f/%.1f MiB (avg/peak %%=%.2f/%.2f) | util avg/peak=%.1f/%.1f%%",
+            stage_name,
+            int(bucket.get("index", 0) or 0),
+            float(bucket.get("start_offset_sec", 0.0) or 0.0),
+            float(bucket.get("end_offset_sec", 0.0) or 0.0),
+            int(bucket.get("sample_count", 0) or 0),
+            float(bucket.get("avg_used_mib", 0.0) or 0.0),
+            float(bucket.get("peak_used_mib", 0.0) or 0.0),
+            float(bucket.get("avg_used_pct", 0.0) or 0.0),
+            float(bucket.get("peak_used_pct", 0.0) or 0.0),
+            float(bucket.get("avg_util_pct", 0.0) or 0.0),
+            float(bucket.get("peak_util_pct", 0.0) or 0.0),
+        )
 
 def _compute_gpu_memory_stats(torch_module: Any, gpu_totals_mib: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
     if torch_module is None:
@@ -548,22 +826,74 @@ def main() -> int:
     }
     stage_gpu_samples: List[Dict[str, Any]] = []
     status["stage_gpu_samples"] = stage_gpu_samples
+    stage_gpu_intervals: List[Dict[str, Any]] = []
+    status["stage_gpu_intervals"] = stage_gpu_intervals
     torch_module = None
     gpu_totals_mib: Dict[int, Dict[str, Any]] = {}
     nvidia_peak_tracker: _NvidiaSmiPeakTracker | None = None
+    nvidia_timeline_tracker: _NvidiaSmiTimelineTracker | None = None
+    active_stage_windows: Dict[str, Dict[str, Any]] = {}
 
     try:
         _validate_runtime_args(args)
         from depthcrafter.depthcrafter_logic import DepthCrafterDemo
         import torch as torch_module
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="runtime_imports_ready",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
-        )
+
+        if torch_module.cuda.is_available():
+            gpu_totals_mib = _query_nvidia_smi_totals_mib()
+
+        nvidia_timeline_tracker = _NvidiaSmiTimelineTracker(interval_sec=0.5)
+        if nvidia_timeline_tracker.start():
+            logger.info(
+                "nvidia-smi timeline sampling enabled (interval=%.2fs).",
+                nvidia_timeline_tracker.interval_sec,
+            )
+        else:
+            nvidia_timeline_tracker = None
+
+        def _record_stage_event(stage: str, payload: Dict[str, Any] | None = None) -> None:
+            _log_stage_gpu_snapshot(
+                logger,
+                stage=stage,
+                torch_module=torch_module,
+                gpu_totals_mib=gpu_totals_mib,
+                stage_log_store=stage_gpu_samples,
+                job_start_ts=start_ts,
+                payload=payload,
+            )
+
+            now_ts = time.time()
+            if stage.endswith("_start"):
+                base_stage = stage[:-6]
+                active_stage_windows[base_stage] = {
+                    "start_ts": now_ts,
+                    "payload_start": dict(payload or {}),
+                }
+                return
+            if stage.endswith("_end"):
+                base_stage = stage[:-4]
+                started = active_stage_windows.pop(base_stage, None)
+                if not started:
+                    return
+                merged_payload: Dict[str, Any] = {}
+                payload_start = started.get("payload_start")
+                if isinstance(payload_start, dict):
+                    merged_payload.update(payload_start)
+                if isinstance(payload, dict):
+                    merged_payload.update(payload)
+                _log_stage_interval_stats(
+                    logger,
+                    stage_name=base_stage,
+                    start_ts=float(started.get("start_ts", now_ts) or now_ts),
+                    end_ts=now_ts,
+                    timeline_tracker=nvidia_timeline_tracker,
+                    stage_interval_store=stage_gpu_intervals,
+                    job_start_ts=start_ts,
+                    payload=merged_payload if merged_payload else None,
+                    bucket_sec=5.0,
+                )
+
+        _record_stage_event("runtime_imports_ready")
 
         target_w = _coerce_multiple_of_8(int(args.target_width), "target width")
         target_h = _coerce_multiple_of_8(int(args.target_height), "target height")
@@ -577,13 +907,8 @@ def main() -> int:
                 target_h,
             )
 
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="model_init_start",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
+        _record_stage_event(
+            "model_init_start",
             payload={"target_width": int(target_w), "target_height": int(target_h)},
         )
         logger.info("Initializing DepthCrafter model...")
@@ -595,17 +920,9 @@ def main() -> int:
             local_files_only=bool(args.local_files_only),
             disable_xformers=bool(args.disable_xformers),
         )
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="model_init_end",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
-        )
+        _record_stage_event("model_init_end")
 
         if torch_module.cuda.is_available():
-            gpu_totals_mib = _query_nvidia_smi_totals_mib()
             device_count = int(torch_module.cuda.device_count())
             for idx in range(device_count):
                 try:
@@ -618,25 +935,10 @@ def main() -> int:
             logger.info("nvidia-smi peak VRAM sampling enabled (interval=%.2fs).", nvidia_peak_tracker.interval_sec)
         else:
             nvidia_peak_tracker = None
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="tracker_start_end",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
-        )
+        _record_stage_event("tracker_start_end")
 
         def _runtime_stage_callback(stage: str, payload: Dict[str, Any]) -> None:
-            _log_stage_gpu_snapshot(
-                logger,
-                stage=stage,
-                torch_module=torch_module,
-                gpu_totals_mib=gpu_totals_mib,
-                stage_log_store=stage_gpu_samples,
-                job_start_ts=start_ts,
-                payload=payload,
-            )
+            _record_stage_event(stage, payload)
 
         demo.runtime_stage_callback = _runtime_stage_callback
 
@@ -664,15 +966,7 @@ def main() -> int:
             args.inference_steps,
             args.output_format,
         )
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="demo_run_start",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
-            payload={"input": str(input_path)},
-        )
+        _record_stage_event("demo_run_start", payload={"input": str(input_path)})
 
         save_path, metadata = demo.run(
             video_path_or_frames_or_info=str(input_path),
@@ -692,15 +986,7 @@ def main() -> int:
             save_final_json_for_this_job_config=True,
             full_video_output_format=str(args.output_format),
         )
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="demo_run_end",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
-            payload={"save_path": str(save_path) if save_path else ""},
-        )
+        _record_stage_event("demo_run_end", payload={"save_path": str(save_path) if save_path else ""})
 
         status["metadata"] = metadata
         status["save_path"] = str(save_path) if save_path else ""
@@ -720,14 +1006,38 @@ def main() -> int:
         status["traceback"] = traceback.format_exc()
         logging.getLogger("cloud.run_depth_job").exception("Depth job failed: %s", exc)
     finally:
-        _log_stage_gpu_snapshot(
-            logger,
-            stage="finalize_start",
-            torch_module=torch_module,
-            gpu_totals_mib=gpu_totals_mib,
-            stage_log_store=stage_gpu_samples,
-            job_start_ts=start_ts,
-        )
+        try:
+            _record_stage_event("finalize_start")
+        except Exception:
+            pass
+
+        # Close any stage spans that started but did not emit an *_end event.
+        if active_stage_windows:
+            close_ts = time.time()
+            for unfinished_stage, started in list(active_stage_windows.items()):
+                try:
+                    _log_stage_interval_stats(
+                        logger,
+                        stage_name=f"{unfinished_stage}_incomplete",
+                        start_ts=float(started.get("start_ts", close_ts) or close_ts),
+                        end_ts=close_ts,
+                        timeline_tracker=nvidia_timeline_tracker,
+                        stage_interval_store=stage_gpu_intervals,
+                        job_start_ts=start_ts,
+                        payload={"unfinished": True},
+                        bucket_sec=5.0,
+                    )
+                except Exception:
+                    continue
+            active_stage_windows.clear()
+
+        if nvidia_timeline_tracker is not None:
+            try:
+                nvidia_timeline_tracker.stop()
+                status["gpu_timeline_sample_count"] = int(nvidia_timeline_tracker.sample_count())
+            except Exception:
+                pass
+
         nvidia_smi_stats: Dict[str, Any] = {}
         if nvidia_peak_tracker is not None:
             try:
