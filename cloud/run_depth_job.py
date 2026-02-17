@@ -304,6 +304,147 @@ def _compute_gpu_memory_stats(torch_module: Any, gpu_totals_mib: Dict[int, Dict[
     }
 
 
+def _collect_stage_gpu_snapshot(torch_module: Any, gpu_totals_mib: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """Collect a point-in-time GPU snapshot (nvidia-smi + torch CUDA memory)."""
+    snapshot: Dict[str, Any] = {
+        "nvidia_smi": {},
+        "torch_cuda": {},
+    }
+
+    rows = _query_nvidia_smi_snapshot()
+    if rows:
+        per_device = []
+        used_sum = 0.0
+        total_sum = 0.0
+        util_sum = 0.0
+        for row in rows:
+            idx = int(row.get("index", 0) or 0)
+            used_mib = float(row.get("used_mib", 0.0) or 0.0)
+            total_mib = float(row.get("total_mib", 0.0) or 0.0)
+            util_gpu_pct = float(row.get("util_gpu_pct", 0.0) or 0.0)
+            used_sum += used_mib
+            total_sum += total_mib
+            util_sum += util_gpu_pct
+            per_device.append(
+                {
+                    "index": idx,
+                    "name": str(row.get("name", gpu_totals_mib.get(idx, {}).get("name", f"cuda:{idx}"))),
+                    "used_mib": round(used_mib, 3),
+                    "total_mib": round(total_mib, 3),
+                    "used_pct_total": round((used_mib / total_mib * 100.0), 3) if total_mib > 0.0 else 0.0,
+                    "util_gpu_pct": round(util_gpu_pct, 3),
+                }
+            )
+        snapshot["nvidia_smi"] = {
+            "device_count": len(per_device),
+            "per_device": per_device,
+            "used_mib_all_devices": round(used_sum, 3),
+            "total_mib_all_devices": round(total_sum, 3),
+            "used_pct_total_all_devices": round((used_sum / total_sum * 100.0), 3) if total_sum > 0.0 else 0.0,
+            "util_gpu_pct_mean": round(util_sum / len(per_device), 3) if per_device else 0.0,
+        }
+
+    if torch_module is not None and getattr(torch_module, "cuda", None) and torch_module.cuda.is_available():
+        try:
+            device_count = int(torch_module.cuda.device_count())
+        except Exception:
+            device_count = 0
+        per_device_torch = []
+        alloc_sum = 0.0
+        reserved_sum = 0.0
+        total_sum = 0.0
+        for idx in range(device_count):
+            totals_entry = gpu_totals_mib.get(idx, {})
+            total_mib = float(totals_entry.get("total_mib", 0.0) or 0.0)
+            try:
+                alloc_mib = float(torch_module.cuda.memory_allocated(idx)) / (1024.0 ** 2)
+            except Exception:
+                alloc_mib = 0.0
+            try:
+                reserved_mib = float(torch_module.cuda.memory_reserved(idx)) / (1024.0 ** 2)
+            except Exception:
+                reserved_mib = 0.0
+            try:
+                peak_alloc_mib = float(torch_module.cuda.max_memory_allocated(idx)) / (1024.0 ** 2)
+            except Exception:
+                peak_alloc_mib = 0.0
+            try:
+                peak_reserved_mib = float(torch_module.cuda.max_memory_reserved(idx)) / (1024.0 ** 2)
+            except Exception:
+                peak_reserved_mib = 0.0
+            alloc_sum += alloc_mib
+            reserved_sum += reserved_mib
+            total_sum += total_mib
+            per_device_torch.append(
+                {
+                    "index": idx,
+                    "name": str(totals_entry.get("name", f"cuda:{idx}")),
+                    "alloc_mib": round(alloc_mib, 3),
+                    "reserved_mib": round(reserved_mib, 3),
+                    "peak_alloc_mib": round(peak_alloc_mib, 3),
+                    "peak_reserved_mib": round(peak_reserved_mib, 3),
+                    "total_mib": round(total_mib, 3),
+                }
+            )
+        snapshot["torch_cuda"] = {
+            "device_count": device_count,
+            "per_device": per_device_torch,
+            "alloc_mib_all_devices": round(alloc_sum, 3),
+            "reserved_mib_all_devices": round(reserved_sum, 3),
+            "total_mib_all_devices": round(total_sum, 3),
+            "alloc_pct_total_all_devices": round((alloc_sum / total_sum * 100.0), 3) if total_sum > 0.0 else 0.0,
+            "reserved_pct_total_all_devices": round((reserved_sum / total_sum * 100.0), 3) if total_sum > 0.0 else 0.0,
+        }
+
+    return snapshot
+
+
+def _log_stage_gpu_snapshot(
+    logger: logging.Logger,
+    *,
+    stage: str,
+    torch_module: Any,
+    gpu_totals_mib: Dict[int, Dict[str, Any]],
+    stage_log_store: List[Dict[str, Any]],
+    job_start_ts: float,
+    payload: Dict[str, Any] | None = None,
+) -> None:
+    now_ts = time.time()
+    snapshot = _collect_stage_gpu_snapshot(torch_module, gpu_totals_mib)
+    entry: Dict[str, Any] = {
+        "stage": stage,
+        "time_unix": round(now_ts, 6),
+        "elapsed_seconds": round(now_ts - job_start_ts, 3),
+        "snapshot": snapshot,
+    }
+    if payload:
+        entry["payload"] = payload
+    stage_log_store.append(entry)
+
+    nvsmi = snapshot.get("nvidia_smi", {}) if isinstance(snapshot, dict) else {}
+    torch_cuda = snapshot.get("torch_cuda", {}) if isinstance(snapshot, dict) else {}
+    nvsmi_used = float(nvsmi.get("used_mib_all_devices", 0.0) or 0.0)
+    nvsmi_pct = float(nvsmi.get("used_pct_total_all_devices", 0.0) or 0.0)
+    nvsmi_util = float(nvsmi.get("util_gpu_pct_mean", 0.0) or 0.0)
+    torch_alloc = float(torch_cuda.get("alloc_mib_all_devices", 0.0) or 0.0)
+    torch_reserved = float(torch_cuda.get("reserved_mib_all_devices", 0.0) or 0.0)
+    torch_alloc_pct = float(torch_cuda.get("alloc_pct_total_all_devices", 0.0) or 0.0)
+    torch_reserved_pct = float(torch_cuda.get("reserved_pct_total_all_devices", 0.0) or 0.0)
+
+    logger.info(
+        "GPU stage snapshot | stage=%s | t=%.2fs | nvidia_smi used=%.1f MiB (%.2f%%) util_mean=%.1f%% | torch alloc=%.1f MiB (%.2f%%) reserved=%.1f MiB (%.2f%%)",
+        stage,
+        now_ts - job_start_ts,
+        nvsmi_used,
+        nvsmi_pct,
+        nvsmi_util,
+        torch_alloc,
+        torch_alloc_pct,
+        torch_reserved,
+        torch_reserved_pct,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one headless DepthCrafter job.")
     parser.add_argument("--input", required=False, help="Input video path on remote machine.")
@@ -405,6 +546,8 @@ def main() -> int:
             "pretrain_path": args.pretrain_path,
         },
     }
+    stage_gpu_samples: List[Dict[str, Any]] = []
+    status["stage_gpu_samples"] = stage_gpu_samples
     torch_module = None
     gpu_totals_mib: Dict[int, Dict[str, Any]] = {}
     nvidia_peak_tracker: _NvidiaSmiPeakTracker | None = None
@@ -413,6 +556,14 @@ def main() -> int:
         _validate_runtime_args(args)
         from depthcrafter.depthcrafter_logic import DepthCrafterDemo
         import torch as torch_module
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="runtime_imports_ready",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
+        )
 
         target_w = _coerce_multiple_of_8(int(args.target_width), "target width")
         target_h = _coerce_multiple_of_8(int(args.target_height), "target height")
@@ -426,6 +577,15 @@ def main() -> int:
                 target_h,
             )
 
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="model_init_start",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
+            payload={"target_width": int(target_w), "target_height": int(target_h)},
+        )
         logger.info("Initializing DepthCrafter model...")
         demo = DepthCrafterDemo(
             unet_path=args.unet_path,
@@ -434,6 +594,14 @@ def main() -> int:
             use_cudnn_benchmark=bool(args.use_cudnn_benchmark),
             local_files_only=bool(args.local_files_only),
             disable_xformers=bool(args.disable_xformers),
+        )
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="model_init_end",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
         )
 
         if torch_module.cuda.is_available():
@@ -450,6 +618,27 @@ def main() -> int:
             logger.info("nvidia-smi peak VRAM sampling enabled (interval=%.2fs).", nvidia_peak_tracker.interval_sec)
         else:
             nvidia_peak_tracker = None
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="tracker_start_end",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
+        )
+
+        def _runtime_stage_callback(stage: str, payload: Dict[str, Any]) -> None:
+            _log_stage_gpu_snapshot(
+                logger,
+                stage=stage,
+                torch_module=torch_module,
+                gpu_totals_mib=gpu_totals_mib,
+                stage_log_store=stage_gpu_samples,
+                job_start_ts=start_ts,
+                payload=payload,
+            )
+
+        demo.runtime_stage_callback = _runtime_stage_callback
 
         if args.prewarm_only:
             status["status"] = "success"
@@ -475,6 +664,15 @@ def main() -> int:
             args.inference_steps,
             args.output_format,
         )
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="demo_run_start",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
+            payload={"input": str(input_path)},
+        )
 
         save_path, metadata = demo.run(
             video_path_or_frames_or_info=str(input_path),
@@ -493,6 +691,15 @@ def main() -> int:
             intermediate_segment_visual_format_config="none",
             save_final_json_for_this_job_config=True,
             full_video_output_format=str(args.output_format),
+        )
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="demo_run_end",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
+            payload={"save_path": str(save_path) if save_path else ""},
         )
 
         status["metadata"] = metadata
@@ -513,6 +720,14 @@ def main() -> int:
         status["traceback"] = traceback.format_exc()
         logging.getLogger("cloud.run_depth_job").exception("Depth job failed: %s", exc)
     finally:
+        _log_stage_gpu_snapshot(
+            logger,
+            stage="finalize_start",
+            torch_module=torch_module,
+            gpu_totals_mib=gpu_totals_mib,
+            stage_log_store=stage_gpu_samples,
+            job_start_ts=start_ts,
+        )
         nvidia_smi_stats: Dict[str, Any] = {}
         if nvidia_peak_tracker is not None:
             try:

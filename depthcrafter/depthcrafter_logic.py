@@ -65,6 +65,7 @@ class DepthCrafterDemo:
         local_files_only: bool = False, 
         disable_xformers=False
     ):
+        self.runtime_stage_callback = None
         torch.backends.cudnn.benchmark = use_cudnn_benchmark
         try:
             unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
@@ -131,6 +132,16 @@ class DepthCrafterDemo:
         except Exception as e:
             _logger.critical(f"CRITICAL: Failed to initialize DepthCrafterPipeline: {e}", exc_info=True)
             raise # Re-raise after logging
+
+    def _emit_runtime_stage(self, stage: str, **payload):
+        callback = getattr(self, "runtime_stage_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(stage, payload)
+        except Exception:
+            # Diagnostics callback failures must never break processing.
+            pass
 
     def _setup_paths(self, base_output_folder: str, original_video_basename: str,
                      segment_job_info: Optional[dict]) -> Tuple[str, str, str]:
@@ -203,6 +214,14 @@ class DepthCrafterDemo:
                      segment_job_info: Optional[dict],
                      job_specific_metadata: dict
                      ) -> Tuple[Optional[np.ndarray], float, int, int]:
+        self._emit_runtime_stage(
+            "logic_load_frames_start",
+            source_type=type(video_path_or_job_info).__name__,
+            process_length_for_read=int(process_length_for_read),
+            target_height=int(user_target_height),
+            target_width=int(user_target_width),
+            is_segment=bool(segment_job_info),
+        )
         actual_frames_to_process = None
         actual_fps_for_save = 30.0
         original_h_loaded, original_w_loaded = None, None
@@ -317,6 +336,13 @@ class DepthCrafterDemo:
             job_specific_metadata["original_height_loaded"] = original_h_loaded
             job_specific_metadata["original_width_loaded"] = original_w_loaded
 
+        self._emit_runtime_stage(
+            "logic_load_frames_end",
+            frames_loaded=int(actual_frames_to_process.shape[0]) if isinstance(actual_frames_to_process, np.ndarray) else 0,
+            processed_height=int(job_specific_metadata["processed_height"]) if isinstance(job_specific_metadata.get("processed_height"), (int, np.integer)) else -1,
+            processed_width=int(job_specific_metadata["processed_width"]) if isinstance(job_specific_metadata.get("processed_width"), (int, np.integer)) else -1,
+            output_fps=float(actual_fps_for_save),
+        )
         return actual_frames_to_process, actual_fps_for_save, job_specific_metadata["processed_height"], job_specific_metadata["processed_width"]
 
     def _handle_no_frames_failure(self, job_specific_metadata: dict, full_save_path: str,
@@ -362,6 +388,16 @@ class DepthCrafterDemo:
             current_pipe_overlap_for_call = 0
 
         _logger.debug(f"Starting inference: Frames: {actual_frames_to_process.shape[0]}, Res: {actual_frames_to_process.shape[1]}x{actual_frames_to_process.shape[2]}, Scale: {guidance_scale}, Steps: {num_denoising_steps}, Win: {current_pipe_window_for_call}, Ovlp: {current_pipe_overlap_for_call}")
+        self._emit_runtime_stage(
+            "logic_inference_start",
+            frames=int(actual_frames_to_process.shape[0]),
+            height=int(actual_processed_height),
+            width=int(actual_processed_width),
+            guidance_scale=float(guidance_scale),
+            steps=int(num_denoising_steps),
+            window_size=int(current_pipe_window_for_call),
+            overlap=int(current_pipe_overlap_for_call),
+        )
         with torch.inference_mode():
             res = self.pipe(
                 actual_frames_to_process,
@@ -372,8 +408,15 @@ class DepthCrafterDemo:
                 num_inference_steps=num_denoising_steps,
                 window_size=current_pipe_window_for_call,
                 overlap=current_pipe_overlap_for_call,
+                runtime_stage_callback=getattr(self, "runtime_stage_callback", None),
             ).frames[0]
         _logger.debug(f"Inference completed. Result shape: {res.shape}")
+        self._emit_runtime_stage(
+            "logic_inference_end",
+            result_frames=int(res.shape[0]) if res.ndim >= 1 else 0,
+            result_height=int(res.shape[1]) if res.ndim >= 2 else 0,
+            result_width=int(res.shape[2]) if res.ndim >= 3 else 0,
+        )
 
         if res.ndim == 4 and res.shape[-1] > 1: 
             res = res.sum(-1) / res.shape[-1]
@@ -455,6 +498,13 @@ class DepthCrafterDemo:
 
     def _save_full_video_output(self, res: np.ndarray, full_save_path: str,
                                 actual_fps_for_save: float, job_specific_metadata: dict) -> bool:
+        self._emit_runtime_stage(
+            "logic_save_full_video_start",
+            output_path=str(full_save_path),
+            frames=int(res.shape[0]) if res.ndim >= 1 else 0,
+            fps=float(actual_fps_for_save),
+            output_format=str(job_specific_metadata.get("preferred_output_format", "mp4")),
+        )
         res_min_full, res_max_full = res.min(), res.max()
         if res_max_full != res_min_full:
             res_normalized_for_mp4 = (res - res_min_full) / (res_max_full - res_min_full)
@@ -475,10 +525,21 @@ class DepthCrafterDemo:
 
             save_video(res_normalized_for_mp4, full_save_path, fps=save_video_fps_full, output_format=output_format_for_full_video)
             _logger.debug(f"Successfully saved: {full_save_path}")
+            self._emit_runtime_stage(
+                "logic_save_full_video_end",
+                output_path=str(full_save_path),
+                success=True,
+            )
             return True
         except Exception as e_save_mp4:
             _logger.error(f"Failed to save: {full_save_path}. Reason: Full video MP4 save error: {e_save_mp4}")
             job_specific_metadata["status"] = "failure_mp4_save"
+            self._emit_runtime_stage(
+                "logic_save_full_video_end",
+                output_path=str(full_save_path),
+                success=False,
+                error=str(e_save_mp4),
+            )
             return False
 
     def _finalize_job_metadata_and_save_json(self, job_specific_metadata: dict, infer_start_time: float,

@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -104,6 +104,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         return_dict: bool = True,
         overlap: int = 25,
         track_time: bool = False,
+        runtime_stage_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         """
         :param video: in shape [t, h, w, c] if np.ndarray or [t, c, h, w] if torch.Tensor, in range [0, 1]
@@ -124,6 +125,15 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         :param return_dict:
         :return:
         """
+        def _emit_stage(stage: str, **payload: Any) -> None:
+            if runtime_stage_callback is None:
+                return
+            try:
+                runtime_stage_callback(stage, payload)
+            except Exception:
+                # Stage diagnostics must never break inference flow.
+                pass
+
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -136,6 +146,14 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(video, height, width)
+        _emit_stage(
+            "pipe_call_start",
+            num_frames=int(num_frames),
+            height=int(height),
+            width=int(width),
+            window_size=int(window_size),
+            overlap=int(overlap),
+        )
 
         # 2. Define call parameters
         batch_size = 1
@@ -160,11 +178,13 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             decode_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
 
+        _emit_stage("pipe_encode_video_start", chunk_size=int(decode_chunk_size))
         video_embeddings = self.encode_video(
             video, chunk_size=decode_chunk_size
         ).unsqueeze(
             0
         )  # [1, t, 1024]
+        _emit_stage("pipe_encode_video_end", embedding_frames=int(video_embeddings.shape[1]))
         torch.cuda.empty_cache()
         # 4. Encode input image using VAE
         noise = randn_tensor(
@@ -179,12 +199,18 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
+        _emit_stage("pipe_encode_vae_start", chunk_size=int(decode_chunk_size))
         video_latents = self.encode_vae_video(
             video.to(self.vae.dtype),
             chunk_size=decode_chunk_size,
         ).unsqueeze(
             0
         )  # [1, t, c, h, w]
+        _emit_stage(
+            "pipe_encode_vae_end",
+            latent_frames=int(video_latents.shape[1]),
+            latent_channels=int(video_latents.shape[2]),
+        )
 
         if track_time:
             encode_event.record()
@@ -243,8 +269,18 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
 
         # inference strategy for long videos
         # two main strategies: 1. noise init from previous frame, 2. segments stitching
+        _emit_stage(
+            "pipe_denoise_start",
+            num_frames=int(num_frames),
+            window_size=int(window_size),
+            overlap=int(overlap),
+            stride=int(stride),
+            num_inference_steps=int(num_inference_steps),
+        )
+        window_count = 0
         while idx_start < num_frames - overlap:
             idx_end = min(idx_start + window_size, num_frames)
+            window_count += 1
             self.scheduler.set_timesteps(num_inference_steps, device=device)
 
             # 9. Denoising loop
@@ -341,6 +377,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 latents_all = torch.cat([latents_all, latents[:, overlap:]], dim=1)
 
             idx_start += stride
+        _emit_stage("pipe_denoise_end", windows=int(window_count))
 
         if track_time:
             denoise_event.record()
@@ -352,7 +389,9 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             # cast back to fp16 if needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
+            _emit_stage("pipe_decode_start", decode_chunk_size=int(decode_chunk_size))
             frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
+            _emit_stage("pipe_decode_end")
 
             if track_time:
                 decode_event.record()
@@ -360,13 +399,17 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 elapsed_time_ms = denoise_event.elapsed_time(decode_event)
                 print(f"Elapsed time for decoding video: {elapsed_time_ms} ms")
 
+            _emit_stage("pipe_postprocess_start", output_type=str(output_type))
             frames = self.video_processor.postprocess_video(
                 video=frames, output_type=output_type
             )
+            _emit_stage("pipe_postprocess_end")
         else:
             frames = latents_all
 
+        _emit_stage("pipe_free_model_hooks_start")
         self.maybe_free_model_hooks()
+        _emit_stage("pipe_free_model_hooks_end")
 
         if not return_dict:
             return frames
