@@ -171,6 +171,7 @@ class DepthCrafterGUI:
     DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
     CLOUD_BLACKLIST_PATH = os.path.join("cloud", "cloud_blacklist.json")
     CLOUD_PROVIDER_HISTORY_PATH = os.path.join("cloud", "cloud_provider_history.json")
+    CLOUD_GPU_RAM_TOLERANCE_GB = 0.25
     CLOUD_PROFILE_DEFAULTS = {
         "5090_32gb": {
             "label": "RTX 5090 32GB",
@@ -4858,21 +4859,37 @@ class DepthCrafterGUI:
             "expected_download_gb": expected_download_gb,
         }
 
-    def _build_cloud_offer_search_query(self, profile_key: str) -> Tuple[str, Dict[str, object]]:
+    def _build_cloud_offer_search_query(
+        self,
+        profile_key: str,
+        require_verified_override: Optional[bool] = None,
+        max_dph_override: Optional[float] = None,
+    ) -> Tuple[str, Dict[str, object]]:
         profile_defaults = self._get_cloud_profile_defaults(profile_key)
         offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "")).strip()
-        require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
+        min_gpu_ram_gb = max(0.0, float(profile_defaults.get("min_gpu_ram_gb", 0.0)))
+        if require_verified_override is None:
+            require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
+        else:
+            require_verified_hosts = bool(require_verified_override)
         min_reliability = 0.97
         min_cuda = 12.8
         min_direct_ports = 2
         min_inet_down = 200.0
         min_inet_up = 50.0
         disk_gb = max(20, self._safe_int_from_tk_var(self.cloud_disk_gb_var, 40))
-        max_dph = max(0.0, self._safe_float_from_tk_var(self.cloud_max_dph_var, 0.0))
+        if max_dph_override is None:
+            max_dph = max(0.0, self._safe_float_from_tk_var(self.cloud_max_dph_var, 0.0))
+        else:
+            try:
+                max_dph = max(0.0, float(max_dph_override))
+            except Exception:
+                max_dph = 0.0
 
         query_parts = [
             "rentable=true",
             "num_gpus=1",
+            f"gpu_ram>={min_gpu_ram_gb:.1f}",
             f"cuda_vers>={min_cuda}",
             f"reliability>={min_reliability}",
             f"disk_space>={disk_gb}",
@@ -4888,20 +4905,16 @@ class DepthCrafterGUI:
             query_parts.append(f"dph<={max_dph}")
         return " ".join(query_parts), profile_defaults
 
-    def _fetch_ranked_cloud_offers_for_confirmation(self, profile_key: str) -> List[Dict[str, Any]]:
-        query, profile_defaults = self._build_cloud_offer_search_query(profile_key)
-        offer_limit = max(1, self._safe_int_from_tk_var(self.cloud_offer_limit_var, 30))
-        disk_gb = max(20, self._safe_int_from_tk_var(self.cloud_disk_gb_var, 40))
-
+    def _run_cloud_offer_search_query(self, query: str, offer_limit: int, disk_gb: int) -> List[Dict[str, Any]]:
         search_cmd = self._build_vast_cli_cmd([
             "search",
             "offers",
             query,
             "--raw",
             "--limit",
-            str(offer_limit),
+            str(max(1, int(offer_limit))),
             "--storage",
-            str(disk_gb),
+            str(max(20, int(disk_gb))),
             "--order",
             "dph_total",
             "--no-default",
@@ -4912,24 +4925,70 @@ class DepthCrafterGUI:
         )
         if rc != 0:
             raise RuntimeError(f"vastai search offers failed with exit code {rc}.")
-
         raw_payload = "\n".join(lines).strip()
         parsed_payload = self._parse_json_like_payload(raw_payload)
-        if not isinstance(parsed_payload, list) or not parsed_payload:
-            raise RuntimeError("No cloud offers returned for current profile/filter settings.")
+        if not isinstance(parsed_payload, list):
+            return []
+        return [entry for entry in parsed_payload if isinstance(entry, dict)]
+
+    def _fetch_ranked_cloud_offers_for_confirmation(self, profile_key: str) -> List[Dict[str, Any]]:
+        query, profile_defaults = self._build_cloud_offer_search_query(profile_key)
+        offer_limit = max(1, self._safe_int_from_tk_var(self.cloud_offer_limit_var, 30))
+        disk_gb = max(20, self._safe_int_from_tk_var(self.cloud_disk_gb_var, 40))
+        require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
+        max_dph = max(0.0, self._safe_float_from_tk_var(self.cloud_max_dph_var, 0.0))
+        parsed_payload = self._run_cloud_offer_search_query(query, offer_limit=offer_limit, disk_gb=disk_gb)
+        if not parsed_payload:
+            diagnostics: List[str] = []
+            if require_verified_hosts:
+                unverified_query, _ = self._build_cloud_offer_search_query(
+                    profile_key,
+                    require_verified_override=False,
+                    max_dph_override=max_dph,
+                )
+                unverified_payload = self._run_cloud_offer_search_query(
+                    unverified_query,
+                    offer_limit=offer_limit,
+                    disk_gb=disk_gb,
+                )
+                if unverified_payload:
+                    diagnostics.append(
+                        f"{len(unverified_payload)} offers appear when verified-host filter is disabled"
+                    )
+            if max_dph > 0.0:
+                uncapped_query, _ = self._build_cloud_offer_search_query(
+                    profile_key,
+                    require_verified_override=require_verified_hosts,
+                    max_dph_override=0.0,
+                )
+                uncapped_payload = self._run_cloud_offer_search_query(
+                    uncapped_query,
+                    offer_limit=offer_limit,
+                    disk_gb=disk_gb,
+                )
+                if uncapped_payload:
+                    diagnostics.append(
+                        f"{len(uncapped_payload)} offers appear when max $/h cap is removed"
+                    )
+            message = "No cloud offers returned for current profile/filter settings."
+            if diagnostics:
+                message += " Possible blockers: " + "; ".join(diagnostics) + "."
+            raise RuntimeError(message)
 
         blacklist_data = self._load_cloud_blacklist_data()
         min_gpu_ram_gb = float(profile_defaults.get("min_gpu_ram_gb", 0.0))
         ranked_offers: List[Dict[str, Any]] = []
         skipped_blacklist_count = 0
+        skipped_vram_count = 0
         for entry in parsed_payload:
-            if not isinstance(entry, dict):
-                continue
             if self._is_cloud_offer_blacklisted(entry, blacklist_data):
                 skipped_blacklist_count += 1
                 continue
             vram_gb = self._normalized_gpu_ram_gb(entry)
-            if vram_gb + 1e-6 < min_gpu_ram_gb:
+            # Vast often reports 48GB-class cards at ~47.99 GiB (e.g. 49140 MB-like units).
+            # Keep a small tolerance so those cards are not wrongly filtered out.
+            if vram_gb + self.CLOUD_GPU_RAM_TOLERANCE_GB < min_gpu_ram_gb:
+                skipped_vram_count += 1
                 continue
             cost_data = self._estimate_offer_total_cost(entry)
             enriched = dict(entry)
@@ -4943,9 +5002,13 @@ class DepthCrafterGUI:
             ranked_offers.append(enriched)
 
         if not ranked_offers:
+            detail = (
+                f"raw={len(parsed_payload)}, blacklisted={skipped_blacklist_count}, "
+                f"vram_filtered={skipped_vram_count}, min_vram={min_gpu_ram_gb:.1f}GB"
+            )
             raise RuntimeError(
                 f"No cloud offers passed filters for profile '{profile_key}' "
-                f"(VRAM>={min_gpu_ram_gb:.1f}GB, blacklisted skipped={skipped_blacklist_count})."
+                f"({detail})."
             )
 
         ranked_offers.sort(

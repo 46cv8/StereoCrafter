@@ -170,6 +170,7 @@ PROFILES: Dict[str, GPUProfile] = {
         overlap=25,
     ),
 }
+GPU_RAM_TOLERANCE_GB = 0.25
 
 
 def resolve_api_key(args: argparse.Namespace) -> str:
@@ -280,6 +281,7 @@ def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
     parts = [
         "rentable=true",
         "num_gpus=1",
+        f"gpu_ram>={max(0.0, float(profile.min_gpu_ram_gb)):.1f}",
         f"cuda_vers>={args.min_cuda}",
         f"reliability>={args.min_reliability}",
         f"disk_space>={args.disk}",
@@ -294,6 +296,32 @@ def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
     if args.max_dph > 0:
         parts.append(f"dph<={args.max_dph}")
     return " ".join(parts)
+
+
+def run_offer_search(query: str, args: argparse.Namespace, api_key: str) -> List[Dict[str, Any]]:
+    search_cmd = [
+        "vastai",
+        "search",
+        "offers",
+        query,
+        "--raw",
+        "--limit",
+        str(args.offer_limit),
+        "--storage",
+        str(args.disk),
+        "--order",
+        args.search_order,
+        "--no-default",
+    ]
+    if args.offer_type != "on-demand":
+        search_cmd += ["--type", args.offer_type]
+    search_cmd = with_api_key(search_cmd, api_key)
+
+    search_proc = run_cmd(search_cmd, capture=True)
+    search_payload = parse_json_like(search_proc.stdout or "")
+    if not isinstance(search_payload, list):
+        return []
+    return [offer for offer in search_payload if isinstance(offer, dict)]
 
 
 def normalize_blacklist_payload(payload: Any) -> Dict[str, set]:
@@ -1076,28 +1104,31 @@ def main() -> int:
     hf_env_payload = resolve_hf_env_payload(args)
     query = build_search_query(profile, args)
 
-    search_cmd = [
-        "vastai",
-        "search",
-        "offers",
-        query,
-        "--raw",
-        "--limit",
-        str(args.offer_limit),
-        "--storage",
-        str(args.disk),
-        "--order",
-        args.search_order,
-        "--no-default",
-    ]
-    if args.offer_type != "on-demand":
-        search_cmd += ["--type", args.offer_type]
-    search_cmd = with_api_key(search_cmd, api_key)
-
-    search_proc = run_cmd(search_cmd, capture=True)
-    search_payload = parse_json_like(search_proc.stdout or "")
-    if not isinstance(search_payload, list) or not search_payload:
-        raise VastWorkerLaunchError(f"No offers matched query for profile '{profile.key}'. Query: {query}")
+    search_payload = run_offer_search(query, args, api_key)
+    if not search_payload:
+        diagnostics = []
+        if not bool(args.allow_unverified):
+            args_unverified = argparse.Namespace(**vars(args))
+            args_unverified.allow_unverified = True
+            query_unverified = build_search_query(profile, args_unverified)
+            payload_unverified = run_offer_search(query_unverified, args_unverified, api_key)
+            if payload_unverified:
+                diagnostics.append(
+                    f"{len(payload_unverified)} offers appear when verified-host filter is disabled (--allow-unverified)"
+                )
+        if float(args.max_dph) > 0.0:
+            args_uncapped = argparse.Namespace(**vars(args))
+            args_uncapped.max_dph = 0.0
+            query_uncapped = build_search_query(profile, args_uncapped)
+            payload_uncapped = run_offer_search(query_uncapped, args_uncapped, api_key)
+            if payload_uncapped:
+                diagnostics.append(
+                    f"{len(payload_uncapped)} offers appear when max-dph cap is removed (--max-dph 0)"
+                )
+        message = f"No offers matched query for profile '{profile.key}'. Query: {query}"
+        if diagnostics:
+            message += " Possible blockers: " + "; ".join(diagnostics)
+        raise VastWorkerLaunchError(message)
 
     blacklist = load_blacklist_file(args.blacklist_file)
     blocked_offer_count = len(blacklist.get("blocked_offer_ids", set()))
@@ -1105,20 +1136,23 @@ def main() -> int:
     blocked_host_count = len(blacklist.get("blocked_host_ids", set()))
     skipped_blacklist_count = 0
     offers = []
+    skipped_vram_count = 0
     for offer in search_payload:
-        if not isinstance(offer, dict):
-            continue
         if offer_is_blacklisted(offer, blacklist):
             skipped_blacklist_count += 1
             continue
-        if normalized_gpu_ram_gb(offer) + 1e-6 < profile.min_gpu_ram_gb:
+        # Vast may report 48GB-class GPUs as ~47.99 GiB after unit normalization.
+        if normalized_gpu_ram_gb(offer) + GPU_RAM_TOLERANCE_GB < profile.min_gpu_ram_gb:
+            skipped_vram_count += 1
             continue
         offers.append(annotate_offer(offer, args))
     if not offers:
+        detail = (
+            f"raw={len(search_payload)}, blacklisted={skipped_blacklist_count}, "
+            f"vram_filtered={skipped_vram_count}, min_vram={profile.min_gpu_ram_gb:.1f}GB"
+        )
         raise VastWorkerLaunchError(
-            f"No offers matched query for profile '{profile.key}' after filters "
-            f"(RAM guard {profile.min_gpu_ram_gb:.1f}GB, blacklist skipped {skipped_blacklist_count}). "
-            f"Query: {query}"
+            f"No offers matched query for profile '{profile.key}' after filters ({detail}). Query: {query}"
         )
     offers.sort(
         key=lambda offer: (
