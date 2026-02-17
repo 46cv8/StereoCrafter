@@ -28,8 +28,9 @@ from urllib.request import urlopen
 # Configure a logger for this module
 _logger = logging.getLogger(__name__)
 
-# Import the backend logic class
+# Import backend logic classes
 from depthcrafter.depthcrafter_logic import DepthCrafterDemo
+from depthcrafter.geometrycrafter_logic import GeometryCrafterDemo
 
 from depthcrafter.utils import (
     format_duration,
@@ -225,6 +226,16 @@ class DepthCrafterGUI:
         self.inference_steps = tk.IntVar(value=5)
         self.seed = tk.IntVar(value=42)
         self.cpu_offload = tk.StringVar(value="model")
+        self.model_backend_var = tk.StringVar(value="depthcrafter")
+        self.geometry_model_path_var = tk.StringVar(value="TencentARC/GeometryCrafter")
+        self.geometry_repo_path_var = tk.StringVar(value=os.path.normpath("./weights/GeometryCrafter"))
+        self.geometry_cache_dir_var = tk.StringVar(value=os.path.normpath("./weights/hf_cache"))
+        self.geometry_decode_chunk_size_var = tk.IntVar(value=8)
+        self.geometry_low_memory_usage_var = tk.BooleanVar(value=False)
+        self.geometry_force_projection_var = tk.BooleanVar(value=True)
+        self.geometry_force_fixed_focal_var = tk.BooleanVar(value=True)
+        self.geometry_use_extract_interp_var = tk.BooleanVar(value=False)
+        self.geometry_local_status_var = tk.StringVar(value="Geometry local prerequisites: not checked.")
         self.use_cudnn_benchmark = tk.BooleanVar(value=False)
         self.process_length = tk.IntVar(value=-1)
         self.target_fps = tk.DoubleVar(value=-1.0)
@@ -345,6 +356,15 @@ class DepthCrafterGUI:
             "inference_steps": self.inference_steps,
             "seed": self.seed,
             "cpu_offload": self.cpu_offload,
+            "model_backend_var": self.model_backend_var,
+            "geometry_model_path_var": self.geometry_model_path_var,
+            "geometry_repo_path_var": self.geometry_repo_path_var,
+            "geometry_cache_dir_var": self.geometry_cache_dir_var,
+            "geometry_decode_chunk_size_var": self.geometry_decode_chunk_size_var,
+            "geometry_low_memory_usage_var": self.geometry_low_memory_usage_var,
+            "geometry_force_projection_var": self.geometry_force_projection_var,
+            "geometry_force_fixed_focal_var": self.geometry_force_fixed_focal_var,
+            "geometry_use_extract_interp_var": self.geometry_use_extract_interp_var,
             "use_cudnn_benchmark": self.use_cudnn_benchmark,
             "process_length": self.process_length,
             "target_fps": self.target_fps,
@@ -441,11 +461,14 @@ class DepthCrafterGUI:
         self._help_data = None
         self.spatial_refine_settings_dialog = None
         self.spatial_refine_settings_widgets = []
+        self.geometry_settings_dialog = None
+        self.geometry_settings_widgets = []
         self.cloud_settings_dialog = None
         self.cloud_settings_widgets = []
         self.cloud_processing_overrides_expanded = False
         self.cloud_processing_overrides_toggle_btn = None
         self.cloud_processing_overrides_frame = None
+        self.geometry_settings_toggle_btn = None
         self.active_external_process = None
 
         self.last_settings_dir = os.getcwd()
@@ -475,6 +498,8 @@ class DepthCrafterGUI:
 
         self._create_menubar()
         self.create_widgets() 
+        self._bind_geometry_status_traces()
+        self._refresh_geometry_local_status()
         self._bind_cloud_processing_summary_traces()
         self._refresh_cloud_processing_summary()
         self.root.app_instance = self 
@@ -522,6 +547,7 @@ class DepthCrafterGUI:
         if hasattr(self, 'process_as_segments_var'):
             self.toggle_merge_related_options_active_state()
         self._apply_spatial_refine_options_visibility()
+        self._refresh_geometry_local_status()
         # Removed update GUI verbosity
 
     def _apply_theme(self, is_startup: bool = False):
@@ -1122,6 +1148,15 @@ class DepthCrafterGUI:
                 "gui_overlap_setting": self.overlap.get(),
                 "processed_as_segments": self.process_as_segments_var.get(),
                 "npz_backfill_missing_only_mode": self.npz_backfill_missing_only_var.get(),
+                "model_backend": self.model_backend_var.get(),
+                "geometry_model_path": self.geometry_model_path_var.get(),
+                "geometry_repo_path": self.geometry_repo_path_var.get(),
+                "geometry_cache_dir": self.geometry_cache_dir_var.get(),
+                "geometry_decode_chunk_size": self.geometry_decode_chunk_size_var.get(),
+                "geometry_low_memory_usage": self.geometry_low_memory_usage_var.get(),
+                "geometry_force_projection": self.geometry_force_projection_var.get(),
+                "geometry_force_fixed_focal": self.geometry_force_fixed_focal_var.get(),
+                "geometry_use_extract_interp": self.geometry_use_extract_interp_var.get(),
             },
             "jobs_info": [], "overall_status": "pending",
             "total_expected_jobs": total_expected_jobs_for_this_video,
@@ -2056,6 +2091,40 @@ class DepthCrafterGUI:
         _create_hover_tooltip(self.combo_cpu_offload, "cpu_offload")
         self.widgets_to_disable_during_processing.append(self.combo_cpu_offload); row_idx += 1
 
+        # Model backend selector
+        ttk.Label(main_params_frame, text="Model Backend:").grid(row=row_idx, column=0, sticky="e", padx=5, pady=2)
+        self.combo_model_backend = ttk.Combobox(
+            main_params_frame,
+            textvariable=self.model_backend_var,
+            values=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+            width=20,
+            state="readonly",
+        )
+        self.combo_model_backend.grid(row=row_idx, column=1, padx=5, pady=2, sticky="w")
+        _create_hover_tooltip(self.combo_model_backend, "model_backend")
+        self.widgets_to_disable_during_processing.append(self.combo_model_backend); row_idx += 1
+
+        geometry_settings_btn = ttk.Button(
+            main_params_frame,
+            text="  ↳ Configure Geometry Backend...",
+            command=self.toggle_geometry_settings_visibility,
+            width=31,
+        )
+        geometry_settings_btn.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 2))
+        self.geometry_settings_toggle_btn = geometry_settings_btn
+        self.widgets_to_disable_during_processing.append(geometry_settings_btn)
+        row_idx += 1
+
+        self.geometry_local_status_label = ttk.Label(
+            main_params_frame,
+            textvariable=self.geometry_local_status_var,
+            wraplength=360,
+            justify="left",
+        )
+        self.geometry_local_status_label.grid(row=row_idx, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 4))
+        self.widgets_to_disable_during_processing.append(self.geometry_local_status_label)
+        row_idx += 1
+
         # --- Frame & Segment Control Frame ---
         fs_frame = ttk.LabelFrame(settings_container_frame, text="Frame & Segment Control")
         fs_frame.grid(row=0, column=1, padx=(5,0), pady=5, sticky="nsew") # Placed in new container
@@ -2509,6 +2578,7 @@ class DepthCrafterGUI:
 
     def on_close(self):
         self._close_spatial_refine_settings_dialog()
+        self._close_geometry_settings_dialog()
         self._close_cloud_settings_dialog()
         self.save_config()
         if self.processing_thread and self.processing_thread.is_alive():
@@ -2936,18 +3006,40 @@ class DepthCrafterGUI:
                     _logger.info("Attempting to load local model.")
 
                 disable_xformers_for_run = self.disable_xformers_var.get()
-
-                demo = DepthCrafterDemo(
-                    unet_path="tencent/DepthCrafter",
-                    pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
-                    cpu_offload=self.cpu_offload.get(),
-                    use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
-                    local_files_only=self.use_local_models_only_var.get(),
-                    disable_xformers=disable_xformers_for_run,
-                )
-                _logger.info("DepthCrafter model initialized. Starting source processing loop.")
+                selected_backend = str(self.model_backend_var.get()).strip().lower()
+                if selected_backend in ("geometrycrafter_diff", "geometrycrafter_determ"):
+                    demo = GeometryCrafterDemo(
+                        model_backend=selected_backend,
+                        geometry_model_path=self.geometry_model_path_var.get().strip() or "TencentARC/GeometryCrafter",
+                        geometry_repo_path=self.geometry_repo_path_var.get().strip(),
+                        geometry_cache_dir=self.geometry_cache_dir_var.get().strip(),
+                        geometry_decode_chunk_size=max(1, int(self.geometry_decode_chunk_size_var.get())),
+                        geometry_low_memory_usage=bool(self.geometry_low_memory_usage_var.get()),
+                        geometry_force_projection=bool(self.geometry_force_projection_var.get()),
+                        geometry_force_fixed_focal=bool(self.geometry_force_fixed_focal_var.get()),
+                        geometry_use_extract_interp=bool(self.geometry_use_extract_interp_var.get()),
+                        pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
+                        cpu_offload=self.cpu_offload.get(),
+                        use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
+                        local_files_only=self.use_local_models_only_var.get(),
+                        disable_xformers=disable_xformers_for_run,
+                    )
+                    _logger.info(
+                        "GeometryCrafter backend initialized (%s). Starting source processing loop.",
+                        selected_backend,
+                    )
+                else:
+                    demo = DepthCrafterDemo(
+                        unet_path="tencent/DepthCrafter",
+                        pre_train_path="stabilityai/stable-video-diffusion-img2vid-xt",
+                        cpu_offload=self.cpu_offload.get(),
+                        use_cudnn_benchmark=self.use_cudnn_benchmark.get(),
+                        local_files_only=self.use_local_models_only_var.get(),
+                        disable_xformers=disable_xformers_for_run,
+                    )
+                    _logger.info("DepthCrafter model initialized. Starting source processing loop.")
         except Exception as e:
-            _logger.exception(f"CRITICAL: Failed to initialize DepthCrafterDemo: {e}")
+            _logger.exception(f"CRITICAL: Failed to initialize inference backend: {e}")
             self.status_message_var.set(f"Error: Model initialization failed. See console.")
             self.current_filename_var.set("N/A")
             self.current_resolution_var.set("N/A")
@@ -3555,6 +3647,212 @@ class DepthCrafterGUI:
 
         self._apply_spatial_refine_options_visibility()
 
+    def _close_geometry_settings_dialog(self):
+        tracked_widgets = list(self.geometry_settings_widgets)
+        if self.geometry_settings_dialog is not None:
+            try:
+                self.geometry_settings_dialog.destroy()
+            except tk.TclError:
+                pass
+        if tracked_widgets:
+            tracked_ids = {id(widget) for widget in tracked_widgets}
+            self.widgets_to_disable_during_processing = [
+                w for w in self.widgets_to_disable_during_processing if id(w) not in tracked_ids
+            ]
+        self.geometry_settings_dialog = None
+        self.geometry_settings_widgets = []
+        self._apply_geometry_options_visibility()
+
+    def _register_geometry_dialog_widget(self, widget):
+        self.geometry_settings_widgets.append(widget)
+        self.widgets_to_disable_during_processing.append(widget)
+        return widget
+
+    def _open_geometry_settings_dialog(self):
+        if self.geometry_settings_dialog is not None:
+            try:
+                if self.geometry_settings_dialog.winfo_exists():
+                    self.geometry_settings_dialog.lift()
+                    self.geometry_settings_dialog.focus_force()
+                    self._apply_geometry_options_visibility()
+                    return
+            except tk.TclError:
+                self._close_geometry_settings_dialog()
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Geometry Backend Settings")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_geometry_settings_dialog)
+
+        self.geometry_settings_dialog = dialog
+        self.geometry_settings_widgets = [dialog]
+
+        outer = ttk.Frame(dialog, padding=12)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(1, weight=1)
+
+        row = 0
+        info_label = self._register_geometry_dialog_widget(
+            ttk.Label(
+                outer,
+                text=(
+                    "These settings are used only when Model Backend is set to "
+                    "GeometryCrafter."
+                ),
+                justify="left",
+                wraplength=520,
+            )
+        )
+        info_label.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 8))
+        row += 1
+
+        ttk.Label(outer, text="Geometry Model Path:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_geometry_model_path = self._register_geometry_dialog_widget(
+            ttk.Entry(outer, textvariable=self.geometry_model_path_var, width=48)
+        )
+        entry_geometry_model_path.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_geometry_model_path, "geometry_model_path")
+        row += 1
+
+        ttk.Label(outer, text="Geometry Repo Path:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        repo_frame = ttk.Frame(outer)
+        repo_frame.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        repo_frame.columnconfigure(0, weight=1)
+        entry_geometry_repo_path = self._register_geometry_dialog_widget(
+            ttk.Entry(repo_frame, textvariable=self.geometry_repo_path_var, width=40)
+        )
+        entry_geometry_repo_path.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        _create_hover_tooltip(entry_geometry_repo_path, "geometry_repo_path")
+        btn_geometry_repo = self._register_geometry_dialog_widget(
+            ttk.Button(
+                repo_frame,
+                text="Browse...",
+                command=lambda: self._browse_directory_into_var(
+                    self.geometry_repo_path_var, "Select Geometry Repo Folder"
+                ),
+                width=10,
+            )
+        )
+        btn_geometry_repo.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(outer, text="Geometry Cache Dir:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        cache_frame = ttk.Frame(outer)
+        cache_frame.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        cache_frame.columnconfigure(0, weight=1)
+        entry_geometry_cache_dir = self._register_geometry_dialog_widget(
+            ttk.Entry(cache_frame, textvariable=self.geometry_cache_dir_var, width=40)
+        )
+        entry_geometry_cache_dir.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        _create_hover_tooltip(entry_geometry_cache_dir, "geometry_cache_dir")
+        btn_geometry_cache = self._register_geometry_dialog_widget(
+            ttk.Button(
+                cache_frame,
+                text="Browse...",
+                command=lambda: self._browse_directory_into_var(
+                    self.geometry_cache_dir_var, "Select Geometry Cache Folder"
+                ),
+                width=10,
+            )
+        )
+        btn_geometry_cache.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(outer, text="Geometry Decode Chunk:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_geometry_decode_chunk = self._register_geometry_dialog_widget(
+            ttk.Spinbox(
+                outer,
+                from_=1,
+                to=128,
+                increment=1,
+                textvariable=self.geometry_decode_chunk_size_var,
+                width=12,
+            )
+        )
+        entry_geometry_decode_chunk.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_geometry_decode_chunk, "geometry_decode_chunk_size")
+        row += 1
+
+        self.geometry_low_mem_cb = self._register_geometry_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Geometry Low-Memory Mode",
+                variable=self.geometry_low_memory_usage_var,
+            )
+        )
+        self.geometry_low_mem_cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.geometry_low_mem_cb, "geometry_low_memory_usage")
+        row += 1
+
+        self.geometry_force_projection_cb = self._register_geometry_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Geometry Force Projection",
+                variable=self.geometry_force_projection_var,
+            )
+        )
+        self.geometry_force_projection_cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.geometry_force_projection_cb, "geometry_force_projection")
+        row += 1
+
+        self.geometry_force_fixed_focal_cb = self._register_geometry_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Geometry Force Fixed Focal",
+                variable=self.geometry_force_fixed_focal_var,
+            )
+        )
+        self.geometry_force_fixed_focal_cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.geometry_force_fixed_focal_cb, "geometry_force_fixed_focal")
+        row += 1
+
+        self.geometry_extract_interp_cb = self._register_geometry_dialog_widget(
+            ttk.Checkbutton(
+                outer,
+                text="Geometry Use Extract Interp",
+                variable=self.geometry_use_extract_interp_var,
+            )
+        )
+        self.geometry_extract_interp_cb.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+        _create_hover_tooltip(self.geometry_extract_interp_cb, "geometry_use_extract_interp")
+        row += 1
+
+        status_label = self._register_geometry_dialog_widget(
+            ttk.Label(
+                outer,
+                textvariable=self.geometry_local_status_var,
+                wraplength=520,
+                justify="left",
+            )
+        )
+        status_label.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(4, 4))
+        row += 1
+
+        close_btn = self._register_geometry_dialog_widget(
+            ttk.Button(outer, text="Close", command=self._close_geometry_settings_dialog, width=12)
+        )
+        close_btn.grid(row=row, column=0, columnspan=3, sticky="e", padx=5, pady=(8, 2))
+
+        self._refresh_geometry_local_status()
+        self._apply_geometry_options_visibility()
+
+    def _apply_geometry_options_visibility(self):
+        if not hasattr(self, 'geometry_settings_toggle_btn') or self.geometry_settings_toggle_btn is None:
+            return
+        is_open = (
+            self.geometry_settings_dialog is not None
+            and bool(self.geometry_settings_dialog.winfo_exists())
+        )
+        button_text = "  ↳ Geometry Settings Open" if is_open else "  ↳ Configure Geometry Backend..."
+        try:
+            self.geometry_settings_toggle_btn.configure(text=button_text)
+        except tk.TclError:
+            pass
+
+    def toggle_geometry_settings_visibility(self):
+        self._open_geometry_settings_dialog()
+
     def _browse_file_into_var(self, tk_var, title, filetypes):
         initial_guess = tk_var.get().strip()
         if initial_guess:
@@ -3575,6 +3873,25 @@ class DepthCrafterGUI:
         if selected:
             tk_var.set(os.path.normpath(selected))
 
+    def _browse_directory_into_var(self, tk_var, title):
+        initial_guess = tk_var.get().strip()
+        if initial_guess:
+            initial_guess = os.path.expanduser(initial_guess)
+            if os.path.isdir(initial_guess):
+                initial_dir = initial_guess
+            else:
+                initial_dir = os.path.dirname(initial_guess)
+        else:
+            initial_dir = os.path.expanduser("~")
+        if not initial_dir:
+            initial_dir = os.path.expanduser("~")
+        selected = filedialog.askdirectory(
+            title=title,
+            initialdir=initial_dir,
+        )
+        if selected:
+            tk_var.set(os.path.normpath(selected))
+
     def _safe_int_from_tk_var(self, tk_var, fallback: int) -> int:
         try:
             return int(tk_var.get())
@@ -3586,6 +3903,132 @@ class DepthCrafterGUI:
             return float(tk_var.get())
         except Exception:
             return float(fallback)
+
+    def _on_geometry_status_setting_changed(self, *_):
+        self._refresh_geometry_local_status()
+        self._apply_geometry_options_visibility()
+
+    def _bind_geometry_status_traces(self):
+        tracked_vars = [
+            self.model_backend_var,
+            self.geometry_model_path_var,
+            self.geometry_repo_path_var,
+            self.geometry_cache_dir_var,
+            self.enable_cloud_dispatch_mode_var,
+        ]
+        for tk_var in tracked_vars:
+            try:
+                tk_var.trace_add("write", self._on_geometry_status_setting_changed)
+            except Exception:
+                continue
+
+    def _refresh_geometry_local_status(self):
+        if not hasattr(self, "geometry_local_status_var"):
+            return
+
+        backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
+        if backend not in ("geometrycrafter_diff", "geometrycrafter_determ"):
+            self.geometry_local_status_var.set("Geometry backend inactive.")
+            return
+
+        if bool(self.enable_cloud_dispatch_mode_var.get()):
+            self.geometry_local_status_var.set(
+                "Geometry backend selected in Cloud mode: local Geometry repo is optional. "
+                "Remote worker will auto-provision repo/submodules and download model weights as needed."
+            )
+            return
+
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        repo_path_raw = str(self.geometry_repo_path_var.get() or "").strip()
+        if repo_path_raw:
+            repo_path = os.path.expanduser(repo_path_raw)
+            if not os.path.isabs(repo_path):
+                repo_path = os.path.normpath(os.path.join(repo_root, repo_path))
+        else:
+            repo_path = os.path.normpath(os.path.join(repo_root, "weights", "GeometryCrafter"))
+
+        geometry_model_raw = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
+        if not geometry_model_raw:
+            geometry_model_raw = "TencentARC/GeometryCrafter"
+        geometry_cache_raw = str(self.geometry_cache_dir_var.get() or "").strip()
+
+        model_status_note = "model cache: unknown"
+        local_model_path = os.path.expanduser(geometry_model_raw)
+        if not os.path.isabs(local_model_path):
+            local_model_path = os.path.normpath(os.path.join(repo_root, local_model_path))
+        if os.path.isdir(local_model_path):
+            model_status_note = f"model source: local path ({local_model_path})"
+        elif "/" in geometry_model_raw:
+            cache_roots = []
+            if geometry_cache_raw:
+                cache_roots.append(os.path.expanduser(geometry_cache_raw))
+            hf_cache_env = os.environ.get("HUGGINGFACE_HUB_CACHE", "").strip()
+            if hf_cache_env:
+                cache_roots.append(os.path.expanduser(hf_cache_env))
+            hf_home = os.environ.get("HF_HOME", "").strip()
+            if hf_home:
+                cache_roots.append(os.path.join(os.path.expanduser(hf_home), "hub"))
+            cache_roots.append(os.path.expanduser("~/.cache/huggingface/hub"))
+
+            cache_hit_path = ""
+            cache_key = f"models--{geometry_model_raw.replace('/', '--')}"
+            for root in cache_roots:
+                try:
+                    model_cache_dir = os.path.join(root, cache_key)
+                    snapshots_dir = os.path.join(model_cache_dir, "snapshots")
+                    if os.path.isdir(snapshots_dir):
+                        with os.scandir(snapshots_dir) as it:
+                            for entry in it:
+                                if entry.is_dir():
+                                    cache_hit_path = snapshots_dir
+                                    break
+                    if cache_hit_path:
+                        break
+                except Exception:
+                    continue
+            if cache_hit_path:
+                model_status_note = f"model cache: found ({cache_hit_path})"
+            else:
+                model_status_note = (
+                    "model cache: missing (will auto-download from Hugging Face on first local run)"
+                )
+        else:
+            model_status_note = (
+                f"model source '{geometry_model_raw}' not found as local path and not a Hugging Face model id"
+            )
+
+        missing_items = []
+        if not os.path.isdir(repo_path):
+            missing_items.append("repo folder")
+        else:
+            if not os.path.isdir(os.path.join(repo_path, "geometrycrafter")):
+                missing_items.append("geometrycrafter/")
+            if not os.path.isdir(os.path.join(repo_path, "third_party")):
+                missing_items.append("third_party/")
+            if not os.path.isdir(os.path.join(repo_path, "third_party", "moge", "moge", "model")):
+                missing_items.append("third_party/moge submodule")
+            if not os.path.isdir(os.path.join(repo_path, "third_party", "moge", "utils3d")):
+                missing_items.append("third_party/moge/utils3d")
+
+        try:
+            import kornia  # noqa: F401
+        except Exception:
+            missing_items.append("python package: kornia")
+        try:
+            import scipy  # noqa: F401
+        except Exception:
+            missing_items.append("python package: scipy")
+
+        if missing_items:
+            self.geometry_local_status_var.set(
+                "Geometry local status: missing "
+                + ", ".join(missing_items)
+                + f". Repo path checked: {repo_path} | {model_status_note}"
+            )
+        else:
+            self.geometry_local_status_var.set(
+                f"Geometry local status: ready ({backend}) | repo: {repo_path} | {model_status_note}"
+            )
 
     def _get_cloud_profile_defaults(self, profile_key: Optional[str] = None) -> Dict[str, object]:
         key = (profile_key or self.cloud_profile_var.get().strip() or "5090_32gb").strip()
@@ -6023,6 +6466,19 @@ class DepthCrafterGUI:
             connection_info.get("git_sync_branch", self._detect_local_git_branch(repo_root))
             or self._detect_local_git_branch(repo_root)
         )
+        model_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
+        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"):
+            model_backend = "depthcrafter"
+
+        geometry_model_path = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
+        remote_root = str(connection_info.get("remote_root", "") or "").strip()
+        geometry_repo_path = os.path.join(remote_root, "weights", "GeometryCrafter") if remote_root else ""
+        geometry_cache_dir = os.path.join(remote_root, "weights", "hf_cache") if remote_root else ""
+        geometry_decode_chunk = max(1, int(self.geometry_decode_chunk_size_var.get()))
+        geometry_low_memory = bool(self.geometry_low_memory_usage_var.get())
+        geometry_force_projection = bool(self.geometry_force_projection_var.get())
+        geometry_force_fixed_focal = bool(self.geometry_force_fixed_focal_var.get())
+        geometry_use_extract_interp = bool(self.geometry_use_extract_interp_var.get())
         original_basename = source_spec["basename"]
 
         if (
@@ -6093,6 +6549,16 @@ class DepthCrafterGUI:
             cloud_output_format,
             "--cpu-offload",
             cloud_cpu_offload,
+            "--model-backend",
+            model_backend,
+            "--geometry-model-path",
+            geometry_model_path,
+            "--geometry-repo-path",
+            geometry_repo_path,
+            "--geometry-cache-dir",
+            geometry_cache_dir,
+            "--geometry-decode-chunk-size",
+            str(geometry_decode_chunk),
         ]
 
         identity_file = self.cloud_identity_file_var.get().strip()
@@ -6108,6 +6574,11 @@ class DepthCrafterGUI:
             cmd.append("--use-cudnn-benchmark")
         if bool(self.use_local_models_only_var.get()):
             cmd.append("--local-files-only")
+        if geometry_low_memory:
+            cmd.append("--geometry-low-memory-usage")
+        cmd.append("--geometry-force-projection" if geometry_force_projection else "--no-geometry-force-projection")
+        cmd.append("--geometry-force-fixed-focal" if geometry_force_fixed_focal else "--no-geometry-force-fixed-focal")
+        cmd.append("--geometry-use-extract-interp" if geometry_use_extract_interp else "--no-geometry-use-extract-interp")
 
         return cmd, job_name
 
@@ -6148,6 +6619,19 @@ class DepthCrafterGUI:
             connection_info.get("git_sync_branch", self._detect_local_git_branch(repo_root))
             or self._detect_local_git_branch(repo_root)
         )
+        model_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
+        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"):
+            model_backend = "depthcrafter"
+
+        geometry_model_path = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
+        remote_root = str(connection_info.get("remote_root", "") or "").strip()
+        geometry_repo_path = os.path.join(remote_root, "weights", "GeometryCrafter") if remote_root else ""
+        geometry_cache_dir = os.path.join(remote_root, "weights", "hf_cache") if remote_root else ""
+        geometry_decode_chunk = max(1, int(self.geometry_decode_chunk_size_var.get()))
+        geometry_low_memory = bool(self.geometry_low_memory_usage_var.get())
+        geometry_force_projection = bool(self.geometry_force_projection_var.get())
+        geometry_force_fixed_focal = bool(self.geometry_force_fixed_focal_var.get())
+        geometry_use_extract_interp = bool(self.geometry_use_extract_interp_var.get())
         if (
             bool(cloud_settings.get("use_source_resolution", False))
             and int(cloud_settings.get("target_width_override", 0)) <= 0
@@ -6214,6 +6698,16 @@ class DepthCrafterGUI:
             cloud_output_format,
             "--cpu-offload",
             cloud_cpu_offload,
+            "--model-backend",
+            model_backend,
+            "--geometry-model-path",
+            geometry_model_path,
+            "--geometry-repo-path",
+            geometry_repo_path,
+            "--geometry-cache-dir",
+            geometry_cache_dir,
+            "--geometry-decode-chunk-size",
+            str(geometry_decode_chunk),
             "--prefetch-window",
             "2",
         ]
@@ -6231,6 +6725,11 @@ class DepthCrafterGUI:
             cmd.append("--use-cudnn-benchmark")
         if bool(self.use_local_models_only_var.get()):
             cmd.append("--local-files-only")
+        if geometry_low_memory:
+            cmd.append("--geometry-low-memory-usage")
+        cmd.append("--geometry-force-projection" if geometry_force_projection else "--no-geometry-force-projection")
+        cmd.append("--geometry-force-fixed-focal" if geometry_force_fixed_focal else "--no-geometry-force-fixed-focal")
+        cmd.append("--geometry-use-extract-interp" if geometry_use_extract_interp else "--no-geometry-use-extract-interp")
 
         return cmd, manifest_path
 

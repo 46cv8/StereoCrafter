@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 _LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+_DEFAULT_GEOMETRY_REPO_URL = "https://github.com/TencentARC/GeometryCrafter.git"
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -40,10 +41,90 @@ def _coerce_multiple_of_8(value: int, label: str) -> int:
     return max(8, rounded)
 
 
+def _coerce_multiple(value: int, label: str, multiple: int) -> int:
+    if multiple == 8:
+        return _coerce_multiple_of_8(value, label)
+    if value <= 0:
+        raise ValueError(f"{label} must be > 0.")
+    if multiple <= 0:
+        raise ValueError("multiple must be > 0.")
+    rounded = int(round(float(value) / float(multiple)) * float(multiple))
+    return max(multiple, rounded)
+
+
 def _safe_json_dump(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _run_cmd_checked(cmd: List[str], logger: logging.Logger, cwd: Path | None = None) -> None:
+    pretty = " ".join(cmd)
+    logger.info("[setup] $ %s", pretty)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd is not None else None,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if proc.returncode != 0:
+        output = (proc.stdout or "").strip()
+        raise RuntimeError(f"Command failed ({proc.returncode}): {pretty}\n{output}")
+
+
+def _ensure_python_module(module_name: str, pip_spec: str, logger: logging.Logger) -> None:
+    try:
+        __import__(module_name)
+        return
+    except Exception:
+        logger.warning("Missing module '%s'. Installing '%s'...", module_name, pip_spec)
+    _run_cmd_checked([sys.executable, "-m", "pip", "install", pip_spec], logger=logger)
+    try:
+        __import__(module_name)
+    except Exception as exc:
+        raise RuntimeError(f"Module '{module_name}' is still unavailable after install.") from exc
+
+
+def _is_geometry_repo(path: Path) -> bool:
+    return (path / "geometrycrafter").is_dir() and (path / "third_party").is_dir()
+
+
+def _resolve_geometry_repo_path(raw_value: str) -> Path:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return (REPO_ROOT / "weights" / "GeometryCrafter").resolve()
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (REPO_ROOT / path).resolve()
+
+
+def _ensure_geometry_repo_available(raw_repo_path: str, logger: logging.Logger) -> Path:
+    repo_path = _resolve_geometry_repo_path(raw_repo_path)
+    if not repo_path.exists():
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_cmd_checked(
+            ["git", "clone", "--recursive", _DEFAULT_GEOMETRY_REPO_URL, str(repo_path)],
+            logger=logger,
+        )
+    elif not _is_geometry_repo(repo_path):
+        raise RuntimeError(
+            f"Geometry repo path exists but is not a valid GeometryCrafter checkout: {repo_path}"
+        )
+
+    moge_marker = repo_path / "third_party" / "moge" / "moge" / "model"
+    if not moge_marker.exists():
+        _run_cmd_checked(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            logger=logger,
+            cwd=repo_path,
+        )
+
+    if not _is_geometry_repo(repo_path):
+        raise RuntimeError(f"GeometryCrafter repository is incomplete at {repo_path}.")
+    return repo_path
 
 
 def _query_nvidia_smi_totals_mib() -> Dict[int, Dict[str, Any]]:
@@ -741,10 +822,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--process-length", type=int, default=-1)
     parser.add_argument("--output-format", choices=["mp4", "main10_mp4"], default="main10_mp4")
 
+    parser.add_argument(
+        "--model-backend",
+        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+        default="depthcrafter",
+    )
     parser.add_argument("--cpu-offload", choices=["model", "sequential", "none"], default="model")
     parser.add_argument("--disable-xformers", action="store_true")
     parser.add_argument("--use-cudnn-benchmark", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--geometry-model-path", default="TencentARC/GeometryCrafter")
+    parser.add_argument("--geometry-repo-path", default="")
+    parser.add_argument("--geometry-cache-dir", default="")
+    parser.add_argument("--geometry-decode-chunk-size", type=int, default=8)
+    parser.add_argument("--geometry-low-memory-usage", action="store_true")
+    parser.add_argument(
+        "--geometry-force-projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--geometry-force-fixed-focal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--geometry-use-extract-interp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
 
     parser.add_argument("--unet-path", default="tencent/DepthCrafter")
     parser.add_argument("--pretrain-path", default="stabilityai/stable-video-diffusion-img2vid-xt")
@@ -817,11 +923,20 @@ def main() -> int:
             "target_fps": args.target_fps,
             "process_length": args.process_length,
             "output_format": args.output_format,
+            "model_backend": args.model_backend,
             "cpu_offload": args.cpu_offload,
             "disable_xformers": bool(args.disable_xformers),
             "local_files_only": bool(args.local_files_only),
             "unet_path": args.unet_path,
             "pretrain_path": args.pretrain_path,
+            "geometry_model_path": args.geometry_model_path,
+            "geometry_repo_path": args.geometry_repo_path,
+            "geometry_cache_dir": args.geometry_cache_dir,
+            "geometry_decode_chunk_size": args.geometry_decode_chunk_size,
+            "geometry_low_memory_usage": bool(args.geometry_low_memory_usage),
+            "geometry_force_projection": bool(args.geometry_force_projection),
+            "geometry_force_fixed_focal": bool(args.geometry_force_fixed_focal),
+            "geometry_use_extract_interp": bool(args.geometry_use_extract_interp),
         },
     }
     stage_gpu_samples: List[Dict[str, Any]] = []
@@ -836,7 +951,25 @@ def main() -> int:
 
     try:
         _validate_runtime_args(args)
-        from depthcrafter.depthcrafter_logic import DepthCrafterDemo
+        model_backend = str(args.model_backend or "depthcrafter").strip().lower()
+        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"):
+            model_backend = "depthcrafter"
+        if isinstance(status.get("params"), dict):
+            status["params"]["model_backend"] = model_backend
+
+        size_multiple = 64 if model_backend.startswith("geometrycrafter") else 8
+
+        if model_backend == "depthcrafter":
+            from depthcrafter.depthcrafter_logic import DepthCrafterDemo as SelectedDemo
+        else:
+            _ensure_python_module("kornia", "kornia>=0.8.2", logger)
+            _ensure_python_module("scipy", "scipy>=1.10", logger)
+            geometry_repo = _ensure_geometry_repo_available(args.geometry_repo_path, logger)
+            if not str(args.geometry_repo_path or "").strip():
+                args.geometry_repo_path = str(geometry_repo)
+                if isinstance(status.get("params"), dict):
+                    status["params"]["geometry_repo_path"] = str(geometry_repo)
+            from depthcrafter.geometrycrafter_logic import GeometryCrafterDemo as SelectedDemo
         import torch as torch_module
 
         if torch_module.cuda.is_available():
@@ -895,31 +1028,55 @@ def main() -> int:
 
         _record_stage_event("runtime_imports_ready")
 
-        target_w = _coerce_multiple_of_8(int(args.target_width), "target width")
-        target_h = _coerce_multiple_of_8(int(args.target_height), "target height")
+        target_w = _coerce_multiple(int(args.target_width), "target width", size_multiple)
+        target_h = _coerce_multiple(int(args.target_height), "target height", size_multiple)
 
         if target_w != int(args.target_width) or target_h != int(args.target_height):
             logger.warning(
-                "Adjusted target resolution from %sx%s to %sx%s to satisfy /8 model constraints.",
+                "Adjusted target resolution from %sx%s to %sx%s to satisfy /%s model constraints.",
                 args.target_width,
                 args.target_height,
                 target_w,
                 target_h,
+                size_multiple,
             )
 
         _record_stage_event(
             "model_init_start",
-            payload={"target_width": int(target_w), "target_height": int(target_h)},
+            payload={
+                "target_width": int(target_w),
+                "target_height": int(target_h),
+                "model_backend": model_backend,
+            },
         )
-        logger.info("Initializing DepthCrafter model...")
-        demo = DepthCrafterDemo(
-            unet_path=args.unet_path,
-            pre_train_path=args.pretrain_path,
-            cpu_offload=args.cpu_offload,
-            use_cudnn_benchmark=bool(args.use_cudnn_benchmark),
-            local_files_only=bool(args.local_files_only),
-            disable_xformers=bool(args.disable_xformers),
-        )
+        logger.info("Initializing model backend: %s", model_backend)
+
+        if model_backend == "depthcrafter":
+            demo = SelectedDemo(
+                unet_path=args.unet_path,
+                pre_train_path=args.pretrain_path,
+                cpu_offload=args.cpu_offload,
+                use_cudnn_benchmark=bool(args.use_cudnn_benchmark),
+                local_files_only=bool(args.local_files_only),
+                disable_xformers=bool(args.disable_xformers),
+            )
+        else:
+            demo = SelectedDemo(
+                model_backend=model_backend,
+                geometry_model_path=args.geometry_model_path,
+                geometry_repo_path=args.geometry_repo_path,
+                geometry_cache_dir=args.geometry_cache_dir,
+                geometry_decode_chunk_size=max(1, int(args.geometry_decode_chunk_size)),
+                geometry_low_memory_usage=bool(args.geometry_low_memory_usage),
+                geometry_force_projection=bool(args.geometry_force_projection),
+                geometry_force_fixed_focal=bool(args.geometry_force_fixed_focal),
+                geometry_use_extract_interp=bool(args.geometry_use_extract_interp),
+                pre_train_path=args.pretrain_path,
+                cpu_offload=args.cpu_offload,
+                use_cudnn_benchmark=bool(args.use_cudnn_benchmark),
+                local_files_only=bool(args.local_files_only),
+                disable_xformers=bool(args.disable_xformers),
+            )
         _record_stage_event("model_init_end")
 
         if torch_module.cuda.is_available():

@@ -399,6 +399,12 @@ def add_ssh_flags(parser: argparse.ArgumentParser) -> None:
 
 def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--venv-name", default=".venv-cloud")
+    parser.add_argument(
+        "--model-backend",
+        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+        default="depthcrafter",
+        help="Inference backend to run on remote.",
+    )
     parser.add_argument("--target-width", type=int, default=1920)
     parser.add_argument("--target-height", type=int, default=1040)
     parser.add_argument("--window-size", type=int, default=75)
@@ -413,6 +419,26 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-xformers", action="store_true")
     parser.add_argument("--use-cudnn-benchmark", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--geometry-model-path", default="TencentARC/GeometryCrafter")
+    parser.add_argument("--geometry-repo-path", default="")
+    parser.add_argument("--geometry-cache-dir", default="")
+    parser.add_argument("--geometry-decode-chunk-size", type=int, default=8)
+    parser.add_argument("--geometry-low-memory-usage", action="store_true")
+    parser.add_argument(
+        "--geometry-force-projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--geometry-force-fixed-focal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--geometry-use-extract-interp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--auto-git-sync",
         action=argparse.BooleanOptionalAction,
@@ -629,10 +655,20 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
         args.output_format,
         "--cpu-offload",
         args.cpu_offload,
+        "--model-backend",
+        args.model_backend,
         "--unet-path",
         args.unet_path,
         "--pretrain-path",
         args.pretrain_path,
+        "--geometry-model-path",
+        args.geometry_model_path,
+        "--geometry-repo-path",
+        args.geometry_repo_path,
+        "--geometry-cache-dir",
+        args.geometry_cache_dir,
+        "--geometry-decode-chunk-size",
+        str(max(1, int(args.geometry_decode_chunk_size))),
     ]
 
     if args.disable_xformers:
@@ -641,6 +677,11 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
         runner_args.append("--use-cudnn-benchmark")
     if args.local_files_only:
         runner_args.append("--local-files-only")
+    if bool(args.geometry_low_memory_usage):
+        runner_args.append("--geometry-low-memory-usage")
+    runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
+    runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
+    runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
 
     quoted_runner = " ".join(shlex.quote(x) for x in runner_args)
     remote_root = args.remote_root.rstrip("/")

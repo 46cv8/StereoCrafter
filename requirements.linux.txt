@@ -12,6 +12,7 @@ xformers==0.0.33.post2
 mediapy
 fire
 decord
+kornia
 OpenEXR
 opencv-python
 imageio_ffmpeg

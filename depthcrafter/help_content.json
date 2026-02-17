@@ -36,6 +36,33 @@
   "cpu_offload": {
       "text": "Moves parts of the model (like UNet, VAE) to CPU RAM when not actively used to save VRAM on the GPU.\n- 'model': Offloads the entire main model pipeline when it's idle between certain operations. Can save significant VRAM but introduces latency when moving data back and forth.\n- 'sequential': More fine-grained offloading of components within the model's execution flow. Balances VRAM savings and speed.\n- '': No offloading. Fastest if you have ample VRAM, but may cause out-of-memory errors on VRAM-constrained systems.\nThis option primarily affects the Diffusers pipeline components."
   },
+  "model_backend": {
+    "text": "Select the inference backend.\n\n- depthcrafter: Original DepthCrafter pipeline.\n- geometrycrafter_diff: GeometryCrafter diffusion backend.\n- geometrycrafter_determ: GeometryCrafter deterministic backend.\n\nGeometryCrafter requires a local GeometryCrafter repo path and uses /64-compatible resolutions."
+  },
+  "geometry_model_path": {
+    "text": "Hugging Face model id for GeometryCrafter weights. Default: TencentARC/GeometryCrafter."
+  },
+  "geometry_repo_path": {
+    "text": "Local path to a GeometryCrafter repository clone (must include geometrycrafter/ and third_party/ with submodules initialized)."
+  },
+  "geometry_cache_dir": {
+    "text": "Optional cache directory for GeometryCrafter/Hugging Face model files.\nLeave blank to use default Hugging Face cache locations."
+  },
+  "geometry_decode_chunk_size": {
+    "text": "Chunk size used for GeometryCrafter encode/decode/prior passes.\nLower values reduce peak VRAM but can reduce speed."
+  },
+  "geometry_low_memory_usage": {
+    "text": "If enabled, GeometryCrafter pushes more intermediate tensors through lower-memory code paths.\nThis can reduce VRAM use at some runtime cost."
+  },
+  "geometry_force_projection": {
+    "text": "GeometryCrafter option: enforce projection consistency when reconstructing point maps.\nUsually best left enabled."
+  },
+  "geometry_force_fixed_focal": {
+    "text": "GeometryCrafter option: enforce a fixed focal estimate across frames.\nCan improve temporal stability in many clips."
+  },
+  "geometry_use_extract_interp": {
+    "text": "GeometryCrafter option controlling interpolation path when resizing internal depth/point map tensors.\nLeave disabled unless testing this behavior specifically."
+  },
   "cudnn_benchmark": {
     "text": "Enables cuDNN auto-tuner. When enabled, cuDNN will try to find the optimal algorithms for the specific hardware and input sizes at the beginning of processing.\nThis can lead to faster execution after an initial warm-up period, but the warm-up itself can take time. Best for consistent input sizes.\nOnly applicable for Nvidia GPUs. If you change this setting, a full restart of the script might be needed for it to take effect properly for the model initialization."
   },

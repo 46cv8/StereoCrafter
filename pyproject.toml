@@ -12,6 +12,7 @@ dependencies = [
     "imageio>=2.37.2",
     "imageio-ffmpeg>=0.6.0",
     "imath>=0.0.2",
+    "kornia>=0.8.2",
     "matplotlib>=3.10.8",
     "mediapy>=1.2.6",
     "moviepy>=2.1.1",

@@ -583,6 +583,17 @@ def build_cloudctl_cmd(
     cpu_offload = str(cfg.get("cpu_offload", "model") or "model")
     if cpu_offload not in {"model", "sequential", "none"}:
         cpu_offload = "model"
+    model_backend = str(cfg.get("model_backend_var", "depthcrafter") or "depthcrafter").strip().lower()
+    if model_backend not in {"depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"}:
+        model_backend = "depthcrafter"
+    geometry_model_path = str(cfg.get("geometry_model_path_var", "TencentARC/GeometryCrafter") or "TencentARC/GeometryCrafter")
+    geometry_repo_path = remote_join(args.remote_root.rstrip("/"), "weights", "GeometryCrafter")
+    geometry_cache_dir = remote_join(args.remote_root.rstrip("/"), "weights", "hf_cache")
+    geometry_decode_chunk_size = max(1, as_int(cfg.get("geometry_decode_chunk_size_var"), 8))
+    geometry_low_memory_usage = bool(cfg.get("geometry_low_memory_usage_var", False))
+    geometry_force_projection = bool(cfg.get("geometry_force_projection_var", True))
+    geometry_force_fixed_focal = bool(cfg.get("geometry_force_fixed_focal_var", True))
+    geometry_use_extract_interp = bool(cfg.get("geometry_use_extract_interp_var", False))
 
     cmd += [
         "--target-width",
@@ -607,6 +618,16 @@ def build_cloudctl_cmd(
         output_format,
         "--cpu-offload",
         cpu_offload,
+        "--model-backend",
+        model_backend,
+        "--geometry-model-path",
+        geometry_model_path,
+        "--geometry-repo-path",
+        geometry_repo_path,
+        "--geometry-cache-dir",
+        geometry_cache_dir,
+        "--geometry-decode-chunk-size",
+        str(geometry_decode_chunk_size),
     ]
 
     if bool(cfg.get("disable_xformers_var", False)):
@@ -615,6 +636,11 @@ def build_cloudctl_cmd(
         cmd.append("--use-cudnn-benchmark")
     if bool(cfg.get("use_local_models_only_var", False)):
         cmd.append("--local-files-only")
+    if geometry_low_memory_usage:
+        cmd.append("--geometry-low-memory-usage")
+    cmd.append("--geometry-force-projection" if geometry_force_projection else "--no-geometry-force-projection")
+    cmd.append("--geometry-force-fixed-focal" if geometry_force_fixed_focal else "--no-geometry-force-fixed-focal")
+    cmd.append("--geometry-use-extract-interp" if geometry_use_extract_interp else "--no-geometry-use-extract-interp")
 
     download_dir = args.download_dir_override or str(cfg.get("output_dir", "")).strip() or "./cloud_downloads"
     cmd += ["--download-dir", download_dir]
