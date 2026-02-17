@@ -5123,16 +5123,55 @@ class DepthCrafterGUI:
         dialog = tk.Toplevel(self.root)
         dialog.title("Cloud Dispatch Settings")
         dialog.transient(self.root)
-        dialog.resizable(False, False)
+        dialog.resizable(True, True)
         dialog.protocol("WM_DELETE_WINDOW", self._close_cloud_settings_dialog)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
 
         self.cloud_settings_dialog = dialog
         self.cloud_settings_widgets = [dialog]
         self.cloud_options_expanded_var.set(True)
 
-        outer = ttk.Frame(dialog, padding=12)
-        outer.grid(row=0, column=0, sticky="nsew")
+        scroll_container = ttk.Frame(dialog)
+        scroll_container.grid(row=0, column=0, sticky="nsew")
+        scroll_container.columnconfigure(0, weight=1)
+        scroll_container.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(scroll_container, highlightthickness=0, borderwidth=0)
+        vscroll = ttk.Scrollbar(scroll_container, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll.grid(row=0, column=1, sticky="ns")
+
+        outer = ttk.Frame(canvas, padding=12)
         outer.columnconfigure(1, weight=1)
+        outer_window = canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def _sync_cloud_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_cloud_canvas_width(event):
+            canvas.itemconfigure(outer_window, width=event.width)
+
+        def _on_cloud_mousewheel(event):
+            try:
+                step = int(event.delta / 120)
+            except Exception:
+                step = 0
+            if step != 0:
+                canvas.yview_scroll(-step, "units")
+
+        def _on_cloud_mousewheel_linux_up(_event):
+            canvas.yview_scroll(-1, "units")
+
+        def _on_cloud_mousewheel_linux_down(_event):
+            canvas.yview_scroll(1, "units")
+
+        outer.bind("<Configure>", _sync_cloud_scroll_region)
+        canvas.bind("<Configure>", _sync_cloud_canvas_width)
+        dialog.bind("<MouseWheel>", _on_cloud_mousewheel)
+        dialog.bind("<Button-4>", _on_cloud_mousewheel_linux_up)
+        dialog.bind("<Button-5>", _on_cloud_mousewheel_linux_down)
 
         row = 0
         ttk.Label(outer, text="GPU Profile:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
@@ -5204,18 +5243,9 @@ class DepthCrafterGUI:
         lbl_effective.grid(row=row, column=1, sticky="w", padx=(5, 0), pady=2)
         row += 1
 
-        self.cloud_processing_overrides_toggle_btn = self._register_cloud_dialog_widget(
-            ttk.Button(
-                outer,
-                text="  ↳ Show Advanced Cloud Overrides",
-                command=self._toggle_cloud_processing_overrides_visibility,
-            )
-        )
-        self.cloud_processing_overrides_toggle_btn.grid(row=row, column=0, columnspan=2, sticky="w", padx=(10, 5), pady=2)
-        row += 1
-
+        self.cloud_processing_overrides_toggle_btn = None
         self.cloud_processing_overrides_frame = self._register_cloud_dialog_widget(ttk.Frame(outer))
-        self.cloud_processing_overrides_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(20, 0), pady=(0, 4))
+        self.cloud_processing_overrides_frame.grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(0, 4))
         self.cloud_processing_overrides_frame.columnconfigure(1, weight=1)
 
         adv_row = 0
@@ -5558,8 +5588,10 @@ class DepthCrafterGUI:
         close_btn.grid(row=row, column=0, columnspan=2, sticky="e", padx=5, pady=(8, 2))
 
         self._refresh_cloud_processing_summary()
-        self._apply_cloud_processing_overrides_visibility()
         self._apply_cloud_options_visibility()
+
+        dialog.minsize(680, 520)
+        dialog.after_idle(_sync_cloud_scroll_region)
 
     def _apply_cloud_options_visibility(self):
         if not hasattr(self, 'cloud_settings_toggle_btn'):
