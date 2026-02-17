@@ -37,7 +37,7 @@
       "text": "Moves parts of the model (like UNet, VAE) to CPU RAM when not actively used to save VRAM on the GPU.\n- 'model': Offloads the entire main model pipeline when it's idle between certain operations. Can save significant VRAM but introduces latency when moving data back and forth.\n- 'sequential': More fine-grained offloading of components within the model's execution flow. Balances VRAM savings and speed.\n- '': No offloading. Fastest if you have ample VRAM, but may cause out-of-memory errors on VRAM-constrained systems.\nThis option primarily affects the Diffusers pipeline components."
   },
   "model_backend": {
-    "text": "Select the inference backend.\n\n- depthcrafter: Original DepthCrafter pipeline.\n- geometrycrafter_diff: GeometryCrafter diffusion backend.\n- geometrycrafter_determ: GeometryCrafter deterministic backend.\n\nGeometryCrafter requires a local GeometryCrafter repo path and uses /64-compatible resolutions."
+    "text": "Select the inference backend.\n\n- depthcrafter: Original DepthCrafter pipeline.\n- geometrycrafter_diff: GeometryCrafter diffusion backend.\n- geometrycrafter_determ: GeometryCrafter deterministic backend.\n- stereopilot: Stereo generation backend (opposite-eye or side-by-side output).\n\nGeometryCrafter requires a local GeometryCrafter repo path and uses /64-compatible resolutions.\nStereoPilot uses its own fixed working clip settings (target size/fps/frame count)."
   },
   "geometry_model_path": {
     "text": "Hugging Face model id for GeometryCrafter weights. Default: TencentARC/GeometryCrafter."
@@ -63,6 +63,57 @@
   "geometry_use_extract_interp": {
     "text": "GeometryCrafter option controlling interpolation path when resizing internal depth/point map tensors.\nLeave disabled unless testing this behavior specifically."
   },
+  "stereopilot_model_path": {
+    "text": "StereoPilot transformer checkpoint source.\nCan be a local .safetensors file or Hugging Face repo id (default: KlingTeam/StereoPilot)."
+  },
+  "stereopilot_base_model_path": {
+    "text": "StereoPilot base model source.\nCan be a local directory or Hugging Face repo id (default: Wan-AI/Wan2.1-T2V-1.3B)."
+  },
+  "stereopilot_repo_path": {
+    "text": "Local path to a StereoPilot repository clone (must contain sample.py, models/, and utils/)."
+  },
+  "stereopilot_cache_dir": {
+    "text": "Optional cache directory for StereoPilot model downloads.\nLeave blank for default Hugging Face cache."
+  },
+  "stereopilot_prompt": {
+    "text": "Fallback text prompt used when no sidecar .txt prompt exists next to the source video."
+  },
+  "stereopilot_use_sidecar_prompt": {
+    "text": "If enabled, read a same-name .txt file next to each input clip and use its first line as the prompt.\nIf missing, fallback prompt is used."
+  },
+  "stereopilot_output_mode": {
+    "text": "Stereo output format.\n- opposite_eye: right-eye video only\n- side_by_side: final SBS video only\n- both: write both files and use SBS as primary output"
+  },
+  "stereopilot_target_width": {
+    "text": "Working width used by StereoPilot preprocessing and inference."
+  },
+  "stereopilot_target_height": {
+    "text": "Working height used by StereoPilot preprocessing and inference."
+  },
+  "stereopilot_target_fps": {
+    "text": "Requested StereoPilot FPS hint.\nCurrent behavior preserves source FPS and keeps all frames (no FPS downsampling/drop), then writes output at source FPS."
+  },
+  "stereopilot_frame_count": {
+    "text": "Maximum frames per StereoPilot inference window.\nFor long clips, StereoPilot now runs sliding windows and overlap blending.\nUse this as the StereoPilot chunk length cap (81 matches the model's default context)."
+  },
+  "stereopilot_sampling_steps": {
+    "text": "StereoPilot diffusion sampling steps.\nHigher values can improve quality but increase runtime."
+  },
+  "stereopilot_guide_scale": {
+    "text": "StereoPilot guidance scale used during sampling."
+  },
+  "stereopilot_shift": {
+    "text": "StereoPilot shift parameter used by the sampler."
+  },
+  "stereopilot_domain_label": {
+    "text": "StereoPilot domain label flag (0 or 1) passed to the model."
+  },
+  "stereopilot_dtype": {
+    "text": "Main runtime dtype for StereoPilot components."
+  },
+  "stereopilot_transformer_dtype": {
+    "text": "Transformer dtype for StereoPilot model weights."
+  },
   "cudnn_benchmark": {
     "text": "Enables cuDNN auto-tuner. When enabled, cuDNN will try to find the optimal algorithms for the specific hardware and input sizes at the beginning of processing.\nThis can lead to faster execution after an initial warm-up period, but the warm-up itself can take time. Best for consistent input sizes.\nOnly applicable for Nvidia GPUs. If you change this setting, a full restart of the script might be needed for it to take effect properly for the model initialization."
   },
@@ -70,7 +121,7 @@
       "text": "If checked:\n- For 'Full Video' processing: A .json file with processing metadata will be saved alongside the final output depth video/sequence.\n- For 'Process as Segments' mode: \n    - Individual .json files are saved for each raw segment NPZ *during processing* (if this option is on AND keep_intermediate_npz is on, these might be kept, otherwise they are usually deleted after master_meta is created).\n    - A _master_meta.json is always created in the segment subfolder.\n    - If a final merged output is created, a .json sidecar will be saved for that merged output, summarizing settings and pointing to the master_meta.json."
   },
   "window_size": {
-    "text": "This value has a dual role depending on the 'Process as Segments' setting:\n\n- Full Video Mode (Unchecked 'Process as Segments'): Defines the size of the processing window (number of frames) that slides over the video. The model processes the video in these chunks.\n\n- Segment Mode (Checked 'Process as Segments'): Defines the number of output frames in each generated segment NPZ file. This is the target length of each chunk before overlap is considered for processing.\n\nTypically 60-110 frames. Larger values can improve temporal consistency but require more VRAM and processing time per window/segment. Must be larger than 'Overlap'."
+    "text": "This value has a dual role depending on the 'Process as Segments' setting:\n\n- Full Video Mode (Unchecked 'Process as Segments'): Defines the size of the processing window (number of frames) that slides over the video. The model processes the video in these chunks.\n\n- Segment Mode (Checked 'Process as Segments'): Defines the number of output frames in each generated segment NPZ file. This is the target length of each chunk before overlap is considered for processing.\n\nTypically 60-110 frames. Larger values can improve temporal consistency but require more VRAM and processing time per window/segment. Must be larger than 'Overlap'.\n\nStereoPilot note: effective StereoPilot window = min(Window Size, StereoPilot Frame Count)."
   },
   "overlap": {
     "text": "This value also has a dual role:\n\n- Full Video Mode (Unchecked 'Process as Segments'): Number of frames that consecutive processing windows overlap. This helps maintain temporal consistency across window boundaries.\n\n- Segment Mode (Checked 'Process as Segments'): Number of frames that overlap between consecutive segments when they are defined and processed. For example, if Window Size is 100 and Overlap is 20, segment 1 might be frames 0-99, segment 2 might be frames 80-179 internally for processing, leading to an output overlap for smoother merging.\n\nCommon values: 15-30 frames. Should be less than 'Window Size'."

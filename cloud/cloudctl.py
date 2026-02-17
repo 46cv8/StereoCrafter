@@ -477,7 +477,7 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--venv-name", default=".venv-cloud")
     parser.add_argument(
         "--model-backend",
-        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"],
         default="depthcrafter",
         help="Inference backend to run on remote.",
     )
@@ -514,6 +514,39 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
         "--geometry-use-extract-interp",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument("--stereopilot-model-path", default="KlingTeam/StereoPilot")
+    parser.add_argument("--stereopilot-base-model-path", default="Wan-AI/Wan2.1-T2V-1.3B")
+    parser.add_argument("--stereopilot-repo-path", default="")
+    parser.add_argument("--stereopilot-cache-dir", default="")
+    parser.add_argument("--stereopilot-prompt", default="")
+    parser.add_argument(
+        "--stereopilot-use-sidecar-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--stereopilot-output-mode",
+        choices=["opposite_eye", "side_by_side", "both"],
+        default="side_by_side",
+    )
+    parser.add_argument("--stereopilot-target-width", type=int, default=832)
+    parser.add_argument("--stereopilot-target-height", type=int, default=480)
+    parser.add_argument("--stereopilot-target-fps", type=float, default=16.0)
+    parser.add_argument("--stereopilot-frame-count", type=int, default=81)
+    parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
+    parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
+    parser.add_argument("--stereopilot-shift", type=float, default=5.0)
+    parser.add_argument("--stereopilot-domain-label", type=int, choices=[0, 1], default=1)
+    parser.add_argument(
+        "--stereopilot-dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="bfloat16",
+    )
+    parser.add_argument(
+        "--stereopilot-transformer-dtype",
+        choices=["float8", "float16", "bfloat16", "float32"],
+        default="float8",
     )
     parser.add_argument(
         "--auto-git-sync",
@@ -761,6 +794,36 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
         args.geometry_cache_dir,
         "--geometry-decode-chunk-size",
         str(max(1, int(args.geometry_decode_chunk_size))),
+        "--stereopilot-model-path",
+        args.stereopilot_model_path,
+        "--stereopilot-base-model-path",
+        args.stereopilot_base_model_path,
+        "--stereopilot-repo-path",
+        args.stereopilot_repo_path,
+        "--stereopilot-cache-dir",
+        args.stereopilot_cache_dir,
+        "--stereopilot-output-mode",
+        args.stereopilot_output_mode,
+        "--stereopilot-target-width",
+        str(max(32, int(args.stereopilot_target_width))),
+        "--stereopilot-target-height",
+        str(max(32, int(args.stereopilot_target_height))),
+        "--stereopilot-target-fps",
+        str(max(1.0, float(args.stereopilot_target_fps))),
+        "--stereopilot-frame-count",
+        str(max(1, int(args.stereopilot_frame_count))),
+        "--stereopilot-sampling-steps",
+        str(max(1, int(args.stereopilot_sampling_steps))),
+        "--stereopilot-guide-scale",
+        str(float(args.stereopilot_guide_scale)),
+        "--stereopilot-shift",
+        str(float(args.stereopilot_shift)),
+        "--stereopilot-domain-label",
+        str(1 if int(args.stereopilot_domain_label) != 0 else 0),
+        "--stereopilot-dtype",
+        args.stereopilot_dtype,
+        "--stereopilot-transformer-dtype",
+        args.stereopilot_transformer_dtype,
     ]
 
     if args.disable_xformers:
@@ -774,6 +837,10 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
     runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
     runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
     runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
+    runner_args.append("--stereopilot-use-sidecar-prompt" if bool(args.stereopilot_use_sidecar_prompt) else "--no-stereopilot-use-sidecar-prompt")
+    stereopilot_prompt = str(getattr(args, "stereopilot_prompt", "") or "").strip()
+    if stereopilot_prompt:
+        runner_args.extend(["--stereopilot-prompt", stereopilot_prompt])
 
     quoted_runner = " ".join(shlex.quote(x) for x in runner_args)
     remote_root = args.remote_root.rstrip("/")
@@ -827,6 +894,36 @@ def _build_remote_batch_session_cmd(args: argparse.Namespace, remote_manifest_pa
         args.geometry_cache_dir,
         "--geometry-decode-chunk-size",
         str(max(1, int(args.geometry_decode_chunk_size))),
+        "--stereopilot-model-path",
+        args.stereopilot_model_path,
+        "--stereopilot-base-model-path",
+        args.stereopilot_base_model_path,
+        "--stereopilot-repo-path",
+        args.stereopilot_repo_path,
+        "--stereopilot-cache-dir",
+        args.stereopilot_cache_dir,
+        "--stereopilot-output-mode",
+        args.stereopilot_output_mode,
+        "--stereopilot-target-width",
+        str(max(32, int(args.stereopilot_target_width))),
+        "--stereopilot-target-height",
+        str(max(32, int(args.stereopilot_target_height))),
+        "--stereopilot-target-fps",
+        str(max(1.0, float(args.stereopilot_target_fps))),
+        "--stereopilot-frame-count",
+        str(max(1, int(args.stereopilot_frame_count))),
+        "--stereopilot-sampling-steps",
+        str(max(1, int(args.stereopilot_sampling_steps))),
+        "--stereopilot-guide-scale",
+        str(float(args.stereopilot_guide_scale)),
+        "--stereopilot-shift",
+        str(float(args.stereopilot_shift)),
+        "--stereopilot-domain-label",
+        str(1 if int(args.stereopilot_domain_label) != 0 else 0),
+        "--stereopilot-dtype",
+        args.stereopilot_dtype,
+        "--stereopilot-transformer-dtype",
+        args.stereopilot_transformer_dtype,
     ]
 
     if args.disable_xformers:
@@ -842,6 +939,10 @@ def _build_remote_batch_session_cmd(args: argparse.Namespace, remote_manifest_pa
     runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
     runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
     runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
+    runner_args.append("--stereopilot-use-sidecar-prompt" if bool(args.stereopilot_use_sidecar_prompt) else "--no-stereopilot-use-sidecar-prompt")
+    stereopilot_prompt = str(getattr(args, "stereopilot_prompt", "") or "").strip()
+    if stereopilot_prompt:
+        runner_args.extend(["--stereopilot-prompt", stereopilot_prompt])
 
     quoted_runner = " ".join(shlex.quote(x) for x in runner_args)
     remote_root = args.remote_root.rstrip("/")
@@ -928,6 +1029,36 @@ def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) ->
         args.geometry_cache_dir,
         "--geometry-decode-chunk-size",
         str(max(1, int(args.geometry_decode_chunk_size))),
+        "--stereopilot-model-path",
+        args.stereopilot_model_path,
+        "--stereopilot-base-model-path",
+        args.stereopilot_base_model_path,
+        "--stereopilot-repo-path",
+        args.stereopilot_repo_path,
+        "--stereopilot-cache-dir",
+        args.stereopilot_cache_dir,
+        "--stereopilot-output-mode",
+        args.stereopilot_output_mode,
+        "--stereopilot-target-width",
+        str(max(32, int(args.stereopilot_target_width))),
+        "--stereopilot-target-height",
+        str(max(32, int(args.stereopilot_target_height))),
+        "--stereopilot-target-fps",
+        str(max(1.0, float(args.stereopilot_target_fps))),
+        "--stereopilot-frame-count",
+        str(max(1, int(args.stereopilot_frame_count))),
+        "--stereopilot-sampling-steps",
+        str(max(1, int(args.stereopilot_sampling_steps))),
+        "--stereopilot-guide-scale",
+        str(float(args.stereopilot_guide_scale)),
+        "--stereopilot-shift",
+        str(float(args.stereopilot_shift)),
+        "--stereopilot-domain-label",
+        str(1 if int(args.stereopilot_domain_label) != 0 else 0),
+        "--stereopilot-dtype",
+        args.stereopilot_dtype,
+        "--stereopilot-transformer-dtype",
+        args.stereopilot_transformer_dtype,
     ]
 
     if args.disable_xformers:
@@ -943,6 +1074,10 @@ def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) ->
     runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
     runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
     runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
+    runner_args.append("--stereopilot-use-sidecar-prompt" if bool(args.stereopilot_use_sidecar_prompt) else "--no-stereopilot-use-sidecar-prompt")
+    stereopilot_prompt = str(getattr(args, "stereopilot_prompt", "") or "").strip()
+    if stereopilot_prompt:
+        runner_args.extend(["--stereopilot-prompt", stereopilot_prompt])
 
     return " ".join(shlex.quote(x) for x in runner_args)
 

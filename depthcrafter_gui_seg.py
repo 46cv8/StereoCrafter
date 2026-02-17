@@ -31,6 +31,7 @@ _logger = logging.getLogger(__name__)
 # Import backend logic classes
 from depthcrafter.depthcrafter_logic import DepthCrafterDemo
 from depthcrafter.geometrycrafter_logic import GeometryCrafterDemo
+from depthcrafter.stereopilot_logic import StereoPilotDemo
 
 from depthcrafter.utils import (
     format_duration,
@@ -236,6 +237,23 @@ class DepthCrafterGUI:
         self.geometry_force_fixed_focal_var = tk.BooleanVar(value=True)
         self.geometry_use_extract_interp_var = tk.BooleanVar(value=False)
         self.geometry_local_status_var = tk.StringVar(value="Geometry local prerequisites: not checked.")
+        self.stereopilot_model_path_var = tk.StringVar(value="KlingTeam/StereoPilot")
+        self.stereopilot_base_model_path_var = tk.StringVar(value="Wan-AI/Wan2.1-T2V-1.3B")
+        self.stereopilot_repo_path_var = tk.StringVar(value=os.path.normpath("./weights/StereoPilot"))
+        self.stereopilot_cache_dir_var = tk.StringVar(value=os.path.normpath("./weights/hf_cache"))
+        self.stereopilot_prompt_var = tk.StringVar(value="A realistic monocular video scene with natural depth and motion.")
+        self.stereopilot_use_sidecar_prompt_var = tk.BooleanVar(value=True)
+        self.stereopilot_output_mode_var = tk.StringVar(value="side_by_side")
+        self.stereopilot_target_width_var = tk.IntVar(value=832)
+        self.stereopilot_target_height_var = tk.IntVar(value=480)
+        self.stereopilot_target_fps_var = tk.DoubleVar(value=16.0)
+        self.stereopilot_frame_count_var = tk.IntVar(value=81)
+        self.stereopilot_sampling_steps_var = tk.IntVar(value=30)
+        self.stereopilot_guide_scale_var = tk.DoubleVar(value=5.0)
+        self.stereopilot_shift_var = tk.DoubleVar(value=5.0)
+        self.stereopilot_domain_label_var = tk.IntVar(value=1)
+        self.stereopilot_dtype_var = tk.StringVar(value="bfloat16")
+        self.stereopilot_transformer_dtype_var = tk.StringVar(value="float8")
         self.use_cudnn_benchmark = tk.BooleanVar(value=False)
         self.process_length = tk.IntVar(value=-1)
         self.target_fps = tk.DoubleVar(value=-1.0)
@@ -369,6 +387,23 @@ class DepthCrafterGUI:
             "geometry_force_projection_var": self.geometry_force_projection_var,
             "geometry_force_fixed_focal_var": self.geometry_force_fixed_focal_var,
             "geometry_use_extract_interp_var": self.geometry_use_extract_interp_var,
+            "stereopilot_model_path_var": self.stereopilot_model_path_var,
+            "stereopilot_base_model_path_var": self.stereopilot_base_model_path_var,
+            "stereopilot_repo_path_var": self.stereopilot_repo_path_var,
+            "stereopilot_cache_dir_var": self.stereopilot_cache_dir_var,
+            "stereopilot_prompt_var": self.stereopilot_prompt_var,
+            "stereopilot_use_sidecar_prompt_var": self.stereopilot_use_sidecar_prompt_var,
+            "stereopilot_output_mode_var": self.stereopilot_output_mode_var,
+            "stereopilot_target_width_var": self.stereopilot_target_width_var,
+            "stereopilot_target_height_var": self.stereopilot_target_height_var,
+            "stereopilot_target_fps_var": self.stereopilot_target_fps_var,
+            "stereopilot_frame_count_var": self.stereopilot_frame_count_var,
+            "stereopilot_sampling_steps_var": self.stereopilot_sampling_steps_var,
+            "stereopilot_guide_scale_var": self.stereopilot_guide_scale_var,
+            "stereopilot_shift_var": self.stereopilot_shift_var,
+            "stereopilot_domain_label_var": self.stereopilot_domain_label_var,
+            "stereopilot_dtype_var": self.stereopilot_dtype_var,
+            "stereopilot_transformer_dtype_var": self.stereopilot_transformer_dtype_var,
             "use_cudnn_benchmark": self.use_cudnn_benchmark,
             "process_length": self.process_length,
             "target_fps": self.target_fps,
@@ -1161,6 +1196,23 @@ class DepthCrafterGUI:
                 "geometry_force_projection": self.geometry_force_projection_var.get(),
                 "geometry_force_fixed_focal": self.geometry_force_fixed_focal_var.get(),
                 "geometry_use_extract_interp": self.geometry_use_extract_interp_var.get(),
+                "stereopilot_model_path": self.stereopilot_model_path_var.get(),
+                "stereopilot_base_model_path": self.stereopilot_base_model_path_var.get(),
+                "stereopilot_repo_path": self.stereopilot_repo_path_var.get(),
+                "stereopilot_cache_dir": self.stereopilot_cache_dir_var.get(),
+                "stereopilot_prompt": self.stereopilot_prompt_var.get(),
+                "stereopilot_use_sidecar_prompt": self.stereopilot_use_sidecar_prompt_var.get(),
+                "stereopilot_output_mode": self.stereopilot_output_mode_var.get(),
+                "stereopilot_target_width": self.stereopilot_target_width_var.get(),
+                "stereopilot_target_height": self.stereopilot_target_height_var.get(),
+                "stereopilot_target_fps": self.stereopilot_target_fps_var.get(),
+                "stereopilot_frame_count": self.stereopilot_frame_count_var.get(),
+                "stereopilot_sampling_steps": self.stereopilot_sampling_steps_var.get(),
+                "stereopilot_guide_scale": self.stereopilot_guide_scale_var.get(),
+                "stereopilot_shift": self.stereopilot_shift_var.get(),
+                "stereopilot_domain_label": self.stereopilot_domain_label_var.get(),
+                "stereopilot_dtype": self.stereopilot_dtype_var.get(),
+                "stereopilot_transformer_dtype": self.stereopilot_transformer_dtype_var.get(),
             },
             "jobs_info": [], "overall_status": "pending",
             "total_expected_jobs": total_expected_jobs_for_this_video,
@@ -2100,7 +2152,7 @@ class DepthCrafterGUI:
         self.combo_model_backend = ttk.Combobox(
             main_params_frame,
             textvariable=self.model_backend_var,
-            values=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+            values=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"],
             width=20,
             state="readonly",
         )
@@ -2110,7 +2162,7 @@ class DepthCrafterGUI:
 
         geometry_settings_btn = ttk.Button(
             main_params_frame,
-            text="  ↳ Configure Geometry Backend...",
+            text="  ↳ Configure Backend...",
             command=self.toggle_geometry_settings_visibility,
             width=31,
         )
@@ -2940,6 +2992,42 @@ class DepthCrafterGUI:
                 )
                 _logger.error("Start blocked: cloud mode received non-video input source(s).")
                 return
+
+        selected_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
+        if selected_backend == "stereopilot":
+            if self.process_as_segments_var.get():
+                messagebox.showerror(
+                    "Unsupported Option",
+                    "StereoPilot backend currently supports full-video processing only. "
+                    "Disable 'Process as Segments'."
+                )
+                _logger.error("Start blocked: StereoPilot does not support segmented mode.")
+                return
+            if self.npz_backfill_missing_only_var.get():
+                messagebox.showerror(
+                    "Unsupported Option",
+                    "StereoPilot backend does not support NPZ backfill mode."
+                )
+                _logger.error("Start blocked: StereoPilot does not support NPZ backfill mode.")
+                return
+            if self.enable_spatial_refine_mode_var.get() or self.enable_edge_guided_upscale_mode_var.get():
+                messagebox.showerror(
+                    "Unsupported Option",
+                    "StereoPilot backend does not support spatial/edge hi-res special modes."
+                )
+                _logger.error("Start blocked: StereoPilot with spatial/edge special mode is unsupported.")
+                return
+            non_video_sources = [
+                spec for spec in sources_to_process_specs
+                if spec.get("type") not in ("video_file", "single_video_file")
+            ]
+            if non_video_sources:
+                messagebox.showerror(
+                    "Unsupported Input",
+                    "StereoPilot backend currently supports video inputs only."
+                )
+                _logger.error("Start blocked: StereoPilot received non-video input source(s).")
+                return
         
         # --- NEW SEED GENERATION GUARD ---
         gui_seed_setting = self.seed.get()
@@ -3041,6 +3129,28 @@ class DepthCrafterGUI:
                         "GeometryCrafter backend initialized (%s). Starting source processing loop.",
                         selected_backend,
                     )
+                elif selected_backend == "stereopilot":
+                    demo = StereoPilotDemo(
+                        model_backend=selected_backend,
+                        stereopilot_model_path=self.stereopilot_model_path_var.get().strip() or "KlingTeam/StereoPilot",
+                        stereopilot_base_model_path=self.stereopilot_base_model_path_var.get().strip() or "Wan-AI/Wan2.1-T2V-1.3B",
+                        stereopilot_repo_path=self.stereopilot_repo_path_var.get().strip(),
+                        stereopilot_cache_dir=self.stereopilot_cache_dir_var.get().strip(),
+                        stereopilot_prompt_default=self.stereopilot_prompt_var.get().strip(),
+                        stereopilot_use_sidecar_prompt=bool(self.stereopilot_use_sidecar_prompt_var.get()),
+                        stereopilot_output_mode=self.stereopilot_output_mode_var.get().strip() or "side_by_side",
+                        stereopilot_target_width=max(32, int(self.stereopilot_target_width_var.get())),
+                        stereopilot_target_height=max(32, int(self.stereopilot_target_height_var.get())),
+                        stereopilot_target_fps=max(1.0, float(self.stereopilot_target_fps_var.get())),
+                        stereopilot_frame_count=max(1, int(self.stereopilot_frame_count_var.get())),
+                        stereopilot_sampling_steps=max(1, int(self.stereopilot_sampling_steps_var.get())),
+                        stereopilot_guide_scale=float(self.stereopilot_guide_scale_var.get()),
+                        stereopilot_shift=float(self.stereopilot_shift_var.get()),
+                        stereopilot_domain_label=1 if int(self.stereopilot_domain_label_var.get()) != 0 else 0,
+                        stereopilot_dtype=self.stereopilot_dtype_var.get().strip() or "bfloat16",
+                        stereopilot_transformer_dtype=self.stereopilot_transformer_dtype_var.get().strip() or "float8",
+                    )
+                    _logger.info("StereoPilot backend initialized. Starting source processing loop.")
                 else:
                     demo = DepthCrafterDemo(
                         unet_path="tencent/DepthCrafter",
@@ -3693,7 +3803,7 @@ class DepthCrafterGUI:
                 self._close_geometry_settings_dialog()
 
         dialog = tk.Toplevel(self.root)
-        dialog.title("Geometry Backend Settings")
+        dialog.title("Backend Settings")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         dialog.protocol("WM_DELETE_WINDOW", self._close_geometry_settings_dialog)
@@ -3710,8 +3820,7 @@ class DepthCrafterGUI:
             ttk.Label(
                 outer,
                 text=(
-                    "These settings are used only when Model Backend is set to "
-                    "GeometryCrafter."
+                    "These settings are used for GeometryCrafter and StereoPilot backends."
                 ),
                 justify="left",
                 wraplength=520,
@@ -3831,6 +3940,187 @@ class DepthCrafterGUI:
         _create_hover_tooltip(self.geometry_extract_interp_cb, "geometry_use_extract_interp")
         row += 1
 
+        separator = self._register_geometry_dialog_widget(ttk.Separator(outer, orient="horizontal"))
+        separator.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=(8, 6))
+        row += 1
+
+        stereopilot_info_label = self._register_geometry_dialog_widget(
+            ttk.Label(
+                outer,
+                text="StereoPilot backend settings (novel-view/stereo video generation).",
+                justify="left",
+                wraplength=520,
+            )
+        )
+        stereopilot_info_label.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
+        row += 1
+
+        ttk.Label(outer, text="StereoPilot Model Path:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_stereopilot_model_path = self._register_geometry_dialog_widget(
+            ttk.Entry(outer, textvariable=self.stereopilot_model_path_var, width=48)
+        )
+        entry_stereopilot_model_path.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_stereopilot_model_path, "stereopilot_model_path")
+        row += 1
+
+        ttk.Label(outer, text="StereoPilot Base Model Path:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_stereopilot_base_model_path = self._register_geometry_dialog_widget(
+            ttk.Entry(outer, textvariable=self.stereopilot_base_model_path_var, width=48)
+        )
+        entry_stereopilot_base_model_path.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_stereopilot_base_model_path, "stereopilot_base_model_path")
+        row += 1
+
+        ttk.Label(outer, text="StereoPilot Repo Path:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        stereopilot_repo_frame = ttk.Frame(outer)
+        stereopilot_repo_frame.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        stereopilot_repo_frame.columnconfigure(0, weight=1)
+        entry_stereopilot_repo_path = self._register_geometry_dialog_widget(
+            ttk.Entry(stereopilot_repo_frame, textvariable=self.stereopilot_repo_path_var, width=40)
+        )
+        entry_stereopilot_repo_path.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        _create_hover_tooltip(entry_stereopilot_repo_path, "stereopilot_repo_path")
+        btn_stereopilot_repo = self._register_geometry_dialog_widget(
+            ttk.Button(
+                stereopilot_repo_frame,
+                text="Browse...",
+                command=lambda: self._browse_directory_into_var(
+                    self.stereopilot_repo_path_var, "Select StereoPilot Repo Folder"
+                ),
+                width=10,
+            )
+        )
+        btn_stereopilot_repo.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(outer, text="StereoPilot Cache Dir:").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        stereopilot_cache_frame = ttk.Frame(outer)
+        stereopilot_cache_frame.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        stereopilot_cache_frame.columnconfigure(0, weight=1)
+        entry_stereopilot_cache_dir = self._register_geometry_dialog_widget(
+            ttk.Entry(stereopilot_cache_frame, textvariable=self.stereopilot_cache_dir_var, width=40)
+        )
+        entry_stereopilot_cache_dir.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        _create_hover_tooltip(entry_stereopilot_cache_dir, "stereopilot_cache_dir")
+        btn_stereopilot_cache = self._register_geometry_dialog_widget(
+            ttk.Button(
+                stereopilot_cache_frame,
+                text="Browse...",
+                command=lambda: self._browse_directory_into_var(
+                    self.stereopilot_cache_dir_var, "Select StereoPilot Cache Folder"
+                ),
+                width=10,
+            )
+        )
+        btn_stereopilot_cache.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        ttk.Label(outer, text="Stereo Prompt (fallback):").grid(row=row, column=0, sticky="e", padx=5, pady=2)
+        entry_stereopilot_prompt = self._register_geometry_dialog_widget(
+            ttk.Entry(outer, textvariable=self.stereopilot_prompt_var, width=48)
+        )
+        entry_stereopilot_prompt.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(5, 0), pady=2)
+        _create_hover_tooltip(entry_stereopilot_prompt, "stereopilot_prompt")
+        row += 1
+
+        stereo_options_frame = self._register_geometry_dialog_widget(ttk.Frame(outer))
+        stereo_options_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=2)
+        for idx in range(4):
+            stereo_options_frame.columnconfigure(idx, weight=1)
+        stereo_sidecar_cb = self._register_geometry_dialog_widget(
+            ttk.Checkbutton(
+                stereo_options_frame,
+                text="Use sidecar .txt prompt when available",
+                variable=self.stereopilot_use_sidecar_prompt_var,
+            )
+        )
+        stereo_sidecar_cb.grid(row=0, column=0, columnspan=2, sticky="w")
+        _create_hover_tooltip(stereo_sidecar_cb, "stereopilot_use_sidecar_prompt")
+        ttk.Label(stereo_options_frame, text="Output Mode:").grid(row=0, column=2, sticky="e", padx=(6, 2))
+        stereo_output_combo = self._register_geometry_dialog_widget(
+            ttk.Combobox(
+                stereo_options_frame,
+                textvariable=self.stereopilot_output_mode_var,
+                values=["opposite_eye", "side_by_side", "both"],
+                width=16,
+                state="readonly",
+            )
+        )
+        stereo_output_combo.grid(row=0, column=3, sticky="w")
+        _create_hover_tooltip(stereo_output_combo, "stereopilot_output_mode")
+        row += 1
+
+        stereo_numeric_frame = self._register_geometry_dialog_widget(ttk.Frame(outer))
+        stereo_numeric_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 4))
+        for idx in range(8):
+            stereo_numeric_frame.columnconfigure(idx, weight=0)
+
+        ttk.Label(stereo_numeric_frame, text="W").grid(row=0, column=0, sticky="e", padx=(0, 2))
+        entry_sp_w = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame, textvariable=self.stereopilot_target_width_var, width=7))
+        entry_sp_w.grid(row=0, column=1, sticky="w", padx=(0, 6))
+        ttk.Label(stereo_numeric_frame, text="H").grid(row=0, column=2, sticky="e", padx=(0, 2))
+        entry_sp_h = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame, textvariable=self.stereopilot_target_height_var, width=7))
+        entry_sp_h.grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ttk.Label(stereo_numeric_frame, text="FPS").grid(row=0, column=4, sticky="e", padx=(0, 2))
+        entry_sp_fps = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame, textvariable=self.stereopilot_target_fps_var, width=7))
+        entry_sp_fps.grid(row=0, column=5, sticky="w", padx=(0, 6))
+        ttk.Label(stereo_numeric_frame, text="Frames").grid(row=0, column=6, sticky="e", padx=(0, 2))
+        entry_sp_frames = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame, textvariable=self.stereopilot_frame_count_var, width=7))
+        entry_sp_frames.grid(row=0, column=7, sticky="w")
+        _create_hover_tooltip(entry_sp_w, "stereopilot_target_width")
+        _create_hover_tooltip(entry_sp_h, "stereopilot_target_height")
+        _create_hover_tooltip(entry_sp_fps, "stereopilot_target_fps")
+        _create_hover_tooltip(entry_sp_frames, "stereopilot_frame_count")
+        row += 1
+
+        stereo_numeric_frame_2 = self._register_geometry_dialog_widget(ttk.Frame(outer))
+        stereo_numeric_frame_2.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=(0, 4))
+        ttk.Label(stereo_numeric_frame_2, text="Sampling Steps").grid(row=0, column=0, sticky="e", padx=(0, 2))
+        entry_sp_steps = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame_2, textvariable=self.stereopilot_sampling_steps_var, width=7))
+        entry_sp_steps.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(stereo_numeric_frame_2, text="Guide Scale").grid(row=0, column=2, sticky="e", padx=(0, 2))
+        entry_sp_guide = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame_2, textvariable=self.stereopilot_guide_scale_var, width=7))
+        entry_sp_guide.grid(row=0, column=3, sticky="w", padx=(0, 8))
+        ttk.Label(stereo_numeric_frame_2, text="Shift").grid(row=0, column=4, sticky="e", padx=(0, 2))
+        entry_sp_shift = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame_2, textvariable=self.stereopilot_shift_var, width=7))
+        entry_sp_shift.grid(row=0, column=5, sticky="w", padx=(0, 8))
+        ttk.Label(stereo_numeric_frame_2, text="Domain").grid(row=0, column=6, sticky="e", padx=(0, 2))
+        entry_sp_domain = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame_2, textvariable=self.stereopilot_domain_label_var, width=5))
+        entry_sp_domain.grid(row=0, column=7, sticky="w")
+        _create_hover_tooltip(entry_sp_steps, "stereopilot_sampling_steps")
+        _create_hover_tooltip(entry_sp_guide, "stereopilot_guide_scale")
+        _create_hover_tooltip(entry_sp_shift, "stereopilot_shift")
+        _create_hover_tooltip(entry_sp_domain, "stereopilot_domain_label")
+        row += 1
+
+        stereo_dtype_frame = self._register_geometry_dialog_widget(ttk.Frame(outer))
+        stereo_dtype_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
+        ttk.Label(stereo_dtype_frame, text="Model Dtype:").grid(row=0, column=0, sticky="e", padx=(0, 2))
+        combo_sp_dtype = self._register_geometry_dialog_widget(
+            ttk.Combobox(
+                stereo_dtype_frame,
+                textvariable=self.stereopilot_dtype_var,
+                values=["float16", "bfloat16", "float32"],
+                width=10,
+                state="readonly",
+            )
+        )
+        combo_sp_dtype.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(stereo_dtype_frame, text="Transformer Dtype:").grid(row=0, column=2, sticky="e", padx=(0, 2))
+        combo_sp_transformer_dtype = self._register_geometry_dialog_widget(
+            ttk.Combobox(
+                stereo_dtype_frame,
+                textvariable=self.stereopilot_transformer_dtype_var,
+                values=["float8", "float16", "bfloat16", "float32"],
+                width=10,
+                state="readonly",
+            )
+        )
+        combo_sp_transformer_dtype.grid(row=0, column=3, sticky="w")
+        _create_hover_tooltip(combo_sp_dtype, "stereopilot_dtype")
+        _create_hover_tooltip(combo_sp_transformer_dtype, "stereopilot_transformer_dtype")
+        row += 1
+
         status_label = self._register_geometry_dialog_widget(
             ttk.Label(
                 outer,
@@ -3857,7 +4147,7 @@ class DepthCrafterGUI:
             self.geometry_settings_dialog is not None
             and bool(self.geometry_settings_dialog.winfo_exists())
         )
-        button_text = "  ↳ Geometry Settings Open" if is_open else "  ↳ Configure Geometry Backend..."
+        button_text = "  ↳ Backend Settings Open" if is_open else "  ↳ Configure Backend..."
         try:
             self.geometry_settings_toggle_btn.configure(text=button_text)
         except tk.TclError:
@@ -3927,6 +4217,10 @@ class DepthCrafterGUI:
             self.geometry_model_path_var,
             self.geometry_repo_path_var,
             self.geometry_cache_dir_var,
+            self.stereopilot_model_path_var,
+            self.stereopilot_base_model_path_var,
+            self.stereopilot_repo_path_var,
+            self.stereopilot_cache_dir_var,
             self.enable_cloud_dispatch_mode_var,
         ]
         for tk_var in tracked_vars:
@@ -3940,15 +4234,107 @@ class DepthCrafterGUI:
             return
 
         backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
-        if backend not in ("geometrycrafter_diff", "geometrycrafter_determ"):
-            self.geometry_local_status_var.set("Geometry backend inactive.")
+        if backend not in ("geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"):
+            self.geometry_local_status_var.set("DepthCrafter backend active. No extra local prerequisites.")
             return
 
         if bool(self.enable_cloud_dispatch_mode_var.get()):
-            self.geometry_local_status_var.set(
-                "Geometry backend selected in Cloud mode: local Geometry repo is optional. "
-                "Remote worker will auto-provision repo/submodules and download model weights as needed."
-            )
+            if backend.startswith("geometrycrafter"):
+                self.geometry_local_status_var.set(
+                    "Geometry backend selected in Cloud mode: local Geometry repo is optional. "
+                    "Remote worker auto-provisions repo/submodules and model weights."
+                )
+            else:
+                self.geometry_local_status_var.set(
+                    "StereoPilot backend selected in Cloud mode: local StereoPilot repo is optional. "
+                    "Remote worker auto-provisions repo and model weights."
+                )
+            return
+
+        if backend == "stereopilot":
+            repo_root = os.path.dirname(os.path.abspath(__file__))
+            repo_path_raw = str(self.stereopilot_repo_path_var.get() or "").strip()
+            if repo_path_raw:
+                repo_path = os.path.expanduser(repo_path_raw)
+                if not os.path.isabs(repo_path):
+                    repo_path = os.path.normpath(os.path.join(repo_root, repo_path))
+            else:
+                repo_path = os.path.normpath(os.path.join(repo_root, "weights", "StereoPilot"))
+
+            model_raw = str(self.stereopilot_model_path_var.get() or "KlingTeam/StereoPilot").strip() or "KlingTeam/StereoPilot"
+            base_raw = str(self.stereopilot_base_model_path_var.get() or "Wan-AI/Wan2.1-T2V-1.3B").strip() or "Wan-AI/Wan2.1-T2V-1.3B"
+            cache_raw = str(self.stereopilot_cache_dir_var.get() or "").strip()
+
+            missing_items = []
+            if not os.path.isdir(repo_path):
+                missing_items.append("repo folder")
+            else:
+                if not os.path.isfile(os.path.join(repo_path, "sample.py")):
+                    missing_items.append("sample.py")
+                if not os.path.isdir(os.path.join(repo_path, "models")):
+                    missing_items.append("models/")
+                if not os.path.isdir(os.path.join(repo_path, "utils")):
+                    missing_items.append("utils/")
+
+            transformer_local = os.path.join(repo_path, "ckpt", "StereoPilot.safetensors")
+            base_local = os.path.join(repo_path, "ckpt", "Wan2.1-T2V-1.3B")
+            model_path_expanded = os.path.expanduser(model_raw)
+            base_path_expanded = os.path.expanduser(base_raw)
+            model_status_note = ""
+            base_status_note = ""
+
+            if os.path.isfile(model_path_expanded):
+                model_status_note = f"transformer: local file ({model_path_expanded})"
+            elif os.path.isfile(transformer_local):
+                model_status_note = f"transformer: local cache ({transformer_local})"
+            else:
+                if "/" in model_raw:
+                    model_status_note = "transformer: missing local checkpoint (will need HF download/setup script)"
+                else:
+                    model_status_note = f"transformer: missing ({model_raw})"
+                missing_items.append("StereoPilot.safetensors")
+
+            if os.path.isdir(base_path_expanded):
+                base_status_note = f"base model: local dir ({base_path_expanded})"
+            elif os.path.isdir(base_local):
+                base_status_note = f"base model: local cache ({base_local})"
+            else:
+                if "/" in base_raw:
+                    base_status_note = "base model: missing local checkpoint directory (will need HF download/setup script)"
+                else:
+                    base_status_note = f"base model: missing ({base_raw})"
+                missing_items.append("Wan2.1-T2V-1.3B")
+
+            try:
+                import toml  # noqa: F401
+            except Exception:
+                missing_items.append("python package: toml")
+            try:
+                import easydict  # noqa: F401
+            except Exception:
+                missing_items.append("python package: easydict")
+            try:
+                import ftfy  # noqa: F401
+            except Exception:
+                missing_items.append("python package: ftfy")
+            try:
+                import safetensors  # noqa: F401
+            except Exception:
+                missing_items.append("python package: safetensors")
+
+            cache_note = f"cache dir: {cache_raw}" if cache_raw else "cache dir: default"
+            setup_hint = "setup: PYTHON_BIN=<your_python> bash scripts/setup_stereopilot_local.sh"
+
+            if missing_items:
+                self.geometry_local_status_var.set(
+                    "StereoPilot local status: missing "
+                    + ", ".join(missing_items)
+                    + f". Repo path checked: {repo_path} | {model_status_note} | {base_status_note} | {cache_note} | {setup_hint}"
+                )
+            else:
+                self.geometry_local_status_var.set(
+                    f"StereoPilot local status: ready | repo: {repo_path} | {model_status_note} | {base_status_note} | {cache_note}"
+                )
             return
 
         repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -6480,7 +6866,7 @@ class DepthCrafterGUI:
             or self._detect_local_git_branch(repo_root)
         )
         model_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
-        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"):
+        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"):
             model_backend = "depthcrafter"
 
         geometry_model_path = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
@@ -6492,6 +6878,24 @@ class DepthCrafterGUI:
         geometry_force_projection = bool(self.geometry_force_projection_var.get())
         geometry_force_fixed_focal = bool(self.geometry_force_fixed_focal_var.get())
         geometry_use_extract_interp = bool(self.geometry_use_extract_interp_var.get())
+        stereopilot_model_path = str(self.stereopilot_model_path_var.get() or "KlingTeam/StereoPilot").strip()
+        stereopilot_base_model_path = str(self.stereopilot_base_model_path_var.get() or "Wan-AI/Wan2.1-T2V-1.3B").strip()
+        stereopilot_repo_path = os.path.join(remote_root, "weights", "StereoPilot") if remote_root else ""
+        stereopilot_cache_dir = os.path.join(remote_root, "weights", "hf_cache") if remote_root else ""
+        stereopilot_prompt = str(self.stereopilot_prompt_var.get() or "").strip()
+        stereopilot_output_mode = str(self.stereopilot_output_mode_var.get() or "side_by_side").strip().lower()
+        if stereopilot_output_mode not in {"opposite_eye", "side_by_side", "both"}:
+            stereopilot_output_mode = "side_by_side"
+        stereopilot_target_width = max(32, int(self.stereopilot_target_width_var.get()))
+        stereopilot_target_height = max(32, int(self.stereopilot_target_height_var.get()))
+        stereopilot_target_fps = max(1.0, float(self.stereopilot_target_fps_var.get()))
+        stereopilot_frame_count = max(1, int(self.stereopilot_frame_count_var.get()))
+        stereopilot_sampling_steps = max(1, int(self.stereopilot_sampling_steps_var.get()))
+        stereopilot_guide_scale = float(self.stereopilot_guide_scale_var.get())
+        stereopilot_shift = float(self.stereopilot_shift_var.get())
+        stereopilot_domain_label = 1 if int(self.stereopilot_domain_label_var.get()) != 0 else 0
+        stereopilot_dtype = str(self.stereopilot_dtype_var.get() or "bfloat16").strip().lower()
+        stereopilot_transformer_dtype = str(self.stereopilot_transformer_dtype_var.get() or "float8").strip().lower()
         original_basename = source_spec["basename"]
 
         if (
@@ -6572,6 +6976,36 @@ class DepthCrafterGUI:
             geometry_cache_dir,
             "--geometry-decode-chunk-size",
             str(geometry_decode_chunk),
+            "--stereopilot-model-path",
+            stereopilot_model_path,
+            "--stereopilot-base-model-path",
+            stereopilot_base_model_path,
+            "--stereopilot-repo-path",
+            stereopilot_repo_path,
+            "--stereopilot-cache-dir",
+            stereopilot_cache_dir,
+            "--stereopilot-output-mode",
+            stereopilot_output_mode,
+            "--stereopilot-target-width",
+            str(stereopilot_target_width),
+            "--stereopilot-target-height",
+            str(stereopilot_target_height),
+            "--stereopilot-target-fps",
+            str(stereopilot_target_fps),
+            "--stereopilot-frame-count",
+            str(stereopilot_frame_count),
+            "--stereopilot-sampling-steps",
+            str(stereopilot_sampling_steps),
+            "--stereopilot-guide-scale",
+            str(stereopilot_guide_scale),
+            "--stereopilot-shift",
+            str(stereopilot_shift),
+            "--stereopilot-domain-label",
+            str(stereopilot_domain_label),
+            "--stereopilot-dtype",
+            stereopilot_dtype,
+            "--stereopilot-transformer-dtype",
+            stereopilot_transformer_dtype,
         ]
 
         identity_file = self.cloud_identity_file_var.get().strip()
@@ -6592,6 +7026,9 @@ class DepthCrafterGUI:
         cmd.append("--geometry-force-projection" if geometry_force_projection else "--no-geometry-force-projection")
         cmd.append("--geometry-force-fixed-focal" if geometry_force_fixed_focal else "--no-geometry-force-fixed-focal")
         cmd.append("--geometry-use-extract-interp" if geometry_use_extract_interp else "--no-geometry-use-extract-interp")
+        cmd.append("--stereopilot-use-sidecar-prompt" if bool(self.stereopilot_use_sidecar_prompt_var.get()) else "--no-stereopilot-use-sidecar-prompt")
+        if stereopilot_prompt:
+            cmd.extend(["--stereopilot-prompt", stereopilot_prompt])
 
         return cmd, job_name
 
@@ -6633,7 +7070,7 @@ class DepthCrafterGUI:
             or self._detect_local_git_branch(repo_root)
         )
         model_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
-        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"):
+        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"):
             model_backend = "depthcrafter"
 
         geometry_model_path = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
@@ -6645,6 +7082,24 @@ class DepthCrafterGUI:
         geometry_force_projection = bool(self.geometry_force_projection_var.get())
         geometry_force_fixed_focal = bool(self.geometry_force_fixed_focal_var.get())
         geometry_use_extract_interp = bool(self.geometry_use_extract_interp_var.get())
+        stereopilot_model_path = str(self.stereopilot_model_path_var.get() or "KlingTeam/StereoPilot").strip()
+        stereopilot_base_model_path = str(self.stereopilot_base_model_path_var.get() or "Wan-AI/Wan2.1-T2V-1.3B").strip()
+        stereopilot_repo_path = os.path.join(remote_root, "weights", "StereoPilot") if remote_root else ""
+        stereopilot_cache_dir = os.path.join(remote_root, "weights", "hf_cache") if remote_root else ""
+        stereopilot_prompt = str(self.stereopilot_prompt_var.get() or "").strip()
+        stereopilot_output_mode = str(self.stereopilot_output_mode_var.get() or "side_by_side").strip().lower()
+        if stereopilot_output_mode not in {"opposite_eye", "side_by_side", "both"}:
+            stereopilot_output_mode = "side_by_side"
+        stereopilot_target_width = max(32, int(self.stereopilot_target_width_var.get()))
+        stereopilot_target_height = max(32, int(self.stereopilot_target_height_var.get()))
+        stereopilot_target_fps = max(1.0, float(self.stereopilot_target_fps_var.get()))
+        stereopilot_frame_count = max(1, int(self.stereopilot_frame_count_var.get()))
+        stereopilot_sampling_steps = max(1, int(self.stereopilot_sampling_steps_var.get()))
+        stereopilot_guide_scale = float(self.stereopilot_guide_scale_var.get())
+        stereopilot_shift = float(self.stereopilot_shift_var.get())
+        stereopilot_domain_label = 1 if int(self.stereopilot_domain_label_var.get()) != 0 else 0
+        stereopilot_dtype = str(self.stereopilot_dtype_var.get() or "bfloat16").strip().lower()
+        stereopilot_transformer_dtype = str(self.stereopilot_transformer_dtype_var.get() or "float8").strip().lower()
         if (
             bool(cloud_settings.get("use_source_resolution", False))
             and int(cloud_settings.get("target_width_override", 0)) <= 0
@@ -6721,6 +7176,36 @@ class DepthCrafterGUI:
             geometry_cache_dir,
             "--geometry-decode-chunk-size",
             str(geometry_decode_chunk),
+            "--stereopilot-model-path",
+            stereopilot_model_path,
+            "--stereopilot-base-model-path",
+            stereopilot_base_model_path,
+            "--stereopilot-repo-path",
+            stereopilot_repo_path,
+            "--stereopilot-cache-dir",
+            stereopilot_cache_dir,
+            "--stereopilot-output-mode",
+            stereopilot_output_mode,
+            "--stereopilot-target-width",
+            str(stereopilot_target_width),
+            "--stereopilot-target-height",
+            str(stereopilot_target_height),
+            "--stereopilot-target-fps",
+            str(stereopilot_target_fps),
+            "--stereopilot-frame-count",
+            str(stereopilot_frame_count),
+            "--stereopilot-sampling-steps",
+            str(stereopilot_sampling_steps),
+            "--stereopilot-guide-scale",
+            str(stereopilot_guide_scale),
+            "--stereopilot-shift",
+            str(stereopilot_shift),
+            "--stereopilot-domain-label",
+            str(stereopilot_domain_label),
+            "--stereopilot-dtype",
+            stereopilot_dtype,
+            "--stereopilot-transformer-dtype",
+            stereopilot_transformer_dtype,
             "--prefetch-window",
             "2",
         ]
@@ -6743,6 +7228,9 @@ class DepthCrafterGUI:
         cmd.append("--geometry-force-projection" if geometry_force_projection else "--no-geometry-force-projection")
         cmd.append("--geometry-force-fixed-focal" if geometry_force_fixed_focal else "--no-geometry-force-fixed-focal")
         cmd.append("--geometry-use-extract-interp" if geometry_use_extract_interp else "--no-geometry-use-extract-interp")
+        cmd.append("--stereopilot-use-sidecar-prompt" if bool(self.stereopilot_use_sidecar_prompt_var.get()) else "--no-stereopilot-use-sidecar-prompt")
+        if stereopilot_prompt:
+            cmd.extend(["--stereopilot-prompt", stereopilot_prompt])
 
         return cmd, manifest_path
 

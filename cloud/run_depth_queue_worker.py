@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Long-lived queue worker for remote DepthCrafter/GeometryCrafter inference.
+"""Long-lived queue worker for remote DepthCrafter/GeometryCrafter/StereoPilot inference.
 
 This worker keeps model weights loaded in memory and processes jobs from a
 filesystem queue:
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--model-backend",
-        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"],
         default="depthcrafter",
     )
     parser.add_argument(
@@ -77,6 +77,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--geometry-use-extract-interp",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument("--stereopilot-model-path", default="KlingTeam/StereoPilot")
+    parser.add_argument("--stereopilot-base-model-path", default="Wan-AI/Wan2.1-T2V-1.3B")
+    parser.add_argument("--stereopilot-repo-path", default="")
+    parser.add_argument("--stereopilot-cache-dir", default="")
+    parser.add_argument("--stereopilot-prompt", default="")
+    parser.add_argument(
+        "--stereopilot-use-sidecar-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--stereopilot-output-mode",
+        choices=["opposite_eye", "side_by_side", "both"],
+        default="side_by_side",
+    )
+    parser.add_argument("--stereopilot-target-width", type=int, default=832)
+    parser.add_argument("--stereopilot-target-height", type=int, default=480)
+    parser.add_argument("--stereopilot-target-fps", type=float, default=16.0)
+    parser.add_argument("--stereopilot-frame-count", type=int, default=81)
+    parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
+    parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
+    parser.add_argument("--stereopilot-shift", type=float, default=5.0)
+    parser.add_argument("--stereopilot-domain-label", type=int, choices=[0, 1], default=1)
+    parser.add_argument(
+        "--stereopilot-dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="bfloat16",
+    )
+    parser.add_argument(
+        "--stereopilot-transformer-dtype",
+        choices=["float8", "float16", "bfloat16", "float32"],
+        default="float8",
     )
 
     parser.add_argument("--unet-path", default="tencent/DepthCrafter")

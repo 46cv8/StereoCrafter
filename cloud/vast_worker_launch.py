@@ -594,7 +594,7 @@ def build_cloudctl_cmd(
     if cpu_offload not in {"model", "sequential", "none"}:
         cpu_offload = "model"
     model_backend = str(cfg.get("model_backend_var", "depthcrafter") or "depthcrafter").strip().lower()
-    if model_backend not in {"depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"}:
+    if model_backend not in {"depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"}:
         model_backend = "depthcrafter"
     geometry_model_path = str(cfg.get("geometry_model_path_var", "TencentARC/GeometryCrafter") or "TencentARC/GeometryCrafter")
     geometry_repo_path = remote_join(args.remote_root.rstrip("/"), "weights", "GeometryCrafter")
@@ -604,6 +604,25 @@ def build_cloudctl_cmd(
     geometry_force_projection = bool(cfg.get("geometry_force_projection_var", True))
     geometry_force_fixed_focal = bool(cfg.get("geometry_force_fixed_focal_var", True))
     geometry_use_extract_interp = bool(cfg.get("geometry_use_extract_interp_var", False))
+    stereopilot_model_path = str(cfg.get("stereopilot_model_path_var", "KlingTeam/StereoPilot") or "KlingTeam/StereoPilot")
+    stereopilot_base_model_path = str(cfg.get("stereopilot_base_model_path_var", "Wan-AI/Wan2.1-T2V-1.3B") or "Wan-AI/Wan2.1-T2V-1.3B")
+    stereopilot_repo_path = remote_join(args.remote_root.rstrip("/"), "weights", "StereoPilot")
+    stereopilot_cache_dir = remote_join(args.remote_root.rstrip("/"), "weights", "hf_cache")
+    stereopilot_prompt = str(cfg.get("stereopilot_prompt_var", "") or "")
+    stereopilot_use_sidecar_prompt = bool(cfg.get("stereopilot_use_sidecar_prompt_var", True))
+    stereopilot_output_mode = str(cfg.get("stereopilot_output_mode_var", "side_by_side") or "side_by_side").strip().lower()
+    if stereopilot_output_mode not in {"opposite_eye", "side_by_side", "both"}:
+        stereopilot_output_mode = "side_by_side"
+    stereopilot_target_width = max(32, as_int(cfg.get("stereopilot_target_width_var"), 832))
+    stereopilot_target_height = max(32, as_int(cfg.get("stereopilot_target_height_var"), 480))
+    stereopilot_target_fps = max(1.0, as_float(cfg.get("stereopilot_target_fps_var"), 16.0))
+    stereopilot_frame_count = max(1, as_int(cfg.get("stereopilot_frame_count_var"), 81))
+    stereopilot_sampling_steps = max(1, as_int(cfg.get("stereopilot_sampling_steps_var"), 30))
+    stereopilot_guide_scale = as_float(cfg.get("stereopilot_guide_scale_var"), 5.0)
+    stereopilot_shift = as_float(cfg.get("stereopilot_shift_var"), 5.0)
+    stereopilot_domain_label = 1 if as_int(cfg.get("stereopilot_domain_label_var"), 1) != 0 else 0
+    stereopilot_dtype = str(cfg.get("stereopilot_dtype_var", "bfloat16") or "bfloat16").strip().lower()
+    stereopilot_transformer_dtype = str(cfg.get("stereopilot_transformer_dtype_var", "float8") or "float8").strip().lower()
 
     cmd += [
         "--target-width",
@@ -638,6 +657,36 @@ def build_cloudctl_cmd(
         geometry_cache_dir,
         "--geometry-decode-chunk-size",
         str(geometry_decode_chunk_size),
+        "--stereopilot-model-path",
+        stereopilot_model_path,
+        "--stereopilot-base-model-path",
+        stereopilot_base_model_path,
+        "--stereopilot-repo-path",
+        stereopilot_repo_path,
+        "--stereopilot-cache-dir",
+        stereopilot_cache_dir,
+        "--stereopilot-output-mode",
+        stereopilot_output_mode,
+        "--stereopilot-target-width",
+        str(stereopilot_target_width),
+        "--stereopilot-target-height",
+        str(stereopilot_target_height),
+        "--stereopilot-target-fps",
+        str(stereopilot_target_fps),
+        "--stereopilot-frame-count",
+        str(stereopilot_frame_count),
+        "--stereopilot-sampling-steps",
+        str(stereopilot_sampling_steps),
+        "--stereopilot-guide-scale",
+        str(stereopilot_guide_scale),
+        "--stereopilot-shift",
+        str(stereopilot_shift),
+        "--stereopilot-domain-label",
+        str(stereopilot_domain_label),
+        "--stereopilot-dtype",
+        stereopilot_dtype,
+        "--stereopilot-transformer-dtype",
+        stereopilot_transformer_dtype,
     ]
 
     if bool(cfg.get("disable_xformers_var", False)):
@@ -651,6 +700,9 @@ def build_cloudctl_cmd(
     cmd.append("--geometry-force-projection" if geometry_force_projection else "--no-geometry-force-projection")
     cmd.append("--geometry-force-fixed-focal" if geometry_force_fixed_focal else "--no-geometry-force-fixed-focal")
     cmd.append("--geometry-use-extract-interp" if geometry_use_extract_interp else "--no-geometry-use-extract-interp")
+    cmd.append("--stereopilot-use-sidecar-prompt" if stereopilot_use_sidecar_prompt else "--no-stereopilot-use-sidecar-prompt")
+    if stereopilot_prompt.strip():
+        cmd += ["--stereopilot-prompt", stereopilot_prompt.strip()]
 
     download_dir = args.download_dir_override or str(cfg.get("output_dir", "")).strip() or "./cloud_downloads"
     cmd += ["--download-dir", download_dir]

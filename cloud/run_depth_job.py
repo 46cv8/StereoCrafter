@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 _LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 _DEFAULT_GEOMETRY_REPO_URL = "https://github.com/TencentARC/GeometryCrafter.git"
+_DEFAULT_STEREOPILOT_REPO_URL = "https://github.com/KlingTeam/StereoPilot.git"
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -119,6 +120,16 @@ def _ensure_runtime_python_deps(
                 ("trimesh", "trimesh>=4.0"),
             ]
         )
+    if model_backend == "stereopilot":
+        required_modules.extend(
+            [
+                ("toml", "toml>=0.10.2"),
+                ("easydict", "easydict>=1.13"),
+                ("ftfy", "ftfy>=6.3.1"),
+                ("safetensors", "safetensors>=0.5.3"),
+                ("torchvision", "torchvision>=0.24.1"),
+            ]
+        )
 
     seen: set[str] = set()
     for module_name, pip_spec in required_modules:
@@ -167,6 +178,185 @@ def _ensure_geometry_repo_available(raw_repo_path: str, logger: logging.Logger) 
     if not _is_geometry_repo(repo_path):
         raise RuntimeError(f"GeometryCrafter repository is incomplete at {repo_path}.")
     return repo_path
+
+
+def _is_stereopilot_repo(path: Path) -> bool:
+    return (path / "sample.py").is_file() and (path / "models").is_dir() and (path / "utils").is_dir()
+
+
+def _resolve_stereopilot_repo_path(raw_value: str) -> Path:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return (REPO_ROOT / "weights" / "StereoPilot").resolve()
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (REPO_ROOT / path).resolve()
+
+
+def _ensure_stereopilot_repo_available(raw_repo_path: str, logger: logging.Logger) -> Path:
+    repo_path = _resolve_stereopilot_repo_path(raw_repo_path)
+    if not repo_path.exists():
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_cmd_checked(
+            ["git", "clone", _DEFAULT_STEREOPILOT_REPO_URL, str(repo_path)],
+            logger=logger,
+        )
+    elif not _is_stereopilot_repo(repo_path):
+        raise RuntimeError(
+            f"StereoPilot repo path exists but is not a valid StereoPilot checkout: {repo_path}"
+        )
+
+    if not _is_stereopilot_repo(repo_path):
+        raise RuntimeError(f"StereoPilot repository is incomplete at {repo_path}.")
+    return repo_path
+
+
+def _resolve_local_or_hf_model_file(
+    raw_value: str,
+    *,
+    default_repo_id: str,
+    default_filename: str,
+    logger: logging.Logger,
+    local_files_only: bool,
+    cache_dir: str,
+    local_default_file: Path,
+) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    raw = str(raw_value or "").strip()
+    if not raw:
+        raw = default_repo_id
+
+    candidate = Path(raw).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    if not candidate.is_absolute():
+        joined = (REPO_ROOT / candidate).resolve()
+        if joined.is_file():
+            return joined
+    if local_default_file.is_file():
+        return local_default_file.resolve()
+
+    if "/" not in raw:
+        raise FileNotFoundError(
+            f"StereoPilot checkpoint file not found: {raw} (and default local cache missing: {local_default_file})"
+        )
+    if local_files_only:
+        raise FileNotFoundError(
+            f"StereoPilot checkpoint missing in local cache and --local-files-only is set: {local_default_file}"
+        )
+
+    download_kwargs: Dict[str, Any] = {
+        "repo_id": raw,
+        "filename": default_filename,
+    }
+    cache_raw = str(cache_dir or "").strip()
+    if cache_raw:
+        download_kwargs["cache_dir"] = cache_raw
+
+    logger.info("Downloading StereoPilot checkpoint '%s/%s'...", raw, default_filename)
+    downloaded = hf_hub_download(**download_kwargs)
+    downloaded_path = Path(downloaded).expanduser().resolve()
+    local_default_file.parent.mkdir(parents=True, exist_ok=True)
+    if not local_default_file.exists():
+        try:
+            if downloaded_path != local_default_file:
+                import shutil
+
+                shutil.copy2(downloaded_path, local_default_file)
+        except Exception:
+            pass
+    return downloaded_path
+
+
+def _resolve_local_or_hf_model_dir(
+    raw_value: str,
+    *,
+    default_repo_id: str,
+    logger: logging.Logger,
+    local_files_only: bool,
+    cache_dir: str,
+    local_default_dir: Path,
+) -> Path:
+    from huggingface_hub import snapshot_download
+
+    raw = str(raw_value or "").strip()
+    if not raw:
+        raw = default_repo_id
+
+    candidate = Path(raw).expanduser()
+    if candidate.is_dir():
+        return candidate.resolve()
+    if not candidate.is_absolute():
+        joined = (REPO_ROOT / candidate).resolve()
+        if joined.is_dir():
+            return joined
+    if local_default_dir.is_dir():
+        return local_default_dir.resolve()
+
+    if "/" not in raw:
+        raise FileNotFoundError(
+            f"StereoPilot base model directory not found: {raw} (and default local cache missing: {local_default_dir})"
+        )
+    if local_files_only:
+        raise FileNotFoundError(
+            f"StereoPilot base model missing in local cache and --local-files-only is set: {local_default_dir}"
+        )
+
+    download_kwargs: Dict[str, Any] = {
+        "repo_id": raw,
+    }
+    cache_raw = str(cache_dir or "").strip()
+    if cache_raw:
+        download_kwargs["cache_dir"] = cache_raw
+
+    logger.info("Downloading StereoPilot base model snapshot '%s'...", raw)
+    downloaded = snapshot_download(**download_kwargs)
+    downloaded_path = Path(downloaded).expanduser().resolve()
+    local_default_dir.parent.mkdir(parents=True, exist_ok=True)
+    if not local_default_dir.exists():
+        try:
+            if downloaded_path != local_default_dir:
+                import shutil
+
+                shutil.copytree(downloaded_path, local_default_dir, dirs_exist_ok=True)
+        except Exception:
+            pass
+    return downloaded_path
+
+
+def _ensure_stereopilot_assets_available(
+    *,
+    repo_path: Path,
+    model_path: str,
+    base_model_path: str,
+    cache_dir: str,
+    local_files_only: bool,
+    logger: logging.Logger,
+) -> tuple[Path, Path]:
+    ckpt_dir = repo_path / "ckpt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    transformer_file = _resolve_local_or_hf_model_file(
+        model_path,
+        default_repo_id="KlingTeam/StereoPilot",
+        default_filename="StereoPilot.safetensors",
+        logger=logger,
+        local_files_only=local_files_only,
+        cache_dir=cache_dir,
+        local_default_file=ckpt_dir / "StereoPilot.safetensors",
+    )
+    base_dir = _resolve_local_or_hf_model_dir(
+        base_model_path,
+        default_repo_id="Wan-AI/Wan2.1-T2V-1.3B",
+        logger=logger,
+        local_files_only=local_files_only,
+        cache_dir=cache_dir,
+        local_default_dir=ckpt_dir / "Wan2.1-T2V-1.3B",
+    )
+
+    return transformer_file, base_dir
 
 
 def _query_nvidia_smi_totals_mib() -> Dict[int, Dict[str, Any]]:
@@ -866,7 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--model-backend",
-        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"],
+        choices=["depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"],
         default="depthcrafter",
     )
     parser.add_argument(
@@ -898,6 +1088,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--geometry-use-extract-interp",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument("--stereopilot-model-path", default="KlingTeam/StereoPilot")
+    parser.add_argument("--stereopilot-base-model-path", default="Wan-AI/Wan2.1-T2V-1.3B")
+    parser.add_argument("--stereopilot-repo-path", default="")
+    parser.add_argument("--stereopilot-cache-dir", default="")
+    parser.add_argument("--stereopilot-prompt", default="")
+    parser.add_argument(
+        "--stereopilot-use-sidecar-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--stereopilot-output-mode",
+        choices=["opposite_eye", "side_by_side", "both"],
+        default="side_by_side",
+    )
+    parser.add_argument("--stereopilot-target-width", type=int, default=832)
+    parser.add_argument("--stereopilot-target-height", type=int, default=480)
+    parser.add_argument("--stereopilot-target-fps", type=float, default=16.0)
+    parser.add_argument("--stereopilot-frame-count", type=int, default=81)
+    parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
+    parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
+    parser.add_argument("--stereopilot-shift", type=float, default=5.0)
+    parser.add_argument("--stereopilot-domain-label", type=int, choices=[0, 1], default=1)
+    parser.add_argument(
+        "--stereopilot-dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="bfloat16",
+    )
+    parser.add_argument(
+        "--stereopilot-transformer-dtype",
+        choices=["float8", "float16", "bfloat16", "float32"],
+        default="float8",
     )
 
     parser.add_argument("--unet-path", default="tencent/DepthCrafter")
@@ -931,6 +1154,8 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         return
     if not args.input:
         raise ValueError("--input is required unless --prewarm-only is set.")
+    if str(args.model_backend or "").strip().lower() == "stereopilot":
+        return
     if args.window_size <= 0:
         raise ValueError("--window-size must be > 0.")
     if args.overlap < 0:
@@ -986,6 +1211,23 @@ def main() -> int:
             "geometry_force_projection": bool(args.geometry_force_projection),
             "geometry_force_fixed_focal": bool(args.geometry_force_fixed_focal),
             "geometry_use_extract_interp": bool(args.geometry_use_extract_interp),
+            "stereopilot_model_path": args.stereopilot_model_path,
+            "stereopilot_base_model_path": args.stereopilot_base_model_path,
+            "stereopilot_repo_path": args.stereopilot_repo_path,
+            "stereopilot_cache_dir": args.stereopilot_cache_dir,
+            "stereopilot_prompt": args.stereopilot_prompt,
+            "stereopilot_use_sidecar_prompt": bool(args.stereopilot_use_sidecar_prompt),
+            "stereopilot_output_mode": args.stereopilot_output_mode,
+            "stereopilot_target_width": args.stereopilot_target_width,
+            "stereopilot_target_height": args.stereopilot_target_height,
+            "stereopilot_target_fps": args.stereopilot_target_fps,
+            "stereopilot_frame_count": args.stereopilot_frame_count,
+            "stereopilot_sampling_steps": args.stereopilot_sampling_steps,
+            "stereopilot_guide_scale": args.stereopilot_guide_scale,
+            "stereopilot_shift": args.stereopilot_shift,
+            "stereopilot_domain_label": args.stereopilot_domain_label,
+            "stereopilot_dtype": args.stereopilot_dtype,
+            "stereopilot_transformer_dtype": args.stereopilot_transformer_dtype,
         },
     }
     stage_gpu_samples: List[Dict[str, Any]] = []
@@ -1001,7 +1243,7 @@ def main() -> int:
     try:
         _validate_runtime_args(args)
         model_backend = str(args.model_backend or "depthcrafter").strip().lower()
-        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ"):
+        if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"):
             model_backend = "depthcrafter"
         if isinstance(status.get("params"), dict):
             status["params"]["model_backend"] = model_backend
@@ -1013,17 +1255,47 @@ def main() -> int:
                 logger=logger,
             )
 
-        size_multiple = 64 if model_backend.startswith("geometrycrafter") else 8
+        if model_backend == "stereopilot":
+            target_w = max(32, int(args.stereopilot_target_width))
+            target_h = max(32, int(args.stereopilot_target_height))
+            size_multiple = 1
+            if isinstance(status.get("params"), dict):
+                status["params"]["target_width"] = int(target_w)
+                status["params"]["target_height"] = int(target_h)
+        else:
+            size_multiple = 64 if model_backend.startswith("geometrycrafter") else 8
+            target_w = _coerce_multiple(int(args.target_width), "target width", size_multiple)
+            target_h = _coerce_multiple(int(args.target_height), "target height", size_multiple)
 
         if model_backend == "depthcrafter":
             from depthcrafter.depthcrafter_logic import DepthCrafterDemo as SelectedDemo
-        else:
+        elif model_backend.startswith("geometrycrafter"):
             geometry_repo = _ensure_geometry_repo_available(args.geometry_repo_path, logger)
             if not str(args.geometry_repo_path or "").strip():
                 args.geometry_repo_path = str(geometry_repo)
                 if isinstance(status.get("params"), dict):
                     status["params"]["geometry_repo_path"] = str(geometry_repo)
             from depthcrafter.geometrycrafter_logic import GeometryCrafterDemo as SelectedDemo
+        else:
+            stereopilot_repo = _ensure_stereopilot_repo_available(args.stereopilot_repo_path, logger)
+            transformer_file, base_model_dir = _ensure_stereopilot_assets_available(
+                repo_path=stereopilot_repo,
+                model_path=args.stereopilot_model_path,
+                base_model_path=args.stereopilot_base_model_path,
+                cache_dir=args.stereopilot_cache_dir,
+                local_files_only=bool(args.local_files_only),
+                logger=logger,
+            )
+            if not str(args.stereopilot_repo_path or "").strip():
+                args.stereopilot_repo_path = str(stereopilot_repo)
+                if isinstance(status.get("params"), dict):
+                    status["params"]["stereopilot_repo_path"] = str(stereopilot_repo)
+            if isinstance(status.get("params"), dict):
+                status["params"]["stereopilot_model_path"] = str(transformer_file)
+                status["params"]["stereopilot_base_model_path"] = str(base_model_dir)
+            args.stereopilot_model_path = str(transformer_file)
+            args.stereopilot_base_model_path = str(base_model_dir)
+            from depthcrafter.stereopilot_logic import StereoPilotDemo as SelectedDemo
         import torch as torch_module
 
         if torch_module.cuda.is_available():
@@ -1082,10 +1354,7 @@ def main() -> int:
 
         _record_stage_event("runtime_imports_ready")
 
-        target_w = _coerce_multiple(int(args.target_width), "target width", size_multiple)
-        target_h = _coerce_multiple(int(args.target_height), "target height", size_multiple)
-
-        if target_w != int(args.target_width) or target_h != int(args.target_height):
+        if size_multiple > 1 and (target_w != int(args.target_width) or target_h != int(args.target_height)):
             logger.warning(
                 "Adjusted target resolution from %sx%s to %sx%s to satisfy /%s model constraints.",
                 args.target_width,
@@ -1114,7 +1383,7 @@ def main() -> int:
                 local_files_only=bool(args.local_files_only),
                 disable_xformers=bool(args.disable_xformers),
             )
-        else:
+        elif model_backend.startswith("geometrycrafter"):
             demo = SelectedDemo(
                 model_backend=model_backend,
                 geometry_model_path=args.geometry_model_path,
@@ -1130,6 +1399,27 @@ def main() -> int:
                 use_cudnn_benchmark=bool(args.use_cudnn_benchmark),
                 local_files_only=bool(args.local_files_only),
                 disable_xformers=bool(args.disable_xformers),
+            )
+        else:
+            demo = SelectedDemo(
+                model_backend=model_backend,
+                stereopilot_model_path=args.stereopilot_model_path,
+                stereopilot_base_model_path=args.stereopilot_base_model_path,
+                stereopilot_repo_path=args.stereopilot_repo_path,
+                stereopilot_cache_dir=args.stereopilot_cache_dir,
+                stereopilot_prompt_default=args.stereopilot_prompt,
+                stereopilot_use_sidecar_prompt=bool(args.stereopilot_use_sidecar_prompt),
+                stereopilot_output_mode=args.stereopilot_output_mode,
+                stereopilot_target_width=max(32, int(args.stereopilot_target_width)),
+                stereopilot_target_height=max(32, int(args.stereopilot_target_height)),
+                stereopilot_target_fps=max(1.0, float(args.stereopilot_target_fps)),
+                stereopilot_frame_count=max(1, int(args.stereopilot_frame_count)),
+                stereopilot_sampling_steps=max(1, int(args.stereopilot_sampling_steps)),
+                stereopilot_guide_scale=float(args.stereopilot_guide_scale),
+                stereopilot_shift=float(args.stereopilot_shift),
+                stereopilot_domain_label=1 if int(args.stereopilot_domain_label) != 0 else 0,
+                stereopilot_dtype=args.stereopilot_dtype,
+                stereopilot_transformer_dtype=args.stereopilot_transformer_dtype,
             )
         _record_stage_event("model_init_end")
 
