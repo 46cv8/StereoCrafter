@@ -52,6 +52,23 @@ def require_tool(name: str) -> None:
         raise ReleaseError(f"Required tool not found in PATH: {name}")
 
 
+def detect_local_git_branch(repo_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception:
+        return ""
+    branch = (result.stdout or "").strip()
+    if not branch or branch == "HEAD":
+        return ""
+    return branch
+
+
 def validate_image_ref(image: str) -> None:
     if "/" not in image or ":" not in image:
         raise ReleaseError(
@@ -163,7 +180,11 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Build/push image and prepare Vast create command.")
     p.add_argument("--image", required=True, help="Registry image ref (registry/repo:tag).")
     p.add_argument("--git-repo-url", required=True, help="GitHub repo URL to clone in image build.")
-    p.add_argument("--git-branch", default="004_depthcrafter_on_cloud")
+    p.add_argument(
+        "--git-branch",
+        default="",
+        help="Branch to build into image. Default: current local branch.",
+    )
     p.add_argument(
         "--git-commit",
         default="",
@@ -249,6 +270,19 @@ def main() -> int:
         raise ReleaseError(f"Dockerfile not found: {dockerfile}")
     if not context.exists():
         raise ReleaseError(f"Build context not found: {context}")
+
+    args.git_branch = str(args.git_branch or "").strip()
+    if not args.git_branch:
+        detected_branch = detect_local_git_branch(context)
+        if not detected_branch:
+            detected_branch = detect_local_git_branch(SCRIPT_DIR.parent)
+        if not detected_branch:
+            raise ReleaseError(
+                "Could not auto-detect local git branch. "
+                "Pass --git-branch explicitly."
+            )
+        args.git_branch = detected_branch
+    log(f"Using git branch for image build: {args.git_branch}")
 
     env_payload = load_env_payload(env_file, args.no_env_file)
 

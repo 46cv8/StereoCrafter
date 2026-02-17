@@ -271,7 +271,7 @@ class DepthCrafterGUI:
         # 0 / -1 => inherit from main dialog values.
         self.cloud_window_size_override_var = tk.IntVar(value=0)
         self.cloud_overlap_override_var = tk.IntVar(value=-1)
-        self.cloud_image_var = tk.StringVar(value="ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud")
+        self.cloud_image_var = tk.StringVar(value="ghcr.io/46cv8/stereocrafter-cloud:latest")
         self.cloud_disk_gb_var = tk.IntVar(value=40)
         self.cloud_reuse_existing_instance_var = tk.BooleanVar(value=True)
         self.cloud_last_instance_id_var = tk.IntVar(value=0)
@@ -5876,7 +5876,27 @@ class DepthCrafterGUI:
         if not bool(self.cloud_use_private_registry_login_var.get()):
             cmd.append("--skip-image-login")
 
+        git_sync_branch = self._detect_local_git_branch(repo_root)
+        if git_sync_branch:
+            cmd.extend(["--git-sync-branch", git_sync_branch])
+
         return cmd
+
+    def _detect_local_git_branch(self, repo_root: str) -> str:
+        try:
+            probe = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            return ""
+        branch = (probe.stdout or "").strip()
+        if not branch or branch == "HEAD":
+            return ""
+        return branch
 
     def _launch_cloud_worker_for_gui_run(
         self,
@@ -5948,6 +5968,7 @@ class DepthCrafterGUI:
             "window_size": int(generated_cfg.get("window_size", self._safe_int_from_tk_var(self.window_size, 75))),
             "overlap": int(generated_cfg.get("overlap", self._safe_int_from_tk_var(self.overlap, 25))),
             "cpu_offload": str(generated_cfg.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get()),
+            "git_sync_branch": str(cloud_remote.get("git_sync_branch", self._detect_local_git_branch(repo_root)) or ""),
         }
         self._cache_cloud_instance_connection(connection, self.cloud_profile_var.get().strip())
         return connection
@@ -5998,6 +6019,10 @@ class DepthCrafterGUI:
         cloud_window_size = int(connection_info.get("window_size", int(cloud_settings["window_size"])))
         cloud_overlap = int(connection_info.get("overlap", int(cloud_settings["overlap"])))
         cloud_cpu_offload = str(connection_info.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get())
+        cloud_git_sync_branch = str(
+            connection_info.get("git_sync_branch", self._detect_local_git_branch(repo_root))
+            or self._detect_local_git_branch(repo_root)
+        )
         original_basename = source_spec["basename"]
 
         if (
@@ -6074,6 +6099,9 @@ class DepthCrafterGUI:
         if identity_file:
             cmd.extend(["--identity", os.path.expanduser(identity_file)])
 
+        if cloud_git_sync_branch:
+            cmd.extend(["--git-sync-branch", cloud_git_sync_branch])
+
         if bool(self.disable_xformers_var.get()):
             cmd.append("--disable-xformers")
         if bool(self.use_cudnn_benchmark.get()):
@@ -6116,6 +6144,10 @@ class DepthCrafterGUI:
         cloud_window_size = int(connection_info.get("window_size", int(cloud_settings["window_size"])))
         cloud_overlap = int(connection_info.get("overlap", int(cloud_settings["overlap"])))
         cloud_cpu_offload = str(connection_info.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get())
+        cloud_git_sync_branch = str(
+            connection_info.get("git_sync_branch", self._detect_local_git_branch(repo_root))
+            or self._detect_local_git_branch(repo_root)
+        )
         if (
             bool(cloud_settings.get("use_source_resolution", False))
             and int(cloud_settings.get("target_width_override", 0)) <= 0
@@ -6189,6 +6221,9 @@ class DepthCrafterGUI:
         identity_file = self.cloud_identity_file_var.get().strip()
         if identity_file:
             cmd.extend(["--identity", os.path.expanduser(identity_file)])
+
+        if cloud_git_sync_branch:
+            cmd.extend(["--git-sync-branch", cloud_git_sync_branch])
 
         if bool(self.disable_xformers_var.get()):
             cmd.append("--disable-xformers")

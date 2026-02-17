@@ -40,13 +40,14 @@ Use this from repo root to rebuild and push with latest branch contents:
 
 ```bash
 python cloud/release_vast_image.py \
-  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --image ghcr.io/46cv8/stereocrafter-cloud:latest \
   --git-repo-url https://github.com/46cv8/StereoCrafter.git \
-  --git-branch 004_depthcrafter_on_cloud \
   --env-file cloud/hf.env \
   --ghcr-env-file cloud/ghcr.env \
   --refresh-repo
 ```
+
+`release_vast_image.py` now auto-detects your current local git branch when `--git-branch` is omitted.
 
 Note: `--docker-pull-base` is intentionally omitted for speed. Add it only when you explicitly want to refresh the CUDA base image (it can invalidate more cache layers and trigger long rebuilds).
 
@@ -54,9 +55,8 @@ If you want to pin a specific commit:
 
 ```bash
 python cloud/release_vast_image.py \
-  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --image ghcr.io/46cv8/stereocrafter-cloud:latest \
   --git-repo-url https://github.com/46cv8/StereoCrafter.git \
-  --git-branch 004_depthcrafter_on_cloud \
   --git-commit <commit_sha> \
   --env-file cloud/hf.env \
   --ghcr-env-file cloud/ghcr.env
@@ -96,7 +96,7 @@ Launch a 5090 worker using your current config as base:
 ```bash
 python cloud/vast_worker_launch.py \
   --profile 5090_32gb \
-  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --image ghcr.io/46cv8/stereocrafter-cloud:latest \
   --base-config config_depthcrafter.json \
   --remote-root /opt/StereoCrafter \
   --remote-venv /opt/venv
@@ -107,7 +107,7 @@ Launch a 96GB RTX PRO 6000 worker:
 ```bash
 python cloud/vast_worker_launch.py \
   --profile rtx_pro_6000_96gb \
-  --image ghcr.io/46cv8/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --image ghcr.io/46cv8/stereocrafter-cloud:latest \
   --base-config config_depthcrafter.json \
   --remote-root /opt/StereoCrafter \
   --remote-venv /opt/venv
@@ -124,6 +124,7 @@ Notes:
 - Add `--run-now` to skip GO prompt.
 - Add `--output-config /path/custom.json` to control generated config path.
 - Add `--blacklist-file /path/to/cloud_blacklist.json` to override default blacklist location.
+- Add `--git-sync-branch <branch>` to force which branch remote sync checks out before jobs. If omitted, your current local branch is auto-detected.
 
 ## 1) Bootstrap a fresh instance
 

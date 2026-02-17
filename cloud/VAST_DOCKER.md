@@ -37,7 +37,7 @@ It does the following:
 3. Creates virtual environment and installs pip deps from `requirements.linux.txt`.
 4. Validates Python is `3.12.x` at build time.
 5. Uses Hugging Face runtime auth (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`) for gated model pulls.
-6. Final step clones repo branch `004_depthcrafter_on_cloud` from your GitHub URL.
+6. Final step clones your selected repo branch from your GitHub URL.
 7. Clone stage now forces a fast-forward `git pull`, supports optional commit pin, and records baked commit at `/opt/stereocrafter_git_commit.txt`.
 
 ## Hugging Face credentials (gitignored file)
@@ -85,13 +85,13 @@ From repo root:
 
 ```bash
 # Replace with your registry path.
-export IMAGE=ghcr.io/<your_user>/stereocrafter-depthcrafter:004_depthcrafter_on_cloud
+export IMAGE=ghcr.io/<your_user>/stereocrafter-cloud:latest
 
 # Build. Replace GIT_REPO_URL with your repo URL.
 docker build \
   -f cloud/Dockerfile.vastai \
   --build-arg GIT_REPO_URL=https://github.com/<your_user>/StereoCrafter.git \
-  --build-arg GIT_BRANCH=004_depthcrafter_on_cloud \
+  --build-arg GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
   --build-arg GIT_CACHE_BUST="$(date +%s)" \
   --pull \
   -t "$IMAGE" \
@@ -107,9 +107,8 @@ Use:
 
 ```bash
 python cloud/release_vast_image.py \
-  --image ghcr.io/<your_user>/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --image ghcr.io/<your_user>/stereocrafter-cloud:latest \
   --git-repo-url https://github.com/<your_user>/StereoCrafter.git \
-  --git-branch 004_depthcrafter_on_cloud \
   --env-file cloud/hf.env \
   --ghcr-env-file cloud/ghcr.env \
   --refresh-repo
@@ -141,7 +140,7 @@ Use `--docker-pull-base` only when you intentionally want to refresh the base im
 HF_ENV_ARGS="$(python cloud/envfile_to_vast_env.py --env-file cloud/hf.env)"
 
 vastai create instance <OFFER_ID> \
-  --image ghcr.io/<your_user>/stereocrafter-depthcrafter:004_depthcrafter_on_cloud \
+  --image ghcr.io/<your_user>/stereocrafter-cloud:latest \
   --env "$HF_ENV_ARGS" \
   --disk 120 \
   --ssh --direct \

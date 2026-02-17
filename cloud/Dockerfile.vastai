@@ -68,9 +68,9 @@ SH
 ENTRYPOINT ["/usr/local/bin/stereocrafter-onstart.sh"]
 CMD ["bash"]
 
-# Last step requested: clone your cloud branch into the runtime app path.
+# Last step: clone your repository branch into the runtime app path.
 ARG GIT_REPO_URL=https://github.com/REPLACE_WITH_YOUR_USER/StereoCrafter.git
-ARG GIT_BRANCH=004_depthcrafter_on_cloud
+ARG GIT_BRANCH=main
 ARG GIT_COMMIT=
 ARG GIT_CACHE_BUST=0
 RUN set -eux; \

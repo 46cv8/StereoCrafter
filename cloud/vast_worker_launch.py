@@ -90,6 +90,23 @@ def require_tool(name: str) -> None:
         raise VastWorkerLaunchError(f"Required tool not found in PATH: {name}")
 
 
+def detect_local_git_branch(repo_root: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except Exception:
+        return ""
+    branch = (result.stdout or "").strip()
+    if not branch or branch == "HEAD":
+        return ""
+    return branch
+
+
 def parse_json_like(raw_text: str) -> Any:
     return cloud_core.parse_json_like(raw_text)
 
@@ -489,6 +506,7 @@ def update_config_for_profile(
         "remote_root": args.remote_root,
         "remote_venv": args.remote_venv,
         "remote_image": args.image,
+        "git_sync_branch": str(getattr(args, "git_sync_branch", "") or ""),
         "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "generated_by": "cloud/vast_worker_launch.py",
     }
@@ -541,6 +559,14 @@ def build_cloudctl_cmd(
 
     if args.identity:
         cmd += ["--identity", args.identity]
+
+    git_sync_branch = str(getattr(args, "git_sync_branch", "") or "").strip()
+    if not git_sync_branch:
+        cloud_remote = cfg.get("cloud_remote", {})
+        if isinstance(cloud_remote, dict):
+            git_sync_branch = str(cloud_remote.get("git_sync_branch", "") or "").strip()
+    if git_sync_branch:
+        cmd += ["--git-sync-branch", git_sync_branch]
 
     target_width = as_int(cfg.get("target_width"), 1920)
     target_height = as_int(cfg.get("target_height"), 1040)
@@ -891,6 +917,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--remote-root", default="/opt/StereoCrafter")
     p.add_argument("--remote-venv", default="/opt/venv")
     p.add_argument("--identity", default="", help="SSH private key path for cloudctl calls.")
+    p.add_argument(
+        "--git-sync-branch",
+        default="",
+        help="Branch to force during remote git sync before running jobs. Default: current local branch.",
+    )
     p.add_argument("--input-override", default="", help="Override config input_dir_or_file_var.")
     p.add_argument("--download-dir-override", default="", help="Override download/output dir for cloudctl.")
     p.add_argument("--batch-patterns", default="*.mkv,*.mp4,*.mov,*.avi")
@@ -960,6 +991,15 @@ def main() -> int:
     identity_path = str(Path(args.identity).expanduser().resolve()) if str(args.identity or "").strip() else ""
     if identity_path and not Path(identity_path).is_file():
         raise VastWorkerLaunchError(f"SSH identity file not found: {identity_path}")
+
+    requested_sync_branch = str(getattr(args, "git_sync_branch", "") or "").strip()
+    if not requested_sync_branch:
+        requested_sync_branch = detect_local_git_branch(REPO_ROOT)
+    args.git_sync_branch = requested_sync_branch
+    if requested_sync_branch:
+        log(f"Remote git sync branch: {requested_sync_branch}")
+    else:
+        log("Remote git sync branch: auto-detect failed; cloudctl will use remote current branch.")
 
     api_key = resolve_api_key(args)
     if not api_key:

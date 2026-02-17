@@ -419,6 +419,11 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
         default=True,
         help="Before inference, attempt fast-forward sync of remote repo from origin/<current-branch>.",
     )
+    parser.add_argument(
+        "--git-sync-branch",
+        default="",
+        help="Optional branch to force on remote before run (for example your current local branch).",
+    )
     parser.add_argument("--unet-path", default="tencent/DepthCrafter")
     parser.add_argument("--pretrain-path", default="stabilityai/stable-video-diffusion-img2vid-xt")
 
@@ -429,25 +434,57 @@ def maybe_sync_remote_repo(cfg: SSHConfig, args: argparse.Namespace) -> None:
         return
 
     remote_root = str(args.remote_root).rstrip("/")
-    sync_script = (
-        f"cd {shlex.quote(remote_root)}"
-        " && if ! command -v git >/dev/null 2>&1; then echo 'skip: git not found'; exit 0; fi"
-        " && if [ ! -d .git ]; then echo 'skip: no .git folder'; exit 0; fi"
-        " && branch=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)\""
-        " && if [ -z \"$branch\" ] || [ \"$branch\" = \"HEAD\" ]; then echo 'skip: detached/unknown branch'; exit 0; fi"
-        " && if ! git remote get-url origin >/dev/null 2>&1; then echo 'skip: no origin remote'; exit 0; fi"
-        " && if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then "
-        "echo 'skip: dirty worktree'; exit 0; fi"
-        " && echo \"sync: checking origin/$branch\""
-        " && if ! git fetch origin \"$branch\" --prune; then echo 'skip: fetch failed'; exit 0; fi"
-        " && local_sha=\"$(git rev-parse HEAD 2>/dev/null || true)\""
-        " && remote_sha=\"$(git rev-parse \"origin/$branch\" 2>/dev/null || true)\""
-        " && if [ -z \"$local_sha\" ] || [ -z \"$remote_sha\" ]; then echo 'skip: could not resolve commit shas'; exit 0; fi"
-        " && if [ \"$local_sha\" = \"$remote_sha\" ]; then echo \"up-to-date: $local_sha\"; exit 0; fi"
-        " && if git merge-base --is-ancestor \"$local_sha\" \"$remote_sha\"; then "
-        "git reset --hard \"$remote_sha\" && echo \"updated: $local_sha -> $remote_sha\"; exit 0; fi"
-        " && echo 'skip: local branch is ahead or diverged'; exit 0"
-    )
+    requested_branch = str(getattr(args, "git_sync_branch", "") or "").strip()
+    if requested_branch and not re.fullmatch(r"[A-Za-z0-9._/-]+", requested_branch):
+        raise CloudCtlError(
+            f"Invalid --git-sync-branch '{requested_branch}'. "
+            "Allowed characters: letters, digits, ., _, -, /"
+        )
+
+    if requested_branch:
+        sync_script = (
+            f"cd {shlex.quote(remote_root)}"
+            " && if ! command -v git >/dev/null 2>&1; then echo 'skip: git not found'; exit 0; fi"
+            " && if [ ! -d .git ]; then echo 'skip: no .git folder'; exit 0; fi"
+            " && if ! git remote get-url origin >/dev/null 2>&1; then echo 'skip: no origin remote'; exit 0; fi"
+            " && if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then "
+            "echo 'skip: dirty worktree'; exit 0; fi"
+            f" && branch={shlex.quote(requested_branch)}"
+            " && echo \"sync: target origin/$branch\""
+            " && if ! git fetch origin \"$branch\" --prune; then echo \"skip: fetch failed for $branch\"; exit 0; fi"
+            " && remote_sha=\"$(git rev-parse \"origin/$branch\" 2>/dev/null || true)\""
+            " && if [ -z \"$remote_sha\" ]; then echo \"skip: origin/$branch not found\"; exit 0; fi"
+            " && current_branch=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)\""
+            " && local_sha_before=\"$(git rev-parse HEAD 2>/dev/null || true)\""
+            " && if [ \"$current_branch\" != \"$branch\" ]; then "
+            "if git show-ref --verify --quiet \"refs/heads/$branch\"; then git checkout \"$branch\"; "
+            "else git checkout -B \"$branch\" \"origin/$branch\"; fi; fi"
+            " && git reset --hard \"$remote_sha\""
+            " && local_sha_after=\"$(git rev-parse HEAD 2>/dev/null || true)\""
+            " && if [ \"$local_sha_before\" = \"$local_sha_after\" ]; then "
+            "echo \"up-to-date: $local_sha_after\"; "
+            "else echo \"updated: $local_sha_before -> $local_sha_after\"; fi"
+        )
+    else:
+        sync_script = (
+            f"cd {shlex.quote(remote_root)}"
+            " && if ! command -v git >/dev/null 2>&1; then echo 'skip: git not found'; exit 0; fi"
+            " && if [ ! -d .git ]; then echo 'skip: no .git folder'; exit 0; fi"
+            " && branch=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)\""
+            " && if [ -z \"$branch\" ] || [ \"$branch\" = \"HEAD\" ]; then echo 'skip: detached/unknown branch'; exit 0; fi"
+            " && if ! git remote get-url origin >/dev/null 2>&1; then echo 'skip: no origin remote'; exit 0; fi"
+            " && if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then "
+            "echo 'skip: dirty worktree'; exit 0; fi"
+            " && echo \"sync: checking origin/$branch\""
+            " && if ! git fetch origin \"$branch\" --prune; then echo 'skip: fetch failed'; exit 0; fi"
+            " && local_sha=\"$(git rev-parse HEAD 2>/dev/null || true)\""
+            " && remote_sha=\"$(git rev-parse \"origin/$branch\" 2>/dev/null || true)\""
+            " && if [ -z \"$local_sha\" ] || [ -z \"$remote_sha\" ]; then echo 'skip: could not resolve commit shas'; exit 0; fi"
+            " && if [ \"$local_sha\" = \"$remote_sha\" ]; then echo \"up-to-date: $local_sha\"; exit 0; fi"
+            " && if git merge-base --is-ancestor \"$local_sha\" \"$remote_sha\"; then "
+            "git reset --hard \"$remote_sha\" && echo \"updated: $local_sha -> $remote_sha\"; exit 0; fi"
+            " && echo 'skip: local branch is ahead or diverged'; exit 0"
+        )
 
     log("Remote git sync: checking for updates...")
     sync_result = ssh_run(
