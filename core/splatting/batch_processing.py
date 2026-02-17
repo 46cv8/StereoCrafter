@@ -82,6 +82,7 @@ class ProcessingSettings:
         output_crf: Quality CRF value (legacy)
         output_crf_full: CRF for full resolution
         output_crf_low: CRF for low resolution
+        output_codec_mode: Output encode mode ("Auto", "Force H265 10-bit", "Force H264 8-bit")
         depth_gamma: Gamma correction for depth
         depth_dilate_size_x: Horizontal dilation size
         depth_dilate_size_y: Vertical dilation size
@@ -115,6 +116,7 @@ class ProcessingSettings:
     output_crf: int = 23
     output_crf_full: int = 23
     output_crf_low: int = 23
+    output_codec_mode: str = "Auto"
     depth_gamma: float = 1.0
     depth_dilate_size_x: float = 0.0
     depth_dilate_size_y: float = 0.0
@@ -431,6 +433,7 @@ class BatchProcessor:
                 global_depth_max=vid_settings.get("global_max", 1.0),
                 depth_stream_info=readers["depth_info"],
                 user_output_crf=settings.output_crf_low if task.is_low_res else settings.output_crf_full,
+                output_codec_mode=settings.output_codec_mode,
                 is_low_res_task=task.is_low_res,
                 depth_gamma=vid_settings["depth_gamma"],
                 depth_dilate_size_x=vid_settings["depth_dilate_size_x"],
@@ -594,6 +597,13 @@ class BatchProcessor:
 
         if settings.depth_blur_left < 0 or settings.depth_blur_left > 20:
             return False, "Blur Left must be between 0 and 20."
+
+        valid_codec_modes = {"Auto", "Force H265 10-bit", "Force H264 8-bit"}
+        if settings.output_codec_mode not in valid_codec_modes:
+            return (
+                False,
+                f"Output codec mode must be one of: {', '.join(sorted(valid_codec_modes))}.",
+            )
 
         return True, ""
 

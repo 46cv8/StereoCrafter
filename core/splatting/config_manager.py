@@ -33,6 +33,7 @@ SPLATTER_DEFAULT_CONFIG = {
     "output_crf": "23",
     "output_crf_full": "23",
     "output_crf_low": "23",
+    "output_codec_mode": "Auto",
     "color_tags_mode": "Auto",
     "dark_mode_enabled": False,
     "skip_lowres_preproc": False,

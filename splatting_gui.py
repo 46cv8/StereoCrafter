@@ -258,6 +258,7 @@ class SplatterGUI(ThemedTk):
         self.output_crf_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
         self.output_crf_full_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
         self.output_crf_low_var = tk.StringVar(value=defaults["CRF_OUTPUT"])
+        self.output_codec_mode_var = tk.StringVar(value="Auto")
         self.color_tags_mode_var = tk.StringVar(value="Auto")
         self.skip_lowres_preproc_var = tk.BooleanVar(value=False)
         self.track_dp_total_true_on_render_var = tk.BooleanVar(value=False)
@@ -1884,9 +1885,27 @@ class SplatterGUI(ThemedTk):
         self._create_hover_tooltip(self.lbl_color_tags_mode, "color_tags_mode")
         self._create_hover_tooltip(self.combo_color_tags_mode, "color_tags_mode")
 
-        # Row 2, Col 1: Border Mode Pulldown + Rescan Button
+        # Row 2, Col 1: Output codec mode
+        self.codec_mode_frame = ttk.Frame(self.output_settings_frame)
+        self.codec_mode_frame.grid(row=2, column=1, sticky="w", padx=5, pady=0)
+        self.lbl_output_codec_mode = ttk.Label(self.codec_mode_frame, text="Output Codec:")
+        self.lbl_output_codec_mode.pack(side="left", padx=(0, 3))
+        self.combo_output_codec_mode = ttk.Combobox(
+            self.codec_mode_frame,
+            textvariable=self.output_codec_mode_var,
+            values=["Auto", "Force H265 10-bit", "Force H264 8-bit"],
+            state="readonly",
+            width=18,
+        )
+        self.combo_output_codec_mode.pack(side="left")
+        self._create_hover_tooltip(self.lbl_output_codec_mode, "output_codec_mode")
+        self._create_hover_tooltip(self.combo_output_codec_mode, "output_codec_mode")
+
+        # Row 3, Col 0-1: Border Mode Pulldown + Rescan Button
         self.border_mode_frame = ttk.Frame(self.output_settings_frame)
-        self.border_mode_frame.grid(row=2, column=1, sticky="w", padx=5, pady=0)
+        self.border_mode_frame.grid(
+            row=3, column=0, columnspan=2, sticky="w", padx=5, pady=0
+        )
         self.lbl_border_mode = ttk.Label(self.border_mode_frame, text="Border:")
         self.lbl_border_mode.pack(side="left", padx=(0, 3))
         self.combo_border_mode = ttk.Combobox(
@@ -1915,7 +1934,12 @@ class SplatterGUI(ThemedTk):
 
         # Track these for disabling during processing
         self.widgets_to_disable.extend(
-            [self.combo_color_tags_mode, self.combo_border_mode, self.btn_border_rescan]
+            [
+                self.combo_color_tags_mode,
+                self.combo_output_codec_mode,
+                self.combo_border_mode,
+                self.btn_border_rescan,
+            ]
         )
 
         current_row = 0  # Reset for next frame
@@ -2939,6 +2963,9 @@ class SplatterGUI(ThemedTk):
             # NEW fields
             multi_map=self.multi_map_var.get(),
             selected_depth_map=self.selected_depth_map_var.get().strip(),
+            output_codec_mode=self.output_codec_mode_var.get()
+            if hasattr(self, "output_codec_mode_var")
+            else "Auto",
             color_tags_mode=self.color_tags_mode_var.get()
             if hasattr(self, "color_tags_mode_var")
             else "Auto",

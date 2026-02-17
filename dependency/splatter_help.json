@@ -22,6 +22,7 @@
     "track_dp_total_true_on_render": "When enabled, rendering tracks the true max disparity across all frames and saves it to sidecar + auto_pass_export.csv. Turn off to test baseline render speed.",
     "process_length": "Set how many frames to process before moving on to the next video, used for testing. Set -1 to process all frames.",
     "output_crf": "Constant Rate Factor (CRF) for H.264/H.265 video encoding. Lower values mean higher quality and larger file sizes. A good starting point is 18 for high quality, 23 for good quality. Range is typically 0-51.",
+    "output_codec_mode": "Controls output codec/pixel format selection for splatted MP4s. Auto follows source metadata. Force H265 10-bit always encodes HEVC Main10 (yuv420p10le) even if source is H.264. Force H264 8-bit always encodes H.264 8-bit.",
     "color_tags_mode": "Writes color metadata tags into output file headers (primaries/transfer/matrix/range). Auto uses detected tags when available; otherwise falls back to BT.709. This changes metadata only. Increases compatability.",
     "auto_convergence_toggle": "EXPERIMENTAL: Simple auto convergence derived from 75% center region and averaged or peak throughout the clip.",
     "depth_dilate_size_x": "Horizontal Dilate for the Depthhmask. Bilinear blending for decimals. 0 to disable. Below 0 applies erosion.",

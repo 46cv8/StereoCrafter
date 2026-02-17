@@ -1731,6 +1731,7 @@ def start_ffmpeg_pipe_process(
     video_stream_info: Optional[dict],
     output_format_str: str = "",  # Make argument optional with a default value
     user_output_crf: Optional[int] = None,
+    output_codec_mode: str = "Auto",
     pad_to_16_9: bool = False,
     debug_label: Optional[str] = None,
 ) -> Optional[subprocess.Popen]:
@@ -1839,7 +1840,37 @@ def start_ffmpeg_pipe_process(
         ):
             is_original_10bit_or_higher = True
 
-    if is_hdr_source:
+    codec_mode_raw = str(output_codec_mode or "Auto").strip().lower()
+    force_h265_10bit = codec_mode_raw in {
+        "force h265 10-bit",
+        "force h265 10 bit",
+        "force_h265_10bit",
+        "h265_10bit",
+        "force hevc 10-bit",
+        "force hevc 10 bit",
+        "force_hevc_10bit",
+    }
+    force_h264_8bit = codec_mode_raw in {
+        "force h264 8-bit",
+        "force h264 8 bit",
+        "force_h264_8bit",
+        "h264_8bit",
+    }
+    if force_h265_10bit:
+        output_codec = "hevc_nvenc" if CUDA_AVAILABLE else "libx265"
+        output_pix_fmt = "yuv420p10le"
+        output_profile = "main10"
+        if user_output_crf is None:
+            default_cpu_crf = "24"
+        resolved_codec_mode = "force_h265_10bit"
+    elif force_h264_8bit:
+        output_codec = "h264_nvenc" if CUDA_AVAILABLE else "libx264"
+        output_pix_fmt = "yuv420p"
+        output_profile = "main"
+        if user_output_crf is None:
+            default_cpu_crf = "18"
+        resolved_codec_mode = "force_h264_8bit"
+    elif is_hdr_source:
         output_codec = "libx265"
         if CUDA_AVAILABLE:
             output_codec = "hevc_nvenc"
@@ -1855,6 +1886,7 @@ def start_ffmpeg_pipe_process(
             x265_params.append(
                 f"max-cll={video_stream_info['max_content_light_level']}"
             )
+        resolved_codec_mode = "auto_hdr_hevc10"
     elif original_codec_name == "hevc" and is_original_10bit_or_higher:
         output_codec = "libx265"
         if CUDA_AVAILABLE:
@@ -1863,6 +1895,7 @@ def start_ffmpeg_pipe_process(
         if user_output_crf is None:
             default_cpu_crf = "24"
         output_profile = "main10"
+        resolved_codec_mode = "auto_source_hevc10"
     else:
         output_codec = "libx264"
         if CUDA_AVAILABLE:
@@ -1871,6 +1904,7 @@ def start_ffmpeg_pipe_process(
         if user_output_crf is None:
             default_cpu_crf = "18"
         output_profile = "main"
+        resolved_codec_mode = "auto_source_h264_8bit"
 
     ffmpeg_cmd.extend(["-c:v", output_codec])
     if "nvenc" in output_codec:
@@ -1925,6 +1959,7 @@ def start_ffmpeg_pipe_process(
     quality_value = default_nvenc_cq if "nvenc" in output_codec else default_cpu_crf
 
     sc_encode_flags = {
+        "output_codec_mode": resolved_codec_mode,
         "enc_codec": output_codec,
         "enc_pix_fmt": output_pix_fmt,
         "enc_profile": output_profile,
@@ -1944,7 +1979,7 @@ def start_ffmpeg_pipe_process(
     if debug_label:
         logger.debug(
             f"[COLOR_META][{debug_label}] src(pix_fmt={src_pix_fmt}, range={src_range}, primaries={src_prim}, trc={src_trc}, matrix={src_matrix}) "
-            f"-> enc(codec={output_codec}, pix_fmt={output_pix_fmt}, profile={output_profile}, primaries={color_primaries}, trc={transfer_characteristics}, matrix={color_space}, {quality_mode}={quality_value})"
+            f"-> enc(mode={resolved_codec_mode}, codec={output_codec}, pix_fmt={output_pix_fmt}, profile={output_profile}, primaries={color_primaries}, trc={transfer_characteristics}, matrix={color_space}, {quality_mode}={quality_value})"
         )
     # --- END DEBUG ---
 

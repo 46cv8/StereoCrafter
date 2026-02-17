@@ -67,6 +67,7 @@ class RenderProcessor:
         global_depth_max: float,
         depth_stream_info: Optional[dict],
         user_output_crf: Optional[int] = None,
+        output_codec_mode: str = "Auto",
         is_low_res_task: bool = False,
         depth_gamma: float = 1.0,
         depth_dilate_size_x: float = 0.0,
@@ -102,6 +103,7 @@ class RenderProcessor:
             global_max_depth: Global max depth used for normalization
             depth_stream_info: Metadata for depth map
             user_output_crf: FFmpeg CRF value
+            output_codec_mode: Output encode mode ("Auto", "Force H265 10-bit", "Force H264 8-bit")
             is_low_res_task: Whether this is a low-res pass
             depth_gamma: Gamma correction for depth
             depth_dilate_size_x: X dilation for depth
@@ -144,6 +146,7 @@ class RenderProcessor:
                 fps=processed_fps,
                 video_stream_info=encode_stream_info,
                 user_output_crf=user_output_crf,
+                output_codec_mode=output_codec_mode,
                 output_format_str="splatted_grid",
                 debug_label=task_name,
             )
@@ -494,4 +497,3 @@ class RenderProcessor:
             top_row = np.concatenate([left, depth], axis=1)
             bot_row = np.concatenate([occlusion, right], axis=1)
             return np.concatenate([top_row, bot_row], axis=0)
-
