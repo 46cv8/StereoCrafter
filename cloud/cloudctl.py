@@ -1078,10 +1078,22 @@ def _wait_for_remote_queue_job_result(
     job_id: str,
     poll_sec: float,
 ) -> tuple[str, str]:
+    def _parse_probe_marker(text: str) -> str | None:
+        lines = [line.strip().upper() for line in (text or "").splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line in {"DONE", "FAILED", "WAIT"}:
+                return line
+        combined = "\n".join(lines)
+        for marker in ("DONE", "FAILED", "WAIT"):
+            if re.search(rf"\b{marker}\b", combined):
+                return marker
+        return None
+
     safe_job_id = sanitize_name(job_id)
     done_path = remote_join(queue_paths["done"], f"{safe_job_id}.json")
     failed_path = remote_join(queue_paths["failed"], f"{safe_job_id}.json")
     poll = max(0.25, float(poll_sec))
+    last_wait_log_ts = 0.0
     while True:
         probe = ssh_run(
             cfg,
@@ -1094,11 +1106,18 @@ def _wait_for_remote_queue_job_result(
             capture=True,
             log_command=False,
         )
-        text = (probe.stdout or "").strip()
-        if text == "DONE":
+        marker = _parse_probe_marker(probe.stdout or "")
+        if marker == "DONE":
             return "done", done_path
-        if text == "FAILED":
+        if marker == "FAILED":
             return "failed", failed_path
+        now = time.time()
+        if (now - last_wait_log_ts) >= 30.0:
+            log(
+                f"Queue wait: job '{safe_job_id}' still pending "
+                f"(queue='{queue_paths['name']}', poll={poll:.2f}s)"
+            )
+            last_wait_log_ts = now
         time.sleep(poll)
 
 
