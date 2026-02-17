@@ -1173,23 +1173,39 @@ def main() -> int:
     )
     print_offer_table(offers, args.show_top)
 
+    selected_offer_from_ranked_list = True
     if args.offer_id > 0:
         selected_offer = next((o for o in offers if as_int(o.get("id"), 0) == args.offer_id), None)
         if selected_offer is None:
-            raise VastWorkerLaunchError(f"--offer-id {args.offer_id} not found in the returned candidate list.")
+            # Offers are highly dynamic. A user-selected offer can legitimately fall out of
+            # the latest ranked window between GUI preflight and launch.
+            selected_offer_from_ranked_list = False
+            selected_offer = {
+                "id": int(args.offer_id),
+            }
+            log(
+                f"Selected --offer-id {int(args.offer_id)} is not in the latest ranked list "
+                f"(offer may have shifted outside --offer-limit or market changed). "
+                "Attempting direct create-instance with that offer id."
+            )
     else:
         selected_offer = offers[0]
 
     selected_offer_id = as_int(selected_offer.get("id"), 0)
-    selected_hourly = as_float(selected_offer.get("_hourly_cost"), 0.0)
-    selected_total = as_float(selected_offer.get("_total_cost_est"), 0.0)
-    selected_loc = str(selected_offer.get("geolocation", ""))
-    selected_gpu = str(selected_offer.get("gpu_name", ""))
+    if selected_offer_id <= 0:
+        raise VastWorkerLaunchError("Could not determine a valid offer id for instance creation.")
 
-    log(
-        f"Selected offer {selected_offer_id}: {selected_gpu} | {selected_loc} | "
-        f"${selected_hourly:.3f}/hr | est total ${selected_total:.3f}"
-    )
+    if selected_offer_from_ranked_list:
+        selected_hourly = as_float(selected_offer.get("_hourly_cost"), 0.0)
+        selected_total = as_float(selected_offer.get("_total_cost_est"), 0.0)
+        selected_loc = str(selected_offer.get("geolocation", ""))
+        selected_gpu = str(selected_offer.get("gpu_name", ""))
+        log(
+            f"Selected offer {selected_offer_id}: {selected_gpu} | {selected_loc} | "
+            f"${selected_hourly:.3f}/hr | est total ${selected_total:.3f}"
+        )
+    else:
+        log(f"Selected offer {selected_offer_id}: direct launch mode (details unavailable in current ranked window).")
 
     if args.dry_run:
         log("Dry run requested; stopping before instance creation.")
