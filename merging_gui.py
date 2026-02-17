@@ -36,6 +36,7 @@ from dependency.stereocrafter_util import (
     find_sidecar_file,
     read_clip_sidecar,
     apply_borders_to_frames,
+    sort_paths_by_clip_id,
 )
 from dependency.video_previewer import VideoPreviewer
 
@@ -1387,7 +1388,7 @@ class MergingGUI(ThemedTk):
             inpainted_videos = [single_video_path]
             single_mode = True
         else:
-            inpainted_videos = sorted(
+            inpainted_videos = sort_paths_by_clip_id(
                 glob.glob(os.path.join(settings["inpainted_folder"], "*.mp4"))
             )
             single_mode = False
@@ -2056,7 +2057,7 @@ class MergingGUI(ThemedTk):
             )
             return []
 
-        all_mp4s = sorted(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
+        all_mp4s = sort_paths_by_clip_id(glob.glob(os.path.join(inpainted_folder, "*.mp4")))
         valid_inpainted_videos = [
             f
             for f in all_mp4s

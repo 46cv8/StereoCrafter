@@ -15,6 +15,11 @@ import cv2
 import gc
 import time
 import re
+from dependency.clip_ordering import (
+    extract_clip_id,
+    clip_sort_key,
+    sort_paths_by_clip_id,
+)
 
 VERSION = "26-01-30.0"
 

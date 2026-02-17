@@ -31,6 +31,7 @@ from dependency.stereocrafter_util import (
     release_cuda_memory, set_util_logger_level,
     encode_frames_to_mp4, read_video_frames_decord
 )
+from dependency.clip_ordering import sort_paths_by_clip_id
 from pipelines.stereo_video_inpainting import (
     StableVideoDiffusionInpaintingPipeline,
     tensor2vid,
@@ -2853,7 +2854,7 @@ class InpaintingGUI(ThemedTk):
                 dtype=torch.float16,
                 offload_type=offload_type
             )
-            input_videos = sorted(glob.glob(os.path.join(input_folder, "*.mp4")))
+            input_videos = sort_paths_by_clip_id(glob.glob(os.path.join(input_folder, "*.mp4")))
             if not input_videos:
                 self.after(0, lambda: messagebox.showinfo("Info", "No .mp4 files found in input folder"))
                 self.after(0, self.processing_done)

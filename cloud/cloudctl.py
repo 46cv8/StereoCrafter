@@ -20,12 +20,17 @@ import select
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
 
 DEFAULT_LOCAL_REPO = Path(__file__).resolve().parents[1]
+if str(DEFAULT_LOCAL_REPO) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_LOCAL_REPO))
+
+from dependency.clip_ordering import sort_paths_by_clip_id
 
 
 @dataclasses.dataclass
@@ -617,6 +622,7 @@ def _run_one_job(
     explicit_job_name: str = "",
     batch_index: int = 0,
     batch_total: int = 0,
+    skip_upload_if_present: bool = False,
 ) -> int:
     if not local_input.exists():
         raise CloudCtlError(f"Input clip not found: {local_input}")
@@ -630,124 +636,145 @@ def _run_one_job(
     else:
         job_name = sanitize_name(f"{args.job_prefix}{stem}_{stamp}")
 
-    remote_root = args.remote_root.rstrip("/")
-    remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
-    remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
-    remote_job_output_dir = remote_join(remote_output_dir, job_name)
-    remote_input_filename = f"{job_name}{local_input.suffix.lower()}"
-    remote_input_path = remote_join(remote_input_dir, remote_input_filename)
+    remote_input_dir, remote_output_dir, remote_job_output_dir, remote_input_path = _remote_job_paths(
+        args,
+        job_name,
+        local_input.suffix,
+    )
 
     log_prefix = f"[{batch_index}/{batch_total}] " if batch_total > 1 else ""
     log(f"{log_prefix}Preparing job {job_name}")
 
-    ssh_run(
-        cfg,
-        " && ".join(
-            [
-                f"mkdir -p {shlex.quote(remote_input_dir)}",
-                f"mkdir -p {shlex.quote(remote_output_dir)}",
-                f"mkdir -p {shlex.quote(remote_job_output_dir)}",
-            ]
-        ),
-    )
+    result = None
+    caught_exception = None
+    try:
+        ssh_run(
+            cfg,
+            " && ".join(
+                [
+                    f"mkdir -p {shlex.quote(remote_input_dir)}",
+                    f"mkdir -p {shlex.quote(remote_output_dir)}",
+                    f"mkdir -p {shlex.quote(remote_job_output_dir)}",
+                ]
+            ),
+        )
 
-    log(f"{log_prefix}Uploading clip: {local_input}")
-    rsync_to_remote(cfg, str(local_input), remote_input_path)
+        should_upload = True
+        if skip_upload_if_present:
+            check_proc = ssh_run(
+                cfg,
+                f"test -f {shlex.quote(remote_input_path)}",
+                check=False,
+                capture=False,
+                log_command=False,
+            )
+            if check_proc.returncode == 0:
+                should_upload = False
+                log(f"{log_prefix}Remote clip already staged: {remote_input_path} (skip upload)")
+        if should_upload:
+            log(f"{log_prefix}Uploading clip: {local_input}")
+            rsync_to_remote(cfg, str(local_input), remote_input_path)
 
-    remote_cmd = _build_remote_job_cmd(args, remote_input_path, remote_job_output_dir, job_name)
-    log(f"{log_prefix}Running remote inference...")
-    result = ssh_run_stream(
-        cfg,
-        remote_cmd,
-        check=False,
-        line_prefix=f"{log_prefix}[remote] ",
-        heartbeat_sec=30,
-    )
+        remote_cmd = _build_remote_job_cmd(args, remote_input_path, remote_job_output_dir, job_name)
+        log(f"{log_prefix}Running remote inference...")
+        result = ssh_run_stream(
+            cfg,
+            remote_cmd,
+            check=False,
+            line_prefix=f"{log_prefix}[remote] ",
+            heartbeat_sec=30,
+        )
 
-    download_root = Path(args.download_dir).expanduser().resolve()
-    download_into_job_subdir = bool(getattr(args, "download_into_job_subdir", False))
-    local_job_dir = download_root / job_name if download_into_job_subdir else download_root
-    if not args.skip_download:
-        local_job_dir.mkdir(parents=True, exist_ok=True)
-        log(f"{log_prefix}Downloading outputs to: {local_job_dir}")
-        rsync_from_remote(cfg, f"{remote_job_output_dir}/", f"{local_job_dir}/")
-        status_path = local_job_dir / "job_status.json"
-        status_alias_path = local_job_dir / f"{job_name}_job_status.json"
-        if status_path.is_file() and status_alias_path != status_path:
-            try:
-                status_alias_path.write_text(status_path.read_text(encoding="utf-8"), encoding="utf-8")
-                if not download_into_job_subdir:
-                    status_path.unlink(missing_ok=True)
-                    status_path = status_alias_path
-            except Exception as status_copy_exc:
-                log(f"{log_prefix}Warning: could not materialize per-job status alias: {status_copy_exc}")
-        if status_path.is_file():
-            try:
-                payload = json.loads(status_path.read_text(encoding="utf-8"))
-            except Exception as status_exc:
-                log(f"{log_prefix}Warning: could not parse job_status.json for VRAM summary: {status_exc}")
-            else:
-                if isinstance(payload, dict):
-                    logged_gpu_stats = False
-                    gpu_memory_smi = payload.get("gpu_memory_nvidia_smi", {})
-                    if isinstance(gpu_memory_smi, dict) and int(gpu_memory_smi.get("device_count", 0) or 0) > 0:
-                        peak_used = float(gpu_memory_smi.get("peak_used_mib_all_devices", 0.0) or 0.0)
-                        peak_used_pct = float(gpu_memory_smi.get("peak_used_pct_total_all_devices", 0.0) or 0.0)
-                        sample_count = int(gpu_memory_smi.get("sample_count", 0) or 0)
-                        sample_interval = float(gpu_memory_smi.get("sample_interval_sec", 0.0) or 0.0)
-                        device_count = int(gpu_memory_smi.get("device_count", 0) or 0)
-                        log(
-                            f"{log_prefix}GPU peak VRAM (nvidia-smi) | used={peak_used:.1f} MiB ({peak_used_pct:.2f}%), "
-                            f"devices={device_count}, samples={sample_count}, dt={sample_interval:.2f}s"
-                        )
-                        logged_gpu_stats = True
-                        per_device_smi = gpu_memory_smi.get("per_device", [])
-                        if isinstance(per_device_smi, list):
-                            for device_entry in per_device_smi:
-                                if not isinstance(device_entry, dict):
-                                    continue
-                                log(
-                                    f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (nvidia-smi) | "
-                                    f"used={float(device_entry.get('peak_used_mib', 0.0) or 0.0):.1f} MiB, "
-                                    f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
-                                    f"util_peak={float(device_entry.get('peak_util_gpu_pct', 0.0) or 0.0):.1f}%, "
-                                    f"name={str(device_entry.get('name', ''))}"
-                                )
-
-                    gpu_memory = payload.get("gpu_memory", {})
-                    if isinstance(gpu_memory, dict):
-                        peak_alloc = float(gpu_memory.get("peak_alloc_mib_all_devices", 0.0) or 0.0)
-                        peak_reserved = float(gpu_memory.get("peak_reserved_mib_all_devices", 0.0) or 0.0)
-                        peak_alloc_pct = float(gpu_memory.get("peak_alloc_pct_total_all_devices", 0.0) or 0.0)
-                        peak_reserved_pct = float(gpu_memory.get("peak_reserved_pct_total_all_devices", 0.0) or 0.0)
-                        device_count = int(gpu_memory.get("device_count", 0) or 0)
-                        if device_count > 0:
+        download_root = Path(args.download_dir).expanduser().resolve()
+        download_into_job_subdir = bool(getattr(args, "download_into_job_subdir", False))
+        local_job_dir = download_root / job_name if download_into_job_subdir else download_root
+        if not args.skip_download:
+            local_job_dir.mkdir(parents=True, exist_ok=True)
+            log(f"{log_prefix}Downloading outputs to: {local_job_dir}")
+            rsync_from_remote(cfg, f"{remote_job_output_dir}/", f"{local_job_dir}/")
+            status_path = local_job_dir / "job_status.json"
+            status_alias_path = local_job_dir / f"{job_name}_job_status.json"
+            if status_path.is_file() and status_alias_path != status_path:
+                try:
+                    status_alias_path.write_text(status_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    if not download_into_job_subdir:
+                        status_path.unlink(missing_ok=True)
+                        status_path = status_alias_path
+                except Exception as status_copy_exc:
+                    log(f"{log_prefix}Warning: could not materialize per-job status alias: {status_copy_exc}")
+            if status_path.is_file():
+                try:
+                    payload = json.loads(status_path.read_text(encoding="utf-8"))
+                except Exception as status_exc:
+                    log(f"{log_prefix}Warning: could not parse job_status.json for VRAM summary: {status_exc}")
+                else:
+                    if isinstance(payload, dict):
+                        logged_gpu_stats = False
+                        gpu_memory_smi = payload.get("gpu_memory_nvidia_smi", {})
+                        if isinstance(gpu_memory_smi, dict) and int(gpu_memory_smi.get("device_count", 0) or 0) > 0:
+                            peak_used = float(gpu_memory_smi.get("peak_used_mib_all_devices", 0.0) or 0.0)
+                            peak_used_pct = float(gpu_memory_smi.get("peak_used_pct_total_all_devices", 0.0) or 0.0)
+                            sample_count = int(gpu_memory_smi.get("sample_count", 0) or 0)
+                            sample_interval = float(gpu_memory_smi.get("sample_interval_sec", 0.0) or 0.0)
+                            device_count = int(gpu_memory_smi.get("device_count", 0) or 0)
                             log(
-                                f"{log_prefix}GPU peak VRAM (torch) | alloc={peak_alloc:.1f} MiB ({peak_alloc_pct:.2f}%), "
-                                f"reserved={peak_reserved:.1f} MiB ({peak_reserved_pct:.2f}%), devices={device_count}"
+                                f"{log_prefix}GPU peak VRAM (nvidia-smi) | used={peak_used:.1f} MiB ({peak_used_pct:.2f}%), "
+                                f"devices={device_count}, samples={sample_count}, dt={sample_interval:.2f}s"
                             )
                             logged_gpu_stats = True
-                            per_device = gpu_memory.get("per_device", [])
-                            if isinstance(per_device, list):
-                                for device_entry in per_device:
+                            per_device_smi = gpu_memory_smi.get("per_device", [])
+                            if isinstance(per_device_smi, list):
+                                for device_entry in per_device_smi:
                                     if not isinstance(device_entry, dict):
                                         continue
                                     log(
-                                        f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (torch) | "
-                                        f"alloc={float(device_entry.get('peak_alloc_mib', 0.0) or 0.0):.1f} MiB, "
-                                        f"reserved={float(device_entry.get('peak_reserved_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (nvidia-smi) | "
+                                        f"used={float(device_entry.get('peak_used_mib', 0.0) or 0.0):.1f} MiB, "
                                         f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
+                                        f"util_peak={float(device_entry.get('peak_util_gpu_pct', 0.0) or 0.0):.1f}%, "
                                         f"name={str(device_entry.get('name', ''))}"
                                     )
-                    if not logged_gpu_stats:
-                        log(f"{log_prefix}GPU peak VRAM stats were not present in job status JSON.")
 
-    if not args.keep_remote_input:
-        ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False)
+                        gpu_memory = payload.get("gpu_memory", {})
+                        if isinstance(gpu_memory, dict):
+                            peak_alloc = float(gpu_memory.get("peak_alloc_mib_all_devices", 0.0) or 0.0)
+                            peak_reserved = float(gpu_memory.get("peak_reserved_mib_all_devices", 0.0) or 0.0)
+                            peak_alloc_pct = float(gpu_memory.get("peak_alloc_pct_total_all_devices", 0.0) or 0.0)
+                            peak_reserved_pct = float(gpu_memory.get("peak_reserved_pct_total_all_devices", 0.0) or 0.0)
+                            device_count = int(gpu_memory.get("device_count", 0) or 0)
+                            if device_count > 0:
+                                log(
+                                    f"{log_prefix}GPU peak VRAM (torch) | alloc={peak_alloc:.1f} MiB ({peak_alloc_pct:.2f}%), "
+                                    f"reserved={peak_reserved:.1f} MiB ({peak_reserved_pct:.2f}%), devices={device_count}"
+                                )
+                                logged_gpu_stats = True
+                                per_device = gpu_memory.get("per_device", [])
+                                if isinstance(per_device, list):
+                                    for device_entry in per_device:
+                                        if not isinstance(device_entry, dict):
+                                            continue
+                                        log(
+                                            f"{log_prefix}GPU{int(device_entry.get('index', 0) or 0)} peak (torch) | "
+                                            f"alloc={float(device_entry.get('peak_alloc_mib', 0.0) or 0.0):.1f} MiB, "
+                                            f"reserved={float(device_entry.get('peak_reserved_mib', 0.0) or 0.0):.1f} MiB, "
+                                            f"total={float(device_entry.get('total_mib', 0.0) or 0.0):.1f} MiB, "
+                                            f"name={str(device_entry.get('name', ''))}"
+                                        )
+                        if not logged_gpu_stats:
+                            log(f"{log_prefix}GPU peak VRAM stats were not present in job status JSON.")
+    except Exception as exc:  # pylint: disable=broad-except
+        caught_exception = exc
+    finally:
+        if not args.keep_remote_input:
+            ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False, log_command=False)
+        if not args.keep_remote_output:
+            ssh_run(cfg, f"rm -rf {shlex.quote(remote_job_output_dir)}", check=False, log_command=False)
 
-    if not args.keep_remote_output and not args.skip_download and result.returncode == 0:
-        ssh_run(cfg, f"rm -rf {shlex.quote(remote_job_output_dir)}", check=False)
+    if caught_exception is not None:
+        raise caught_exception
 
+    if result is None:
+        raise CloudCtlError(f"Remote job did not produce a result for {local_input.name}")
     if result.returncode != 0:
         raise CloudCtlError(f"Remote job failed (exit code {result.returncode}) for {local_input.name}")
 
@@ -780,13 +807,76 @@ def _discover_batch_inputs(input_dir: Path, patterns: List[str], recursive: bool
 
     seen = set()
     ordered_unique = []
-    for p in sorted(found):
+    for p_str in sort_paths_by_clip_id(str(p) for p in found):
+        p = Path(p_str)
         key = str(p.resolve())
         if key in seen:
             continue
         seen.add(key)
         ordered_unique.append(p)
     return ordered_unique
+
+
+def _load_batch_manifest_inputs(manifest_path: Path) -> List[tuple[str, Path]]:
+    """Read newline manifest with either '<path>' or '<job_name><TAB><path>' entries."""
+    if not manifest_path.is_file():
+        raise CloudCtlError(f"Manifest file not found: {manifest_path}")
+    manifest_dir = manifest_path.parent
+    jobs: List[tuple[str, Path]] = []
+    for raw in manifest_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line:
+            explicit_name, path_text = line.split("\t", 1)
+            job_name = sanitize_name(explicit_name.strip())
+        elif "|" in line:
+            explicit_name, path_text = line.split("|", 1)
+            job_name = sanitize_name(explicit_name.strip())
+        else:
+            job_name = ""
+            path_text = line
+        clip_path = Path(path_text.strip()).expanduser()
+        if not clip_path.is_absolute():
+            clip_path = (manifest_dir / clip_path)
+        clip_path = clip_path.resolve()
+        if not clip_path.is_file():
+            raise CloudCtlError(f"Manifest clip path not found: {clip_path}")
+        jobs.append((job_name, clip_path))
+
+    # If no explicit names are provided, enforce deterministic clip-id ordering.
+    if jobs and all(not name for name, _ in jobs):
+        ordered_paths = [Path(p) for p in sort_paths_by_clip_id(path for _, path in jobs)]
+        return [("", p) for p in ordered_paths]
+    # Otherwise respect manifest order exactly.
+    return jobs
+
+
+def _build_batch_job_name(
+    args: argparse.Namespace,
+    clip: Path,
+    *,
+    batch_index: int,
+    batch_total: int,
+    batch_stamp: str,
+    explicit_name: str = "",
+) -> str:
+    if explicit_name:
+        return sanitize_name(explicit_name)
+    stem = sanitize_name(clip.stem)
+    if batch_total > 1:
+        return sanitize_name(f"{args.job_prefix}{batch_index:03d}_{stem}_{batch_stamp}")
+    return sanitize_name(f"{args.job_prefix}{stem}_{batch_stamp}")
+
+
+def _remote_job_paths(args: argparse.Namespace, job_name: str, clip_suffix: str) -> tuple[str, str, str, str]:
+    remote_root = args.remote_root.rstrip("/")
+    remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
+    remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
+    remote_job_output_dir = remote_join(remote_output_dir, job_name)
+    remote_input_filename = f"{job_name}{clip_suffix.lower()}"
+    remote_input_path = remote_join(remote_input_dir, remote_input_filename)
+    return remote_input_dir, remote_output_dir, remote_job_output_dir, remote_input_path
 
 
 def cmd_run_batch(args: argparse.Namespace) -> int:
@@ -800,30 +890,206 @@ def cmd_run_batch(args: argparse.Namespace) -> int:
         poll_sec=args.ssh_ready_poll_sec,
     )
     maybe_sync_remote_repo(cfg, args)
-    input_dir = Path(args.input_dir).expanduser().resolve()
-    if not input_dir.exists():
-        raise CloudCtlError(f"Input dir does not exist: {input_dir}")
+    clips_with_names: List[tuple[str, Path]]
+    input_manifest_spec = str(getattr(args, "input_manifest", "") or "").strip()
+    input_dir_spec = str(getattr(args, "input_dir", "") or "").strip()
+    if not input_manifest_spec and not input_dir_spec:
+        raise CloudCtlError("run-batch requires either --input-manifest or --input-dir.")
 
-    patterns = [p for p in args.patterns.split(",") if p.strip()]
-    clips = _discover_batch_inputs(input_dir, patterns, bool(args.recursive))
+    if input_manifest_spec:
+        manifest_path = Path(args.input_manifest).expanduser().resolve()
+        clips_with_names = _load_batch_manifest_inputs(manifest_path)
+    else:
+        input_dir = Path(args.input_dir).expanduser().resolve()
+        if not input_dir.exists():
+            raise CloudCtlError(f"Input dir does not exist: {input_dir}")
+        patterns = [p for p in args.patterns.split(",") if p.strip()]
+        discovered = _discover_batch_inputs(input_dir, patterns, bool(args.recursive))
+        clips_with_names = [("", clip) for clip in discovered]
+
+    clips = [clip for _, clip in clips_with_names]
     if args.max_jobs > 0:
-        clips = clips[: args.max_jobs]
+        clips_with_names = clips_with_names[: args.max_jobs]
+        clips = [clip for _, clip in clips_with_names]
 
     if not clips:
         raise CloudCtlError("No clips matched the requested patterns.")
 
     log(f"Found {len(clips)} clip(s) for batch processing.")
 
+    batch_stamp = time.strftime("%Y%m%d_%H%M%S")
+    plans = []
+    for idx, (explicit_name, clip) in enumerate(clips_with_names, start=1):
+        job_name = _build_batch_job_name(
+            args,
+            clip,
+            batch_index=idx,
+            batch_total=len(clips_with_names),
+            batch_stamp=batch_stamp,
+            explicit_name=explicit_name,
+        )
+        plans.append((idx, clip, job_name))
+
     failed = []
-    for idx, clip in enumerate(clips, start=1):
+    started_job_names = set()
+
+    if bool(getattr(args, "prefetch_upload_all", False)) and len(plans) > 1:
+        remote_root = args.remote_root.rstrip("/")
+        remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
+        remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
+        ssh_run(
+            cfg,
+            " && ".join(
+                [
+                    f"mkdir -p {shlex.quote(remote_input_dir)}",
+                    f"mkdir -p {shlex.quote(remote_output_dir)}",
+                ]
+            ),
+        )
+        log("Prefetch mode: staging all clips to remote input before inference...")
+        for idx, clip, job_name in plans:
+            _, _, _, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+            log(f"[{idx}/{len(plans)}] Prefetch upload: {clip.name}")
+            try:
+                rsync_to_remote(cfg, str(clip), remote_input_path)
+            except Exception as exc:  # pylint: disable=broad-except
+                msg = f"Prefetch upload failed for {clip.name}: {exc}"
+                log(msg)
+                failed.append(msg)
+                if not args.continue_on_error:
+                    break
+    prefetch_window = max(0, int(getattr(args, "prefetch_window", 0) or 0))
+    pipeline_enabled = prefetch_window > 0 and len(plans) > 1 and not bool(getattr(args, "prefetch_upload_all", False))
+
+    if pipeline_enabled:
+        remote_root = args.remote_root.rstrip("/")
+        remote_input_dir = remote_join(remote_root, args.remote_input_subdir)
+        remote_output_dir = remote_join(remote_root, args.remote_output_subdir)
+        ssh_run(
+            cfg,
+            " && ".join(
+                [
+                    f"mkdir -p {shlex.quote(remote_input_dir)}",
+                    f"mkdir -p {shlex.quote(remote_output_dir)}",
+                ]
+            ),
+        )
+        log(
+            f"Pipeline mode: keeping up to {prefetch_window} additional clip(s) staged ahead of inference."
+        )
+
+        staged_jobs = set()
+        staged_failures = {}
+        next_upload_idx = 0
+        started_count = 0
+        stop_upload = False
+        cond = threading.Condition()
+
+        def _uploader() -> None:
+            nonlocal next_upload_idx
+            nonlocal stop_upload
+            while True:
+                with cond:
+                    while (
+                        not stop_upload
+                        and next_upload_idx < len(plans)
+                        and (next_upload_idx - started_count) >= (prefetch_window + 1)
+                    ):
+                        cond.wait(timeout=0.25)
+                    if stop_upload or next_upload_idx >= len(plans):
+                        return
+                    idx, clip, job_name = plans[next_upload_idx]
+                    next_upload_idx += 1
+
+                try:
+                    _, _, _, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+                    log(f"[{idx}/{len(plans)}] Prefetch upload: {clip.name}")
+                    rsync_to_remote(cfg, str(clip), remote_input_path)
+                    with cond:
+                        staged_jobs.add(job_name)
+                        cond.notify_all()
+                except Exception as exc:  # pylint: disable=broad-except
+                    err = f"Prefetch upload failed for {clip.name}: {exc}"
+                    with cond:
+                        staged_failures[job_name] = err
+                        cond.notify_all()
+                    if not args.continue_on_error:
+                        with cond:
+                            stop_upload = True
+                            cond.notify_all()
+                        return
+
+        uploader_thread = threading.Thread(target=_uploader, daemon=True)
+        uploader_thread.start()
+
         try:
-            _run_one_job(cfg, args, clip, batch_index=idx, batch_total=len(clips))
-        except Exception as exc:  # pylint: disable=broad-except
-            msg = f"Batch item failed for {clip.name}: {exc}"
-            log(msg)
-            failed.append(msg)
-            if not args.continue_on_error:
-                break
+            for idx, clip, job_name in plans:
+                with cond:
+                    while job_name not in staged_jobs and job_name not in staged_failures and not stop_upload:
+                        cond.wait(timeout=0.25)
+                    upload_error = staged_failures.get(job_name)
+                    started_count += 1
+                    cond.notify_all()
+
+                if upload_error:
+                    log(upload_error)
+                    failed.append(upload_error)
+                    if not args.continue_on_error:
+                        break
+                    continue
+
+                try:
+                    started_job_names.add(job_name)
+                    _run_one_job(
+                        cfg,
+                        args,
+                        clip,
+                        explicit_job_name=job_name,
+                        batch_index=idx,
+                        batch_total=len(plans),
+                        skip_upload_if_present=True,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    msg = f"Batch item failed for {clip.name}: {exc}"
+                    log(msg)
+                    failed.append(msg)
+                    if not args.continue_on_error:
+                        break
+        finally:
+            with cond:
+                stop_upload = True
+                cond.notify_all()
+            uploader_thread.join(timeout=10.0)
+    else:
+        for idx, clip, job_name in plans:
+            try:
+                started_job_names.add(job_name)
+                _run_one_job(
+                    cfg,
+                    args,
+                    clip,
+                    explicit_job_name=job_name,
+                    batch_index=idx,
+                    batch_total=len(plans),
+                    skip_upload_if_present=bool(getattr(args, "prefetch_upload_all", False)),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                msg = f"Batch item failed for {clip.name}: {exc}"
+                log(msg)
+                failed.append(msg)
+                if not args.continue_on_error:
+                    break
+
+    if (not args.keep_remote_input) or (not args.keep_remote_output):
+        unstarted = [(idx, clip, job_name) for idx, clip, job_name in plans if job_name not in started_job_names]
+        if unstarted:
+            log(f"Remote cleanup: removing artifacts for {len(unstarted)} unstarted prefetched job(s).")
+            for idx, clip, job_name in unstarted:
+                _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+                if not args.keep_remote_input:
+                    ssh_run(cfg, f"rm -f {shlex.quote(remote_input_path)}", check=False, log_command=False)
+                if not args.keep_remote_output:
+                    ssh_run(cfg, f"rm -rf {shlex.quote(remote_job_output_dir)}", check=False, log_command=False)
 
     if failed:
         for item in failed:
@@ -894,11 +1160,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch = sub.add_parser("run-batch", help="Upload and run a batch of clips sequentially.")
     add_ssh_flags(p_batch)
     add_model_job_flags(p_batch)
-    p_batch.add_argument("--input-dir", required=True)
+    p_batch.add_argument("--input-dir", default="")
+    p_batch.add_argument(
+        "--input-manifest",
+        default="",
+        help="Optional text file of clips to process in order. Each line: <path> or <job_name><TAB><path>.",
+    )
     p_batch.add_argument("--patterns", default="*.mkv,*.mp4,*.mov,*.avi")
     p_batch.add_argument("--recursive", action="store_true")
     p_batch.add_argument("--max-jobs", type=int, default=0)
     p_batch.add_argument("--continue-on-error", action="store_true")
+    p_batch.add_argument(
+        "--prefetch-window",
+        type=int,
+        default=0,
+        help="Pipeline staging depth: number of additional clips to keep uploaded ahead of current inference.",
+    )
+    p_batch.add_argument(
+        "--prefetch-upload-all",
+        action="store_true",
+        help="Stage all batch clips to remote first so inference can run back-to-back with less GPU idle.",
+    )
     p_batch.add_argument("--job-prefix", default="")
     p_batch.add_argument("--remote-input-subdir", default="cloud_jobs/incoming")
     p_batch.add_argument("--remote-output-subdir", default="cloud_jobs/output")

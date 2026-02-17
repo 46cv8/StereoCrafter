@@ -48,6 +48,7 @@ from depthcrafter.utils import (
     save_depth_visual_as_single_exr_util,
     get_video_stream_info,
 )
+from dependency.clip_ordering import clip_sort_key, sort_paths_by_clip_id
 
 try:
     from depthcrafter import merge_depth_segments
@@ -2803,7 +2804,7 @@ class DepthCrafterGUI:
             self.effective_move_original_on_completion = self.MOVE_ORIGINAL_TO_FINISHED_FOLDER_ON_COMPLETION
             if self.current_input_mode == "batch_folder":
                 try:
-                    for item_name in os.listdir(input_path_str):
+                    for item_name in sort_paths_by_clip_id(os.listdir(input_path_str)):
                         item_full_path = os.path.join(input_path_str, item_name)
                         if os.path.isfile(item_full_path):
                             ext = os.path.splitext(item_name)[1].lower()
@@ -2834,6 +2835,9 @@ class DepthCrafterGUI:
                 _logger.critical(f"GUI Start Thread: Unexpected mode '{self.current_input_mode}' for path '{input_path_str}' after explicit determination. This indicates a logic error.")
                 messagebox.showerror("Internal Error", f"Unexpected input mode '{self.current_input_mode}' for path '{input_path_str}'. Please report this.")
                 return
+
+        # Ensure deterministic ordering by parsed clip id (with lexical fallback).
+        sources_to_process_specs.sort(key=lambda spec: clip_sort_key(spec.get("basename", spec.get("path", ""))))
 
 
         if not sources_to_process_specs:
@@ -6079,6 +6083,139 @@ class DepthCrafterGUI:
 
         return cmd, job_name
 
+    def _write_cloud_batch_manifest(self, source_specs: List[Dict]) -> str:
+        output_root = self.output_dir.get().strip() or "."
+        cloud_tmp_dir = os.path.join(output_root, ".cloud_gui_tmp")
+        os.makedirs(cloud_tmp_dir, exist_ok=True)
+        manifest_path = os.path.join(
+            cloud_tmp_dir,
+            f"cloud_batch_manifest_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+        )
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            for spec in source_specs:
+                clip_path = str(spec.get("path", "")).strip()
+                clip_name = str(spec.get("basename", "")).strip()
+                if not clip_path:
+                    continue
+                if not clip_name:
+                    clip_name = os.path.splitext(os.path.basename(clip_path))[0]
+                # Format: <job_name><TAB><path>
+                manifest_file.write(f"{clip_name}\t{clip_path}\n")
+        return manifest_path
+
+    def _build_cloudctl_run_batch_command(
+        self,
+        connection_info: Dict[str, object],
+        source_specs: List[Dict],
+        effective_seed_for_run: int,
+    ) -> Tuple[List[str], str]:
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        cloud_settings = self._get_effective_cloud_processing_settings()
+        cloud_target_width = int(connection_info.get("target_width", int(cloud_settings["target_width"])))
+        cloud_target_height = int(connection_info.get("target_height", int(cloud_settings["target_height"])))
+        cloud_window_size = int(connection_info.get("window_size", int(cloud_settings["window_size"])))
+        cloud_overlap = int(connection_info.get("overlap", int(cloud_settings["overlap"])))
+        cloud_cpu_offload = str(connection_info.get("cpu_offload", self.cpu_offload.get()) or self.cpu_offload.get())
+        if (
+            bool(cloud_settings.get("use_source_resolution", False))
+            and int(cloud_settings.get("target_width_override", 0)) <= 0
+            and int(cloud_settings.get("target_height_override", 0)) <= 0
+            and source_specs
+        ):
+            src_w, src_h = self._detect_source_video_resolution_for_cloud(source_specs[0].get("path", ""))
+            if src_w > 0 and src_h > 0:
+                cloud_target_width = int(src_w)
+                cloud_target_height = int(src_h)
+                _logger.info(
+                    f"[CLOUD] Batch mode using source resolution from first clip: {cloud_target_width}x{cloud_target_height}."
+                )
+            else:
+                _logger.warning(
+                    "[CLOUD] Could not determine source resolution for batch run; using configured cloud target %sx%s.",
+                    cloud_target_width,
+                    cloud_target_height,
+                )
+
+        manifest_path = self._write_cloud_batch_manifest(source_specs)
+        cloud_output_format = str(self.merge_output_format_var.get())
+        if cloud_output_format not in ("mp4", "main10_mp4"):
+            cloud_output_format = "main10_mp4"
+
+        cmd = [
+            sys.executable,
+            "-u",
+            os.path.join(repo_root, "cloud", "cloudctl.py"),
+            "run-batch",
+            "--host",
+            str(connection_info["host"]),
+            "--user",
+            str(connection_info["user"]),
+            "--port",
+            str(int(connection_info["port"])),
+            "--remote-root",
+            str(connection_info["remote_root"]),
+            "--venv-name",
+            str(connection_info["remote_venv"]),
+            "--input-manifest",
+            manifest_path,
+            "--download-dir",
+            self.output_dir.get(),
+            "--target-width",
+            str(cloud_target_width),
+            "--target-height",
+            str(cloud_target_height),
+            "--window-size",
+            str(cloud_window_size),
+            "--overlap",
+            str(cloud_overlap),
+            "--inference-steps",
+            str(int(self.inference_steps.get())),
+            "--guidance-scale",
+            str(float(self.guidance_scale.get())),
+            "--seed",
+            str(int(effective_seed_for_run)),
+            "--target-fps",
+            str(float(self.target_fps.get())),
+            "--process-length",
+            str(int(self.process_length.get())),
+            "--output-format",
+            cloud_output_format,
+            "--cpu-offload",
+            cloud_cpu_offload,
+            "--prefetch-window",
+            "2",
+        ]
+
+        identity_file = self.cloud_identity_file_var.get().strip()
+        if identity_file:
+            cmd.extend(["--identity", os.path.expanduser(identity_file)])
+
+        if bool(self.disable_xformers_var.get()):
+            cmd.append("--disable-xformers")
+        if bool(self.use_cudnn_benchmark.get()):
+            cmd.append("--use-cudnn-benchmark")
+        if bool(self.use_local_models_only_var.get()):
+            cmd.append("--local-files-only")
+
+        return cmd, manifest_path
+
+    def _extract_cloud_batch_outcomes(self, output_lines: List[str]) -> Tuple[set, set]:
+        completed_jobs = set()
+        failed_filenames = set()
+        complete_pattern = re.compile(r"Job complete:\s*([A-Za-z0-9._-]+)")
+        failed_pattern = re.compile(r"Batch item failed for\s+(.+?):")
+        for line in output_lines:
+            text = str(line or "").strip()
+            if not text:
+                continue
+            complete_match = complete_pattern.search(text)
+            if complete_match:
+                completed_jobs.add(complete_match.group(1).strip())
+            failed_match = failed_pattern.search(text)
+            if failed_match:
+                failed_filenames.add(failed_match.group(1).strip())
+        return completed_jobs, failed_filenames
+
     def _update_gui_info_from_cloud_status(self, job_info_stub: Dict, status_json_path: str):
         status_data = load_json_file(status_json_path)
         if not isinstance(status_data, dict):
@@ -6231,58 +6368,116 @@ class DepthCrafterGUI:
         )
         instance_id = int(connection_info.get("instance_id", 0) or 0)
         total_sources_processed = 0
+        had_cloud_errors = False
+        use_cloud_batch_queue = len(source_specs_to_process) > 1
 
         try:
-            for source_idx, source_spec in enumerate(source_specs_to_process):
-                if self.stop_event.is_set():
-                    _logger.info("Cloud dispatch cancelled by user.")
-                    break
-
-                current_video_path = source_spec["path"]
-                original_basename = source_spec["basename"]
-                self.current_filename_var.set(f"{original_basename} (Cloud)")
-                self.current_resolution_var.set("N/A")
-                self.current_frames_var.set("N/A")
+            if use_cloud_batch_queue:
                 self.status_message_var.set(
-                    f"Cloud processing {source_idx + 1} of {len(source_specs_to_process)}: {original_basename}"
+                    f"Cloud batch dispatch: pipelined queue for {len(source_specs_to_process)} clips..."
                 )
                 self.root.update_idletasks()
-
-                job_stub = {
-                    "is_segment": False,
-                    "original_video_raw_frame_count": "N/A",
-                }
-                self._update_gui_info_on_job_start(job_stub, original_basename, "Cloud")
-
-                cloud_cmd, job_name = self._build_cloudctl_run_job_command(
+                batch_cmd, manifest_path = self._build_cloudctl_run_batch_command(
                     connection_info=connection_info,
-                    source_spec=source_spec,
+                    source_specs=source_specs_to_process,
                     effective_seed_for_run=effective_seed_for_run,
-                    source_idx=source_idx,
-                    total_sources=len(source_specs_to_process),
                 )
-
-                rc, _ = self._run_external_command_with_logging(
-                    cloud_cmd,
+                _logger.info(f"[CLOUD] Using queued batch mode with manifest: {manifest_path}")
+                batch_rc, batch_output_lines = self._run_external_command_with_logging(
+                    batch_cmd,
                     cwd=os.path.dirname(os.path.abspath(__file__)),
                 )
-                if rc != 0:
-                    _logger.error(f"Cloud job failed for {original_basename} with exit code {rc}.")
-                    if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
-                        self._move_original_source(current_video_path, original_basename, "failed")
-                else:
-                    status_json_path = self._resolve_cloud_status_json_path(job_name)
-                    self._update_gui_info_from_cloud_status(job_stub, status_json_path)
-                    if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
-                        self._move_original_source(current_video_path, original_basename, "finished")
+                completed_jobs, failed_filenames = self._extract_cloud_batch_outcomes(batch_output_lines)
 
-                total_sources_processed += 1
-                self.message_queue.put(("progress", total_sources_processed))
+                for source_spec in source_specs_to_process:
+                    original_basename = source_spec["basename"]
+                    current_video_path = source_spec["path"]
+                    file_name = os.path.basename(current_video_path)
+                    outcome = "pending"
+                    if original_basename in completed_jobs:
+                        outcome = "finished"
+                    elif file_name in failed_filenames:
+                        outcome = "failed"
+                    elif batch_rc != 0:
+                        # Batch aborted before this clip was attempted.
+                        outcome = "pending"
+
+                    if outcome == "finished":
+                        job_stub = {
+                            "is_segment": False,
+                            "original_video_raw_frame_count": "N/A",
+                        }
+                        self._update_gui_info_on_job_start(job_stub, original_basename, "Cloud")
+                        status_json_path = self._resolve_cloud_status_json_path(original_basename)
+                        self._update_gui_info_from_cloud_status(job_stub, status_json_path)
+                        if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
+                            self._move_original_source(current_video_path, original_basename, "finished")
+                        total_sources_processed += 1
+                        self.message_queue.put(("progress", total_sources_processed))
+                    elif outcome == "failed":
+                        if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
+                            self._move_original_source(current_video_path, original_basename, "failed")
+                        total_sources_processed += 1
+                        self.message_queue.put(("progress", total_sources_processed))
+
+                if batch_rc != 0:
+                    _logger.error(f"Cloud batch job failed with exit code {batch_rc}.")
+                    had_cloud_errors = True
+            else:
+                for source_idx, source_spec in enumerate(source_specs_to_process):
+                    if self.stop_event.is_set():
+                        _logger.info("Cloud dispatch cancelled by user.")
+                        break
+
+                    current_video_path = source_spec["path"]
+                    original_basename = source_spec["basename"]
+                    self.current_filename_var.set(f"{original_basename} (Cloud)")
+                    self.current_resolution_var.set("N/A")
+                    self.current_frames_var.set("N/A")
+                    self.status_message_var.set(
+                        f"Cloud processing {source_idx + 1} of {len(source_specs_to_process)}: {original_basename}"
+                    )
+                    self.root.update_idletasks()
+
+                    job_stub = {
+                        "is_segment": False,
+                        "original_video_raw_frame_count": "N/A",
+                    }
+                    self._update_gui_info_on_job_start(job_stub, original_basename, "Cloud")
+
+                    cloud_cmd, job_name = self._build_cloudctl_run_job_command(
+                        connection_info=connection_info,
+                        source_spec=source_spec,
+                        effective_seed_for_run=effective_seed_for_run,
+                        source_idx=source_idx,
+                        total_sources=len(source_specs_to_process),
+                    )
+
+                    rc, _ = self._run_external_command_with_logging(
+                        cloud_cmd,
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                    )
+                    if rc != 0:
+                        _logger.error(f"Cloud job failed for {original_basename} with exit code {rc}.")
+                        had_cloud_errors = True
+                        if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
+                            self._move_original_source(current_video_path, original_basename, "failed")
+                    else:
+                        status_json_path = self._resolve_cloud_status_json_path(job_name)
+                        self._update_gui_info_from_cloud_status(job_stub, status_json_path)
+                        if self.effective_move_original_on_completion and os.path.isfile(current_video_path):
+                            self._move_original_source(current_video_path, original_basename, "finished")
+
+                    total_sources_processed += 1
+                    self.message_queue.put(("progress", total_sources_processed))
 
             if self.stop_event.is_set():
                 self.status_message_var.set("Cloud processing cancelled.")
             else:
-                self.status_message_var.set("Cloud processing finished.")
+                if had_cloud_errors:
+                    self.status_message_var.set("Cloud processing finished with errors.")
+                else:
+                    self.status_message_var.set("Cloud processing finished.")
         finally:
             if bool(self.cloud_auto_destroy_instance_var.get()) and instance_id > 0:
                 self.status_message_var.set(f"Destroying cloud instance {instance_id}...")

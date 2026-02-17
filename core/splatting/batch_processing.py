@@ -31,6 +31,7 @@ from .depth_processing import (
 from .render_processor import RenderProcessor
 from .convergence import ConvergenceEstimatorWrapper
 from core.common.video_io import read_video_frames
+from dependency.clip_ordering import sort_paths_by_clip_id
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +246,7 @@ class BatchProcessor:
             video_extensions = ("*.mp4", "*.avi", "*.mov", "*.mkv")
             for ext in video_extensions:
                 result.input_videos.extend(glob.glob(os.path.join(input_source, ext)))
-            result.input_videos = sorted(result.input_videos)
+            result.input_videos = sort_paths_by_clip_id(result.input_videos)
 
         else:
             result.error = (
