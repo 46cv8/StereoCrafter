@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stereopilot-target-width", type=int, default=832)
     parser.add_argument("--stereopilot-target-height", type=int, default=480)
     parser.add_argument("--stereopilot-target-fps", type=float, default=16.0)
-    parser.add_argument("--stereopilot-frame-count", type=int, default=81)
+    parser.add_argument("--stereopilot-frame-count", type=int, default=81, help=argparse.SUPPRESS)
     parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
     parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
     parser.add_argument("--stereopilot-shift", type=float, default=5.0)
@@ -252,7 +252,6 @@ def _init_demo(
             stereopilot_target_width=max(32, int(args.stereopilot_target_width)),
             stereopilot_target_height=max(32, int(args.stereopilot_target_height)),
             stereopilot_target_fps=max(1.0, float(args.stereopilot_target_fps)),
-            stereopilot_frame_count=max(1, int(args.stereopilot_frame_count)),
             stereopilot_sampling_steps=max(1, int(args.stereopilot_sampling_steps)),
             stereopilot_guide_scale=float(args.stereopilot_guide_scale),
             stereopilot_shift=float(args.stereopilot_shift),
@@ -318,7 +317,6 @@ def _build_job_status(
             "stereopilot_target_width": args.stereopilot_target_width,
             "stereopilot_target_height": args.stereopilot_target_height,
             "stereopilot_target_fps": args.stereopilot_target_fps,
-            "stereopilot_frame_count": args.stereopilot_frame_count,
             "stereopilot_sampling_steps": args.stereopilot_sampling_steps,
             "stereopilot_guide_scale": args.stereopilot_guide_scale,
             "stereopilot_shift": args.stereopilot_shift,

@@ -247,7 +247,8 @@ class DepthCrafterGUI:
         self.stereopilot_target_width_var = tk.IntVar(value=832)
         self.stereopilot_target_height_var = tk.IntVar(value=480)
         self.stereopilot_target_fps_var = tk.DoubleVar(value=16.0)
-        self.stereopilot_frame_count_var = tk.IntVar(value=81)
+        self.stereopilot_window_size_var = tk.IntVar(value=81)
+        self.stereopilot_overlap_var = tk.IntVar(value=25)
         self.stereopilot_sampling_steps_var = tk.IntVar(value=30)
         self.stereopilot_guide_scale_var = tk.DoubleVar(value=5.0)
         self.stereopilot_shift_var = tk.DoubleVar(value=5.0)
@@ -397,7 +398,8 @@ class DepthCrafterGUI:
             "stereopilot_target_width_var": self.stereopilot_target_width_var,
             "stereopilot_target_height_var": self.stereopilot_target_height_var,
             "stereopilot_target_fps_var": self.stereopilot_target_fps_var,
-            "stereopilot_frame_count_var": self.stereopilot_frame_count_var,
+            "stereopilot_window_size_var": self.stereopilot_window_size_var,
+            "stereopilot_overlap_var": self.stereopilot_overlap_var,
             "stereopilot_sampling_steps_var": self.stereopilot_sampling_steps_var,
             "stereopilot_guide_scale_var": self.stereopilot_guide_scale_var,
             "stereopilot_shift_var": self.stereopilot_shift_var,
@@ -539,6 +541,7 @@ class DepthCrafterGUI:
         self.create_widgets() 
         self._bind_geometry_status_traces()
         self._refresh_geometry_local_status()
+        self._apply_backend_specific_controls()
         self._bind_cloud_processing_summary_traces()
         self._refresh_cloud_processing_summary()
         self.root.app_instance = self 
@@ -568,6 +571,12 @@ class DepthCrafterGUI:
             and "spatial_refine_tile_overlap_y_var" not in normalized_settings
         ):
             normalized_settings["spatial_refine_tile_overlap_y_var"] = normalized_settings["spatial_refine_tile_overlap_var"]
+        if (
+            "stereopilot_frame_count_var" in normalized_settings
+            and "stereopilot_window_size_var" not in normalized_settings
+        ):
+            normalized_settings["stereopilot_window_size_var"] = normalized_settings["stereopilot_frame_count_var"]
+        normalized_settings.pop("stereopilot_frame_count_var", None)
 
         for key, value_from_json in normalized_settings.items():
             if key == "target_fps": # Specific debug
@@ -587,6 +596,7 @@ class DepthCrafterGUI:
             self.toggle_merge_related_options_active_state()
         self._apply_spatial_refine_options_visibility()
         self._refresh_geometry_local_status()
+        self._apply_backend_specific_controls()
         # Removed update GUI verbosity
 
     def _apply_theme(self, is_startup: bool = False):
@@ -1206,7 +1216,8 @@ class DepthCrafterGUI:
                 "stereopilot_target_width": self.stereopilot_target_width_var.get(),
                 "stereopilot_target_height": self.stereopilot_target_height_var.get(),
                 "stereopilot_target_fps": self.stereopilot_target_fps_var.get(),
-                "stereopilot_frame_count": self.stereopilot_frame_count_var.get(),
+                "stereopilot_window_size": self.stereopilot_window_size_var.get(),
+                "stereopilot_overlap": self.stereopilot_overlap_var.get(),
                 "stereopilot_sampling_steps": self.stereopilot_sampling_steps_var.get(),
                 "stereopilot_guide_scale": self.stereopilot_guide_scale_var.get(),
                 "stereopilot_shift": self.stereopilot_shift_var.get(),
@@ -1488,9 +1499,32 @@ class DepthCrafterGUI:
         inference_steps_for_job = snapshotted_settings["inference_steps"]
         seed_for_job = snapshotted_settings["seed_setting"]
         process_length_for_run_param = snapshotted_settings["process_max_frames_setting"] if not is_segment_job else -1
-        
-        window_size_for_pipe_call = snapshotted_settings["gui_window_size_setting"]
-        overlap_for_pipe_call = snapshotted_settings["gui_overlap_setting"]
+        selected_backend = str(snapshotted_settings.get("model_backend", "depthcrafter") or "depthcrafter").strip().lower()
+        if selected_backend == "stereopilot":
+            window_size_for_pipe_call = max(
+                1,
+                int(
+                    snapshotted_settings.get(
+                        "stereopilot_window_size",
+                        snapshotted_settings.get(
+                            "stereopilot_frame_count",
+                            self.stereopilot_window_size_var.get(),
+                        ),
+                    )
+                ),
+            )
+            overlap_for_pipe_call = max(
+                0,
+                int(
+                    snapshotted_settings.get(
+                        "stereopilot_overlap",
+                        self.stereopilot_overlap_var.get(),
+                    )
+                ),
+            )
+        else:
+            window_size_for_pipe_call = snapshotted_settings["gui_window_size_setting"]
+            overlap_for_pipe_call = snapshotted_settings["gui_overlap_setting"]
 
         try:
             keep_npz_for_this_job_run = False
@@ -1860,6 +1894,7 @@ class DepthCrafterGUI:
         if not is_processing:
             self.toggle_merge_related_options_active_state()
             self.toggle_secondary_output_options_active_state()
+            self._apply_backend_specific_controls()
 
     def _show_help_for(self, help_key: str):
         """Displays help content for a given key in a Tkinter Toplevel window."""
@@ -2608,6 +2643,12 @@ class DepthCrafterGUI:
                     and "spatial_refine_tile_overlap_y_var" not in config
                 ):
                     config["spatial_refine_tile_overlap_y_var"] = config["spatial_refine_tile_overlap_var"]
+                if (
+                    "stereopilot_frame_count_var" in config
+                    and "stereopilot_window_size_var" not in config
+                ):
+                    config["stereopilot_window_size_var"] = config["stereopilot_frame_count_var"]
+                config.pop("stereopilot_frame_count_var", None)
                 legacy_cloud_image = str(config.get("cloud_image_var", "")).strip()
                 if legacy_cloud_image in self._legacy_cloud_image_migrations:
                     migrated_image = self._legacy_cloud_image_migrations[legacy_cloud_image]
@@ -3142,7 +3183,6 @@ class DepthCrafterGUI:
                         stereopilot_target_width=max(32, int(self.stereopilot_target_width_var.get())),
                         stereopilot_target_height=max(32, int(self.stereopilot_target_height_var.get())),
                         stereopilot_target_fps=max(1.0, float(self.stereopilot_target_fps_var.get())),
-                        stereopilot_frame_count=max(1, int(self.stereopilot_frame_count_var.get())),
                         stereopilot_sampling_steps=max(1, int(self.stereopilot_sampling_steps_var.get())),
                         stereopilot_guide_scale=float(self.stereopilot_guide_scale_var.get()),
                         stereopilot_shift=float(self.stereopilot_shift_var.get()),
@@ -4052,7 +4092,7 @@ class DepthCrafterGUI:
 
         stereo_numeric_frame = self._register_geometry_dialog_widget(ttk.Frame(outer))
         stereo_numeric_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=5, pady=(2, 4))
-        for idx in range(8):
+        for idx in range(6):
             stereo_numeric_frame.columnconfigure(idx, weight=0)
 
         ttk.Label(stereo_numeric_frame, text="W").grid(row=0, column=0, sticky="e", padx=(0, 2))
@@ -4063,14 +4103,26 @@ class DepthCrafterGUI:
         entry_sp_h.grid(row=0, column=3, sticky="w", padx=(0, 6))
         ttk.Label(stereo_numeric_frame, text="FPS").grid(row=0, column=4, sticky="e", padx=(0, 2))
         entry_sp_fps = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame, textvariable=self.stereopilot_target_fps_var, width=7))
-        entry_sp_fps.grid(row=0, column=5, sticky="w", padx=(0, 6))
-        ttk.Label(stereo_numeric_frame, text="Frames").grid(row=0, column=6, sticky="e", padx=(0, 2))
-        entry_sp_frames = self._register_geometry_dialog_widget(ttk.Entry(stereo_numeric_frame, textvariable=self.stereopilot_frame_count_var, width=7))
-        entry_sp_frames.grid(row=0, column=7, sticky="w")
+        entry_sp_fps.grid(row=0, column=5, sticky="w")
         _create_hover_tooltip(entry_sp_w, "stereopilot_target_width")
         _create_hover_tooltip(entry_sp_h, "stereopilot_target_height")
         _create_hover_tooltip(entry_sp_fps, "stereopilot_target_fps")
-        _create_hover_tooltip(entry_sp_frames, "stereopilot_frame_count")
+        row += 1
+
+        stereo_window_frame = self._register_geometry_dialog_widget(ttk.Frame(outer))
+        stereo_window_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 4))
+        ttk.Label(stereo_window_frame, text="Window").grid(row=0, column=0, sticky="e", padx=(0, 2))
+        entry_sp_window = self._register_geometry_dialog_widget(
+            ttk.Entry(stereo_window_frame, textvariable=self.stereopilot_window_size_var, width=7)
+        )
+        entry_sp_window.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(stereo_window_frame, text="Overlap").grid(row=0, column=2, sticky="e", padx=(0, 2))
+        entry_sp_overlap = self._register_geometry_dialog_widget(
+            ttk.Entry(stereo_window_frame, textvariable=self.stereopilot_overlap_var, width=7)
+        )
+        entry_sp_overlap.grid(row=0, column=3, sticky="w")
+        _create_hover_tooltip(entry_sp_window, "stereopilot_window_size")
+        _create_hover_tooltip(entry_sp_overlap, "stereopilot_overlap")
         row += 1
 
         stereo_numeric_frame_2 = self._register_geometry_dialog_widget(ttk.Frame(outer))
@@ -4207,9 +4259,45 @@ class DepthCrafterGUI:
         except Exception:
             return float(fallback)
 
+    def _is_stereopilot_backend_selected(self) -> bool:
+        backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
+        return backend == "stereopilot"
+
+    def _apply_backend_specific_controls(self):
+        if not hasattr(self, "process_as_segments_cb") or self.process_as_segments_cb is None:
+            return
+
+        stereopilot_active = self._is_stereopilot_backend_selected()
+        if stereopilot_active and bool(self.process_as_segments_var.get()):
+            self.process_as_segments_var.set(False)
+
+        desired_state = tk.NORMAL
+        if stereopilot_active:
+            desired_state = tk.DISABLED
+        else:
+            try:
+                if (
+                    hasattr(self, "start_button")
+                    and self.start_button is not None
+                    and hasattr(self, "cancel_button")
+                    and self.cancel_button is not None
+                    and self.start_button.cget("state") == tk.DISABLED
+                    and self.cancel_button.cget("state") == tk.NORMAL
+                ):
+                    desired_state = tk.DISABLED
+            except tk.TclError:
+                pass
+
+        try:
+            self.process_as_segments_cb.configure(state=desired_state)
+        except tk.TclError:
+            pass
+        self.toggle_merge_related_options_active_state()
+
     def _on_geometry_status_setting_changed(self, *_):
         self._refresh_geometry_local_status()
         self._apply_geometry_options_visibility()
+        self._apply_backend_specific_controls()
 
     def _bind_geometry_status_traces(self):
         tracked_vars = [
@@ -4448,9 +4536,18 @@ class DepthCrafterGUI:
         height_override = max(0, self._safe_int_from_tk_var(self.cloud_target_height_override_var, 0))
         window_override = self._safe_int_from_tk_var(self.cloud_window_size_override_var, 0)
         overlap_override = self._safe_int_from_tk_var(self.cloud_overlap_override_var, -1)
+        selected_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
 
-        base_window = max(1, self._safe_int_from_tk_var(self.window_size, int(profile_defaults["window_size"])))
-        base_overlap = max(0, self._safe_int_from_tk_var(self.overlap, int(profile_defaults["overlap"])))
+        if selected_backend == "stereopilot":
+            base_window = max(1, self._safe_int_from_tk_var(self.stereopilot_window_size_var, 81))
+            base_overlap = max(0, self._safe_int_from_tk_var(self.stereopilot_overlap_var, 25))
+            base_window_label = "stereopilot window"
+            base_overlap_label = "stereopilot overlap"
+        else:
+            base_window = max(1, self._safe_int_from_tk_var(self.window_size, int(profile_defaults["window_size"])))
+            base_overlap = max(0, self._safe_int_from_tk_var(self.overlap, int(profile_defaults["overlap"])))
+            base_window_label = "main window"
+            base_overlap_label = "main overlap"
 
         effective_width = width_override if width_override > 0 else int(profile_defaults["target_width"])
         effective_height = height_override if height_override > 0 else int(profile_defaults["target_height"])
@@ -4463,8 +4560,8 @@ class DepthCrafterGUI:
             target_source = "source clip resolution (auto per file)"
         else:
             target_source = f"profile default ({profile_defaults['key']})"
-        window_source = "cloud override" if window_override > 0 else "main window"
-        overlap_source = "cloud override" if overlap_override >= 0 else "main window"
+        window_source = "cloud override" if window_override > 0 else base_window_label
+        overlap_source = "cloud override" if overlap_override >= 0 else base_overlap_label
 
         return {
             "profile_key": str(profile_defaults["key"]),
@@ -4487,6 +4584,7 @@ class DepthCrafterGUI:
             "overlap_source": overlap_source,
             "base_window": int(base_window),
             "base_overlap": int(base_overlap),
+            "selected_backend": selected_backend,
         }
 
     def _refresh_cloud_processing_summary(self):
@@ -4524,7 +4622,7 @@ class DepthCrafterGUI:
             )
         self.cloud_inherited_processing_summary_var.set(
             (
-                f"Main dialog currently: window={settings['base_window']}, overlap={settings['base_overlap']}. "
+                f"Current backend base values: window={settings['base_window']}, overlap={settings['base_overlap']}. "
                 "Advanced cloud overrides replace these only when set."
             )
         )
@@ -4953,6 +5051,7 @@ class DepthCrafterGUI:
 
     def _bind_cloud_processing_summary_traces(self):
         tracked_vars = [
+            self.model_backend_var,
             self.cloud_profile_var,
             self.cloud_target_width_override_var,
             self.cloud_target_height_override_var,
@@ -4961,6 +5060,8 @@ class DepthCrafterGUI:
             self.cloud_require_verified_hosts_var,
             self.window_size,
             self.overlap,
+            self.stereopilot_window_size_var,
+            self.stereopilot_overlap_var,
         ]
         for tk_var in tracked_vars:
             try:
@@ -6529,6 +6630,22 @@ class DepthCrafterGUI:
         progress_emit_interval_sec = 1.0
         progress_updates_seen = 0
         progress_updates_emitted = 0
+        last_progress_emitted_text = ""
+
+        def _looks_like_progress_update(text: str) -> bool:
+            cleaned = text.strip()
+            if not cleaned:
+                return False
+            lower = cleaned.lower()
+            if "to-chk=" in lower or "xfr#" in lower:
+                return True
+            if "it/s" in lower or "s/it" in lower:
+                return True
+            if "%" in cleaned and "|" in cleaned:
+                return True
+            if "%" in cleaned and "/" in cleaned and ("eta" in lower or "<" in cleaned):
+                return True
+            return False
 
         def _emit_line(text: str) -> None:
             cleaned = text.strip()
@@ -6540,14 +6657,18 @@ class DepthCrafterGUI:
         def _emit_progress(text: str, force: bool = False) -> bool:
             nonlocal progress_last_emit_ts
             nonlocal progress_updates_emitted
+            nonlocal last_progress_emitted_text
             cleaned = text.strip()
             if not cleaned:
+                return False
+            if cleaned == last_progress_emitted_text:
                 return False
             now = time.time()
             if not force and (now - progress_last_emit_ts) < progress_emit_interval_sec:
                 return False
             progress_last_emit_ts = now
             progress_updates_emitted += 1
+            last_progress_emitted_text = cleaned
             _emit_line(cleaned)
             return True
 
@@ -6560,9 +6681,13 @@ class DepthCrafterGUI:
                     candidate = line_buffer
                     line_buffer = ""
                     if candidate.strip():
-                        latest_progress_text = candidate
-                        progress_updates_seen += 1
-                        _emit_progress(latest_progress_text, force=False)
+                        if _looks_like_progress_update(candidate):
+                            latest_progress_text = candidate
+                            progress_updates_seen += 1
+                            _emit_progress(latest_progress_text, force=False)
+                        else:
+                            latest_progress_text = ""
+                            _emit_line(candidate)
                     continue
                 if ch == "\n":
                     if line_buffer.strip():
@@ -6868,6 +6993,9 @@ class DepthCrafterGUI:
         model_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
         if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"):
             model_backend = "depthcrafter"
+        if model_backend == "stereopilot":
+            cloud_window_size = max(1, int(self.stereopilot_window_size_var.get()))
+            cloud_overlap = max(0, int(self.stereopilot_overlap_var.get()))
 
         geometry_model_path = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
         remote_root = str(connection_info.get("remote_root", "") or "").strip()
@@ -6889,7 +7017,6 @@ class DepthCrafterGUI:
         stereopilot_target_width = max(32, int(self.stereopilot_target_width_var.get()))
         stereopilot_target_height = max(32, int(self.stereopilot_target_height_var.get()))
         stereopilot_target_fps = max(1.0, float(self.stereopilot_target_fps_var.get()))
-        stereopilot_frame_count = max(1, int(self.stereopilot_frame_count_var.get()))
         stereopilot_sampling_steps = max(1, int(self.stereopilot_sampling_steps_var.get()))
         stereopilot_guide_scale = float(self.stereopilot_guide_scale_var.get())
         stereopilot_shift = float(self.stereopilot_shift_var.get())
@@ -6992,8 +7119,6 @@ class DepthCrafterGUI:
             str(stereopilot_target_height),
             "--stereopilot-target-fps",
             str(stereopilot_target_fps),
-            "--stereopilot-frame-count",
-            str(stereopilot_frame_count),
             "--stereopilot-sampling-steps",
             str(stereopilot_sampling_steps),
             "--stereopilot-guide-scale",
@@ -7072,6 +7197,9 @@ class DepthCrafterGUI:
         model_backend = str(self.model_backend_var.get() or "depthcrafter").strip().lower()
         if model_backend not in ("depthcrafter", "geometrycrafter_diff", "geometrycrafter_determ", "stereopilot"):
             model_backend = "depthcrafter"
+        if model_backend == "stereopilot":
+            cloud_window_size = max(1, int(self.stereopilot_window_size_var.get()))
+            cloud_overlap = max(0, int(self.stereopilot_overlap_var.get()))
 
         geometry_model_path = str(self.geometry_model_path_var.get() or "TencentARC/GeometryCrafter").strip()
         remote_root = str(connection_info.get("remote_root", "") or "").strip()
@@ -7093,7 +7221,6 @@ class DepthCrafterGUI:
         stereopilot_target_width = max(32, int(self.stereopilot_target_width_var.get()))
         stereopilot_target_height = max(32, int(self.stereopilot_target_height_var.get()))
         stereopilot_target_fps = max(1.0, float(self.stereopilot_target_fps_var.get()))
-        stereopilot_frame_count = max(1, int(self.stereopilot_frame_count_var.get()))
         stereopilot_sampling_steps = max(1, int(self.stereopilot_sampling_steps_var.get()))
         stereopilot_guide_scale = float(self.stereopilot_guide_scale_var.get())
         stereopilot_shift = float(self.stereopilot_shift_var.get())
@@ -7192,8 +7319,6 @@ class DepthCrafterGUI:
             str(stereopilot_target_height),
             "--stereopilot-target-fps",
             str(stereopilot_target_fps),
-            "--stereopilot-frame-count",
-            str(stereopilot_frame_count),
             "--stereopilot-sampling-steps",
             str(stereopilot_sampling_steps),
             "--stereopilot-guide-scale",

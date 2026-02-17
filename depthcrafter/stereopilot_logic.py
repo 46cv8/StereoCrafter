@@ -43,7 +43,6 @@ class StereoPilotDemo:
         stereopilot_target_width: int = 832,
         stereopilot_target_height: int = 480,
         stereopilot_target_fps: float = 16.0,
-        stereopilot_frame_count: int = 81,
         stereopilot_sampling_steps: int = 30,
         stereopilot_guide_scale: float = 5.0,
         stereopilot_shift: float = 5.0,
@@ -88,7 +87,6 @@ class StereoPilotDemo:
             minimum=32,
         )
         self.stereopilot_target_fps = max(1.0, float(stereopilot_target_fps))
-        self.stereopilot_frame_count = max(1, int(stereopilot_frame_count))
         self.stereopilot_sampling_steps = max(1, int(stereopilot_sampling_steps))
         self.stereopilot_guide_scale = float(stereopilot_guide_scale)
         self.stereopilot_shift = float(stereopilot_shift)
@@ -557,7 +555,6 @@ class StereoPilotDemo:
                 target_height=int(self.stereopilot_target_height),
                 target_fps_requested=float(self.stereopilot_target_fps),
                 preserve_source_fps=True,
-                frame_count_cap=int(self.stereopilot_frame_count),
                 gui_window_size=int(gui_window_size),
                 gui_overlap=int(gui_overlap),
             )
@@ -583,9 +580,8 @@ class StereoPilotDemo:
             if total_frames <= 0:
                 raise RuntimeError("StereoPilot preprocessing produced no frames.")
 
-            model_window_cap = max(1, int(self.stereopilot_frame_count))
-            gui_window_requested = int(gui_window_size) if int(gui_window_size) > 0 else model_window_cap
-            effective_window = max(1, min(total_frames, model_window_cap, gui_window_requested))
+            gui_window_requested = int(gui_window_size) if int(gui_window_size) > 0 else 81
+            effective_window = max(1, min(total_frames, gui_window_requested))
             effective_overlap = max(0, min(int(gui_overlap), max(0, effective_window - 1)))
             if int(gui_overlap) >= effective_window:
                 _logger.warning(
@@ -865,7 +861,6 @@ class StereoPilotDemo:
                 "stereopilot_window_count": int(len(windows)),
                 "stereopilot_window_size_used": int(effective_window),
                 "stereopilot_overlap_used": int(effective_overlap),
-                "stereopilot_frame_count_cap": int(model_window_cap),
                 "stereopilot_gui_window_size": int(gui_window_size),
                 "stereopilot_gui_overlap": int(gui_overlap),
                 "prompt_source": prompt_source,

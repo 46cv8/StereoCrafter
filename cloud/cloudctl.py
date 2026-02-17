@@ -103,6 +103,22 @@ def run_cmd_stream(
     progress_emit_interval_sec = 1.0
     progress_updates_seen = 0
     progress_updates_emitted = 0
+    last_progress_emitted_text = ""
+
+    def _looks_like_progress_update(text: str) -> bool:
+        cleaned = text.strip()
+        if not cleaned:
+            return False
+        lower = cleaned.lower()
+        if "to-chk=" in lower or "xfr#" in lower:
+            return True
+        if "it/s" in lower or "s/it" in lower:
+            return True
+        if "%" in cleaned and "|" in cleaned:
+            return True
+        if "%" in cleaned and "/" in cleaned and ("eta" in lower or "<" in cleaned):
+            return True
+        return False
 
     def _emit_line(text: str) -> None:
         cleaned = text.strip()
@@ -114,14 +130,18 @@ def run_cmd_stream(
     def _emit_progress(text: str, force: bool = False) -> bool:
         nonlocal progress_last_emit_ts
         nonlocal progress_updates_emitted
+        nonlocal last_progress_emitted_text
         cleaned = text.strip()
         if not cleaned:
+            return False
+        if cleaned == last_progress_emitted_text:
             return False
         now = time.time()
         if not force and (now - progress_last_emit_ts) < progress_emit_interval_sec:
             return False
         progress_last_emit_ts = now
         progress_updates_emitted += 1
+        last_progress_emitted_text = cleaned
         _emit_line(cleaned)
         return True
 
@@ -134,9 +154,13 @@ def run_cmd_stream(
                 candidate = line_buffer
                 line_buffer = ""
                 if candidate.strip():
-                    latest_progress_text = candidate
-                    progress_updates_seen += 1
-                    _emit_progress(latest_progress_text, force=False)
+                    if _looks_like_progress_update(candidate):
+                        latest_progress_text = candidate
+                        progress_updates_seen += 1
+                        _emit_progress(latest_progress_text, force=False)
+                    else:
+                        latest_progress_text = ""
+                        _emit_line(candidate)
                 continue
             if ch == "\n":
                 if line_buffer.strip():
@@ -533,7 +557,7 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stereopilot-target-width", type=int, default=832)
     parser.add_argument("--stereopilot-target-height", type=int, default=480)
     parser.add_argument("--stereopilot-target-fps", type=float, default=16.0)
-    parser.add_argument("--stereopilot-frame-count", type=int, default=81)
+    parser.add_argument("--stereopilot-frame-count", type=int, default=81, help=argparse.SUPPRESS)
     parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
     parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
     parser.add_argument("--stereopilot-shift", type=float, default=5.0)
@@ -810,8 +834,6 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
         str(max(32, int(args.stereopilot_target_height))),
         "--stereopilot-target-fps",
         str(max(1.0, float(args.stereopilot_target_fps))),
-        "--stereopilot-frame-count",
-        str(max(1, int(args.stereopilot_frame_count))),
         "--stereopilot-sampling-steps",
         str(max(1, int(args.stereopilot_sampling_steps))),
         "--stereopilot-guide-scale",
@@ -910,8 +932,6 @@ def _build_remote_batch_session_cmd(args: argparse.Namespace, remote_manifest_pa
         str(max(32, int(args.stereopilot_target_height))),
         "--stereopilot-target-fps",
         str(max(1.0, float(args.stereopilot_target_fps))),
-        "--stereopilot-frame-count",
-        str(max(1, int(args.stereopilot_frame_count))),
         "--stereopilot-sampling-steps",
         str(max(1, int(args.stereopilot_sampling_steps))),
         "--stereopilot-guide-scale",
@@ -1045,8 +1065,6 @@ def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) ->
         str(max(32, int(args.stereopilot_target_height))),
         "--stereopilot-target-fps",
         str(max(1.0, float(args.stereopilot_target_fps))),
-        "--stereopilot-frame-count",
-        str(max(1, int(args.stereopilot_frame_count))),
         "--stereopilot-sampling-steps",
         str(max(1, int(args.stereopilot_sampling_steps))),
         "--stereopilot-guide-scale",

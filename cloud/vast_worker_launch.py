@@ -616,7 +616,6 @@ def build_cloudctl_cmd(
     stereopilot_target_width = max(32, as_int(cfg.get("stereopilot_target_width_var"), 832))
     stereopilot_target_height = max(32, as_int(cfg.get("stereopilot_target_height_var"), 480))
     stereopilot_target_fps = max(1.0, as_float(cfg.get("stereopilot_target_fps_var"), 16.0))
-    stereopilot_frame_count = max(1, as_int(cfg.get("stereopilot_frame_count_var"), 81))
     stereopilot_sampling_steps = max(1, as_int(cfg.get("stereopilot_sampling_steps_var"), 30))
     stereopilot_guide_scale = as_float(cfg.get("stereopilot_guide_scale_var"), 5.0)
     stereopilot_shift = as_float(cfg.get("stereopilot_shift_var"), 5.0)
@@ -673,8 +672,6 @@ def build_cloudctl_cmd(
         str(stereopilot_target_height),
         "--stereopilot-target-fps",
         str(stereopilot_target_fps),
-        "--stereopilot-frame-count",
-        str(stereopilot_frame_count),
         "--stereopilot-sampling-steps",
         str(stereopilot_sampling_steps),
         "--stereopilot-guide-scale",

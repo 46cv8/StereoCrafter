@@ -43,6 +43,7 @@ echo "[setup-stereopilot] Installing required python package(s)..."
   "toml>=0.10.2" \
   "easydict>=1.13" \
   "ftfy>=6.3.1" \
+  "einops>=0.8.0" \
   "safetensors>=0.5.3" \
   "torchvision>=0.24.1" \
   "decord>=0.6.0" \

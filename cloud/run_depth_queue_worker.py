@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stereopilot-target-width", type=int, default=832)
     parser.add_argument("--stereopilot-target-height", type=int, default=480)
     parser.add_argument("--stereopilot-target-fps", type=float, default=16.0)
-    parser.add_argument("--stereopilot-frame-count", type=int, default=81)
+    parser.add_argument("--stereopilot-frame-count", type=int, default=81, help=argparse.SUPPRESS)
     parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
     parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
     parser.add_argument("--stereopilot-shift", type=float, default=5.0)

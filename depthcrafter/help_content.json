@@ -93,8 +93,11 @@
   "stereopilot_target_fps": {
     "text": "Requested StereoPilot FPS hint.\nCurrent behavior preserves source FPS and keeps all frames (no FPS downsampling/drop), then writes output at source FPS."
   },
-  "stereopilot_frame_count": {
-    "text": "Maximum frames per StereoPilot inference window.\nFor long clips, StereoPilot now runs sliding windows and overlap blending.\nUse this as the StereoPilot chunk length cap (81 matches the model's default context)."
+  "stereopilot_window_size": {
+    "text": "StereoPilot sliding window length (frames) used for long videos.\nStereoPilot now uses this as the single temporal window control."
+  },
+  "stereopilot_overlap": {
+    "text": "StereoPilot overlap (frames) between consecutive inference windows.\nHigher overlap can smooth transitions, but increases runtime."
   },
   "stereopilot_sampling_steps": {
     "text": "StereoPilot diffusion sampling steps.\nHigher values can improve quality but increase runtime."
@@ -121,7 +124,7 @@
       "text": "If checked:\n- For 'Full Video' processing: A .json file with processing metadata will be saved alongside the final output depth video/sequence.\n- For 'Process as Segments' mode: \n    - Individual .json files are saved for each raw segment NPZ *during processing* (if this option is on AND keep_intermediate_npz is on, these might be kept, otherwise they are usually deleted after master_meta is created).\n    - A _master_meta.json is always created in the segment subfolder.\n    - If a final merged output is created, a .json sidecar will be saved for that merged output, summarizing settings and pointing to the master_meta.json."
   },
   "window_size": {
-    "text": "This value has a dual role depending on the 'Process as Segments' setting:\n\n- Full Video Mode (Unchecked 'Process as Segments'): Defines the size of the processing window (number of frames) that slides over the video. The model processes the video in these chunks.\n\n- Segment Mode (Checked 'Process as Segments'): Defines the number of output frames in each generated segment NPZ file. This is the target length of each chunk before overlap is considered for processing.\n\nTypically 60-110 frames. Larger values can improve temporal consistency but require more VRAM and processing time per window/segment. Must be larger than 'Overlap'.\n\nStereoPilot note: effective StereoPilot window = min(Window Size, StereoPilot Frame Count)."
+    "text": "This value has a dual role depending on the 'Process as Segments' setting:\n\n- Full Video Mode (Unchecked 'Process as Segments'): Defines the size of the processing window (number of frames) that slides over the video. The model processes the video in these chunks.\n\n- Segment Mode (Checked 'Process as Segments'): Defines the number of output frames in each generated segment NPZ file. This is the target length of each chunk before overlap is considered for processing.\n\nTypically 60-110 frames. Larger values can improve temporal consistency but require more VRAM and processing time per window/segment. Must be larger than 'Overlap'."
   },
   "overlap": {
     "text": "This value also has a dual role:\n\n- Full Video Mode (Unchecked 'Process as Segments'): Number of frames that consecutive processing windows overlap. This helps maintain temporal consistency across window boundaries.\n\n- Segment Mode (Checked 'Process as Segments'): Number of frames that overlap between consecutive segments when they are defined and processed. For example, if Window Size is 100 and Overlap is 20, segment 1 might be frames 0-99, segment 2 might be frames 80-179 internally for processing, leading to an output overlap for smoother merging.\n\nCommon values: 15-30 frames. Should be less than 'Window Size'."
