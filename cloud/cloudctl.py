@@ -1113,6 +1113,53 @@ def _remote_worker_running(cfg: SSHConfig, queue_paths: dict) -> bool:
     return "RUNNING" in text
 
 
+def _list_remote_running_queue_workers(cfg: SSHConfig, args: argparse.Namespace) -> list[dict]:
+    remote_root = args.remote_root.rstrip("/")
+    queues_root = remote_join(remote_root, "cloud_jobs", "queues")
+    proc = ssh_run(
+        cfg,
+        " ; ".join(
+            [
+                f"if [ -d {shlex.quote(queues_root)} ]; then",
+                f"for qdir in {shlex.quote(queues_root)}/*; do",
+                "[ -d \"$qdir\" ] || continue",
+                "pid_file=\"$qdir/worker.pid\"",
+                "[ -f \"$pid_file\" ] || continue",
+                "pid=\"$(cat \"$pid_file\" 2>/dev/null || true)\"",
+                "case \"$pid\" in ''|*[!0-9]*) continue ;; esac",
+                "if kill -0 \"$pid\" 2>/dev/null; then",
+                "printf '%s\\t%s\\n' \"$(basename \"$qdir\")\" \"$pid\"",
+                "fi",
+                "done",
+                "fi",
+            ]
+        ),
+        check=False,
+        capture=True,
+        log_command=False,
+    )
+    workers: list[dict] = []
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        name = parts[0].strip()
+        pid_text = parts[1].strip()
+        if not name:
+            continue
+        try:
+            pid = int(pid_text)
+        except Exception:
+            continue
+        if pid <= 0:
+            continue
+        workers.append({"name": name, "pid": pid})
+    return workers
+
+
 def _ensure_remote_queue_dirs(cfg: SSHConfig, queue_paths: dict) -> None:
     ssh_run(
         cfg,
@@ -1133,6 +1180,20 @@ def _ensure_remote_queue_dirs(cfg: SSHConfig, queue_paths: dict) -> None:
 
 def _start_remote_queue_worker(cfg: SSHConfig, args: argparse.Namespace, queue_paths: dict) -> None:
     _ensure_remote_queue_dirs(cfg, queue_paths)
+    running_workers = _list_remote_running_queue_workers(cfg, args)
+    other_workers = [w for w in running_workers if w.get("name") != queue_paths["name"]]
+    if other_workers:
+        worker_desc = ", ".join(f"{w['name']} (pid {w['pid']})" for w in other_workers)
+        log(f"Stopping existing queue worker(s) before launch: {worker_desc}")
+        for worker in other_workers:
+            prev_paths = _remote_queue_paths(args, str(worker["name"]))
+            _stop_remote_queue_worker(
+                cfg,
+                prev_paths,
+                wait_timeout_sec=30.0,
+                force_kill_on_timeout=True,
+            )
+
     if _remote_worker_running(cfg, queue_paths):
         log(f"Queue worker already running for '{queue_paths['name']}'.")
         return
@@ -1191,6 +1252,7 @@ def _stop_remote_queue_worker(
     queue_paths: dict,
     *,
     wait_timeout_sec: float = 60.0,
+    force_kill_on_timeout: bool = False,
 ) -> None:
     ssh_run(
         cfg,
@@ -1205,6 +1267,29 @@ def _stop_remote_queue_worker(
             return
         time.sleep(0.5)
     log(f"Queue worker stop timeout for '{queue_paths['name']}' (still running).")
+    if not force_kill_on_timeout:
+        return
+    pid_file = queue_paths["worker_pid"]
+    ssh_run(
+        cfg,
+        " && ".join(
+            [
+                f"if [ -f {shlex.quote(pid_file)} ]; then",
+                f"pid=\"$(cat {shlex.quote(pid_file)} 2>/dev/null || true)\"",
+                "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then kill \"$pid\" 2>/dev/null || true; fi",
+                "sleep 1",
+                "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null || true; fi",
+                f"rm -f {shlex.quote(pid_file)}",
+                "fi",
+            ]
+        ),
+        check=False,
+        log_command=False,
+    )
+    if _remote_worker_running(cfg, queue_paths):
+        log(f"Queue worker force-stop failed for '{queue_paths['name']}'.")
+    else:
+        log(f"Queue worker force-stopped for '{queue_paths['name']}'.")
 
 
 def _enqueue_remote_queue_job(cfg: SSHConfig, queue_paths: dict, *, job_id: str, payload: dict) -> str:
