@@ -1770,8 +1770,16 @@ def _run_batch_with_worker_queue(
         f"Queue mode enabled. queue={queue_paths['name']} "
         f"(poll={max(0.25, float(getattr(args, 'queue_poll_sec', 1.0) or 1.0)):.2f}s)"
     )
-    if bool(getattr(args, "prefetch_upload_all", False)) or int(getattr(args, "prefetch_window", 0) or 0) > 0:
-        log("Queue mode: ignoring prefetch flags.")
+    queue_prefetch_window = max(0, int(getattr(args, "prefetch_window", 0) or 0))
+    queue_prefetch_all = bool(getattr(args, "prefetch_upload_all", False))
+    queue_max_inflight = len(plans) if queue_prefetch_all else max(1, queue_prefetch_window + 1)
+    if queue_prefetch_all:
+        log("Queue mode prefetch: upload-all enabled.")
+    else:
+        log(
+            f"Queue mode prefetch: keeping up to {queue_max_inflight} uploaded/enqueued job(s) "
+            f"({max(0, queue_max_inflight - 1)} ahead of active processing)."
+        )
     if bool(getattr(args, "persistent_session", True)):
         log("Queue mode: persistent session chunking is bypassed.")
 
@@ -1790,90 +1798,124 @@ def _run_batch_with_worker_queue(
                 log_command=False,
             )
 
-        for idx, clip, job_name in plans:
-            _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
-            ssh_run(
-                cfg,
-                f"mkdir -p {shlex.quote(remote_job_output_dir)}",
-                check=True,
-                log_command=False,
-            )
-            log(f"[{idx}/{total}] Uploading clip: {clip}")
-            rsync_to_remote(cfg, str(clip), remote_input_path)
-
-            job_id = sanitize_name(f"{idx:05d}_{job_name}")
-            queue_payload = {
-                "job_id": job_id,
-                "job_name": job_name,
-                "input": remote_input_path,
-                "output_dir": remote_job_output_dir,
-                "status_json": remote_join(remote_job_output_dir, "job_status.json"),
-            }
-            _enqueue_remote_queue_job(cfg, queue_paths, job_id=job_id, payload=queue_payload)
-            enqueued.append(
-                {
-                    "idx": idx,
-                    "clip": clip,
-                    "job_name": job_name,
-                    "job_id": job_id,
-                    "remote_input_path": remote_input_path,
-                    "remote_job_output_dir": remote_job_output_dir,
-                }
-            )
-            log(f"[{idx}/{total}] Enqueued job: {job_name} ({job_id})")
-
         poll_sec = max(0.25, float(getattr(args, "queue_poll_sec", 1.0) or 1.0))
-        for item in enqueued:
+        next_plan_idx = 0
+        stop_after_current = False
+        pending_fifo: list[dict] = []
+
+        while (next_plan_idx < total and not stop_after_current) or pending_fifo:
+            while (
+                next_plan_idx < total
+                and not stop_after_current
+                and (queue_prefetch_all or len(pending_fifo) < queue_max_inflight)
+            ):
+                idx, clip, job_name = plans[next_plan_idx]
+                next_plan_idx += 1
+                _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
+                try:
+                    ssh_run(
+                        cfg,
+                        f"mkdir -p {shlex.quote(remote_job_output_dir)}",
+                        check=True,
+                        log_command=False,
+                    )
+                    log(f"[{idx}/{total}] Uploading clip: {clip}")
+                    rsync_to_remote(cfg, str(clip), remote_input_path)
+
+                    job_id = sanitize_name(f"{idx:05d}_{job_name}")
+                    queue_payload = {
+                        "job_id": job_id,
+                        "job_name": job_name,
+                        "input": remote_input_path,
+                        "output_dir": remote_job_output_dir,
+                        "status_json": remote_join(remote_job_output_dir, "job_status.json"),
+                    }
+                    _enqueue_remote_queue_job(cfg, queue_paths, job_id=job_id, payload=queue_payload)
+                    item = {
+                        "idx": idx,
+                        "clip": clip,
+                        "job_name": job_name,
+                        "job_id": job_id,
+                        "remote_input_path": remote_input_path,
+                        "remote_job_output_dir": remote_job_output_dir,
+                    }
+                    enqueued.append(item)
+                    pending_fifo.append(item)
+                    log(f"[{idx}/{total}] Enqueued job: {job_name} ({job_id})")
+                except Exception as exc:  # pylint: disable=broad-except
+                    msg = f"Batch item failed for {clip.name}: enqueue/upload error: {exc}"
+                    log(msg)
+                    failed.append(msg)
+                    if not bool(getattr(args, "continue_on_error", False)):
+                        stop_after_current = True
+                        break
+
+            if not pending_fifo:
+                continue
+
+            item = pending_fifo.pop(0)
             idx = int(item["idx"])
             clip = item["clip"]
             job_name = str(item["job_name"])
             job_id = str(item["job_id"])
             remote_input_path = str(item["remote_input_path"])
             remote_job_output_dir = str(item["remote_job_output_dir"])
+            remote_result_path = ""
 
-            result_kind, remote_result_path = _wait_for_remote_queue_job_result(
-                cfg,
-                queue_paths,
-                job_id=job_id,
-                poll_sec=poll_sec,
-            )
-            result_payload = _read_remote_json(cfg, remote_result_path)
-            if result_kind == "failed":
-                status_message = ""
-                if isinstance(result_payload, dict):
-                    status_message = str(result_payload.get("status_message", "")).strip()
-                msg = f"Batch item failed for {clip.name}: {status_message or 'queue worker reported failure'}"
-                log(msg)
-                failed.append(msg)
-                if not bool(getattr(args, "continue_on_error", False)):
-                    break
-
-            status_payload = _download_job_outputs_and_log_stats(
-                cfg,
-                args,
-                job_name=job_name,
-                remote_job_output_dir=remote_job_output_dir,
-                log_prefix=f"[{idx}/{total}] ",
-            )
-
-            if isinstance(status_payload, dict):
-                status_value = str(status_payload.get("status", "")).strip().lower()
-                if status_value != "success":
-                    msg = f"Batch item failed for {clip.name}: status={status_value or 'unknown'}"
+            try:
+                result_kind, remote_result_path = _wait_for_remote_queue_job_result(
+                    cfg,
+                    queue_paths,
+                    job_id=job_id,
+                    poll_sec=poll_sec,
+                )
+                result_payload = _read_remote_json(cfg, remote_result_path)
+                if result_kind == "failed":
+                    status_message = ""
+                    if isinstance(result_payload, dict):
+                        status_message = str(result_payload.get("status_message", "")).strip()
+                    msg = f"Batch item failed for {clip.name}: {status_message or 'queue worker reported failure'}"
                     log(msg)
                     failed.append(msg)
                     if not bool(getattr(args, "continue_on_error", False)):
-                        break
+                        stop_after_current = True
 
-            _cleanup_remote_job_artifacts(
-                cfg,
-                args,
-                remote_input_path=remote_input_path,
-                remote_job_output_dir=remote_job_output_dir,
-            )
-            ssh_run(cfg, f"rm -f {shlex.quote(remote_result_path)}", check=False, log_command=False)
+                status_payload = _download_job_outputs_and_log_stats(
+                    cfg,
+                    args,
+                    job_name=job_name,
+                    remote_job_output_dir=remote_job_output_dir,
+                    log_prefix=f"[{idx}/{total}] ",
+                )
 
-            log(f"[{idx}/{total}] Job complete: {job_name}")
+                if isinstance(status_payload, dict):
+                    status_value = str(status_payload.get("status", "")).strip().lower()
+                    if status_value != "success":
+                        msg = f"Batch item failed for {clip.name}: status={status_value or 'unknown'}"
+                        log(msg)
+                        failed.append(msg)
+                        if not bool(getattr(args, "continue_on_error", False)):
+                            stop_after_current = True
+
+                log(f"[{idx}/{total}] Job complete: {job_name}")
+            except Exception as exc:  # pylint: disable=broad-except
+                msg = f"Batch item failed for {clip.name}: {exc}"
+                log(msg)
+                failed.append(msg)
+                if not bool(getattr(args, "continue_on_error", False)):
+                    stop_after_current = True
+            finally:
+                _cleanup_remote_job_artifacts(
+                    cfg,
+                    args,
+                    remote_input_path=remote_input_path,
+                    remote_job_output_dir=remote_job_output_dir,
+                )
+                if remote_result_path:
+                    ssh_run(cfg, f"rm -f {shlex.quote(remote_result_path)}", check=False, log_command=False)
+
+            if stop_after_current and not bool(getattr(args, "continue_on_error", False)):
+                break
 
     finally:
         if not bool(getattr(args, "keep_queue_worker", False)):
@@ -2373,7 +2415,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument(
         "--prefetch-window",
         type=int,
-        default=0,
+        default=3,
         help="Pipeline staging depth: number of additional clips to keep uploaded ahead of current inference.",
     )
     p_batch.add_argument(

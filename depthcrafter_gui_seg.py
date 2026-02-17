@@ -7332,7 +7332,7 @@ class DepthCrafterGUI:
             "--stereopilot-transformer-dtype",
             stereopilot_transformer_dtype,
             "--prefetch-window",
-            "2",
+            "3",
         ]
 
         identity_file = self.cloud_identity_file_var.get().strip()
