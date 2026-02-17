@@ -43,6 +43,13 @@ class SSHConfig:
     ssh_options: List[str]
 
 
+@dataclasses.dataclass
+class RemoteLogTailer:
+    process: subprocess.Popen
+    thread: threading.Thread
+    stop_event: threading.Event
+
+
 class CloudCtlError(RuntimeError):
     pass
 
@@ -247,6 +254,74 @@ def ssh_run_stream(
         line_prefix=line_prefix,
         heartbeat_sec=heartbeat_sec,
     )
+
+
+def _start_remote_log_tailer(
+    cfg: SSHConfig,
+    remote_log_path: str,
+    *,
+    line_prefix: str = "",
+    log_command: bool = True,
+) -> RemoteLogTailer:
+    remote_script = f"touch {shlex.quote(remote_log_path)} && tail -n 0 -F {shlex.quote(remote_log_path)}"
+    wrapped = f"bash -lc {shlex.quote(remote_script)}"
+    cmd = ssh_base_args(cfg) + [wrapped]
+    if log_command:
+        log("$ " + " ".join(shlex.quote(c) for c in cmd))
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    stop_event = threading.Event()
+
+    def _reader() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for raw in stream:
+                if stop_event.is_set():
+                    break
+                text = raw.rstrip("\r\n")
+                if text:
+                    log(f"{line_prefix}{text}" if line_prefix else text)
+        except Exception as exc:  # pylint: disable=broad-except
+            if not stop_event.is_set():
+                log(f"{line_prefix}[tail-warning] {exc}" if line_prefix else f"[tail-warning] {exc}")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+    return RemoteLogTailer(process=proc, thread=thread, stop_event=stop_event)
+
+
+def _stop_remote_log_tailer(tailer: RemoteLogTailer | None) -> None:
+    if tailer is None:
+        return
+    tailer.stop_event.set()
+    proc = tailer.process
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=2.0)
+    except Exception:
+        pass
+    try:
+        tailer.thread.join(timeout=2.0)
+    except Exception:
+        pass
 
 
 def rsync_to_remote(
@@ -1506,7 +1581,16 @@ def _run_batch_with_worker_queue(
     failed: list[str] = []
     total = len(plans)
     enqueued: list[dict] = []
+    log_tailer: RemoteLogTailer | None = None
     try:
+        if bool(getattr(args, "queue_stream_logs", True)):
+            log_tailer = _start_remote_log_tailer(
+                cfg,
+                queue_paths["worker_log"],
+                line_prefix="[queue][remote] ",
+                log_command=False,
+            )
+
         for idx, clip, job_name in plans:
             _, _, remote_job_output_dir, remote_input_path = _remote_job_paths(args, job_name, clip.suffix)
             ssh_run(
@@ -1597,6 +1681,7 @@ def _run_batch_with_worker_queue(
             _stop_remote_queue_worker(cfg, queue_paths, wait_timeout_sec=60.0)
         else:
             log(f"Leaving queue worker running for '{queue_paths['name']}'.")
+        _stop_remote_log_tailer(log_tailer)
 
     if failed:
         for item in failed:
@@ -2056,6 +2141,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not stop the remote queue worker when this job finishes.",
     )
+    p_job.add_argument(
+        "--queue-stream-logs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream remote queue worker log lines in real time.",
+    )
     p_job.add_argument("--download-dir", default="./cloud_downloads")
     p_job.add_argument(
         "--download-into-job-subdir",
@@ -2112,6 +2203,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-queue-worker",
         action="store_true",
         help="Do not stop the remote queue worker when batch finishes.",
+    )
+    p_batch.add_argument(
+        "--queue-stream-logs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream remote queue worker log lines in real time.",
     )
     p_batch.add_argument(
         "--persistent-session",
