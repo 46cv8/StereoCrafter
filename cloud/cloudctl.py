@@ -881,10 +881,13 @@ def _remote_queue_paths(args: argparse.Namespace, queue_name: str) -> dict:
 
 
 def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) -> str:
+    remote_root = args.remote_root.rstrip("/")
+    venv_python = remote_join(remote_root, args.venv_name, "bin", "python")
+    worker_script = remote_join(remote_root, "cloud", "run_depth_queue_worker.py")
     runner_args = [
-        "python",
+        venv_python,
         "-u",
-        "cloud/run_depth_queue_worker.py",
+        worker_script,
         "--queue-dir",
         queue_root,
         "--poll-interval-sec",
@@ -941,13 +944,7 @@ def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) ->
     runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
     runner_args.append("--geometry-use-extract-interp" if bool(args.geometry_use_extract_interp) else "--no-geometry-use-extract-interp")
 
-    quoted_runner = " ".join(shlex.quote(x) for x in runner_args)
-    remote_root = args.remote_root.rstrip("/")
-    return (
-        f"cd {shlex.quote(remote_root)}"
-        f" && source {shlex.quote(remote_join(remote_root, args.venv_name, 'bin', 'activate'))}"
-        f" && {quoted_runner}"
-    )
+    return " ".join(shlex.quote(x) for x in runner_args)
 
 
 def _remote_worker_running(cfg: SSHConfig, queue_paths: dict) -> bool:
@@ -992,7 +989,15 @@ def _start_remote_queue_worker(cfg: SSHConfig, args: argparse.Namespace, queue_p
         [
             f"rm -f {shlex.quote(queue_paths['stop_file'])}",
             f"rm -f {shlex.quote(queue_paths['worker_state'])}",
-            f"nohup bash -lc {shlex.quote(remote_cmd)} > {shlex.quote(queue_paths['worker_log'])} 2>&1 < /dev/null & echo $! > {shlex.quote(queue_paths['worker_pid'])}",
+            f"rm -f {shlex.quote(queue_paths['worker_pid'])}",
+            f"cd {shlex.quote(args.remote_root.rstrip('/'))}",
+            (
+                "{ "
+                f"nohup {remote_cmd} > {shlex.quote(queue_paths['worker_log'])} 2>&1 < /dev/null & "
+                f"echo $! > {shlex.quote(queue_paths['worker_pid'])}; "
+                "disown $! >/dev/null 2>&1 || true; "
+                "}"
+            ),
         ]
     )
     ssh_run(cfg, launch_script)
