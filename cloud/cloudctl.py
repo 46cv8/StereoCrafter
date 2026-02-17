@@ -935,7 +935,7 @@ def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) ->
         runner_args.append("--local-files-only")
     if bool(args.geometry_low_memory_usage):
         runner_args.append("--geometry-low-memory-usage")
-    if bool(args.continue_on_error):
+    if bool(getattr(args, "continue_on_error", False)):
         runner_args.append("--continue-on-error")
     runner_args.append("--geometry-force-projection" if bool(args.geometry_force_projection) else "--no-geometry-force-projection")
     runner_args.append("--geometry-force-fixed-focal" if bool(args.geometry_force_fixed_focal) else "--no-geometry-force-fixed-focal")
@@ -998,11 +998,33 @@ def _start_remote_queue_worker(cfg: SSHConfig, args: argparse.Namespace, queue_p
     ssh_run(cfg, launch_script)
 
     poll_deadline = time.time() + 60.0
+    next_wait_log = time.time() + 5.0
     while time.time() < poll_deadline:
         if _remote_worker_running(cfg, queue_paths):
             log(f"Queue worker started for '{queue_paths['name']}'.")
             return
+        now = time.time()
+        if now >= next_wait_log:
+            elapsed = max(0.0, 60.0 - (poll_deadline - now))
+            log(
+                f"Waiting for queue worker startup '{queue_paths['name']}' "
+                f"(elapsed {elapsed:.0f}s/60s)..."
+            )
+            next_wait_log = now + 5.0
         time.sleep(0.5)
+    log_tail_proc = ssh_run(
+        cfg,
+        f"tail -n 80 {shlex.quote(queue_paths['worker_log'])}",
+        check=False,
+        capture=True,
+        log_command=False,
+    )
+    log_tail_text = (log_tail_proc.stdout or "").strip()
+    if log_tail_text:
+        for line in log_tail_text.splitlines()[-80:]:
+            text = line.strip()
+            if text:
+                log(f"[queue-start][remote] {text}")
     raise CloudCtlError(f"Queue worker failed to start for '{queue_paths['name']}'.")
 
 
