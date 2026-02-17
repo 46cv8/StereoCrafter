@@ -31,11 +31,13 @@ from urllib.request import urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from envfile_to_vast_env import build_vast_env_arg, parse_env_file  # noqa: E402
+import cloud_core  # noqa: E402
+
+DEFAULT_VAST_API_BASE_URL = cloud_core.DEFAULT_VAST_API_BASE_URL
 
 
 class VastWorkerLaunchError(RuntimeError):
@@ -89,20 +91,7 @@ def require_tool(name: str) -> None:
 
 
 def parse_json_like(raw_text: str) -> Any:
-    text = (raw_text or "").strip()
-    if not text:
-        return None
-    candidates = [text]
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if lines and lines[-1] != text:
-        candidates.append(lines[-1])
-    for payload in candidates:
-        for parser in (json.loads, ast.literal_eval):
-            try:
-                return parser(payload)
-            except Exception:
-                continue
-    return None
+    return cloud_core.parse_json_like(raw_text)
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -138,39 +127,19 @@ class GPUProfile:
 
 
 PROFILES: Dict[str, GPUProfile] = {
-    "5090_32gb": GPUProfile(
-        key="5090_32gb",
-        label="RTX 5090 32GB",
-        offer_gpu_filter="gpu_name=RTX_5090",
-        min_gpu_ram_gb=30.0,
-        target_width=1664,
-        target_height=896,
-        window_size=75,
-        overlap=25,
-    ),
-    "rtx_pro_6000_96gb": GPUProfile(
-        key="rtx_pro_6000_96gb",
-        label="RTX PRO 6000 96GB",
-        offer_gpu_filter="gpu_name in [RTX_PRO_6000_WS,RTX_PRO_6000_S]",
-        min_gpu_ram_gb=92.0,
-        target_width=1920,
-        target_height=1040,
-        window_size=75,
-        overlap=25,
-    ),
-    "nvidia_48gb_single": GPUProfile(
-        key="nvidia_48gb_single",
-        label="Any NVIDIA 48GB+ (Input Res)",
-        # Empty filter intentionally means broad search; CUDA/VRAM guards do the narrowing.
-        offer_gpu_filter="",
-        min_gpu_ram_gb=48.0,
-        target_width=1920,
-        target_height=1040,
-        window_size=75,
-        overlap=25,
-    ),
+    key: GPUProfile(
+        key=key,
+        label=str(defaults.get("label", key)),
+        offer_gpu_filter=str(defaults.get("offer_gpu_filter", "")),
+        min_gpu_ram_gb=float(defaults.get("min_gpu_ram_gb", 0.0)),
+        target_width=int(defaults.get("target_width", 1920)),
+        target_height=int(defaults.get("target_height", 1040)),
+        window_size=int(defaults.get("window_size", 75)),
+        overlap=int(defaults.get("overlap", 25)),
+    )
+    for key, defaults in cloud_core.CLOUD_PROFILE_DEFAULTS.items()
 }
-GPU_RAM_TOLERANCE_GB = 0.25
+GPU_RAM_TOLERANCE_GB = cloud_core.GPU_RAM_TOLERANCE_GB
 
 
 def resolve_api_key(args: argparse.Namespace) -> str:
@@ -278,24 +247,18 @@ def with_api_key(cmd: List[str], api_key: str) -> List[str]:
 
 def build_search_query(profile: GPUProfile, args: argparse.Namespace) -> str:
     require_verified = not bool(getattr(args, "allow_unverified", False))
-    parts = [
-        "rentable=true",
-        "num_gpus=1",
-        f"gpu_ram>={max(0.0, float(profile.min_gpu_ram_gb)):.1f}",
-        f"cuda_vers>={args.min_cuda}",
-        f"reliability>={args.min_reliability}",
-        f"disk_space>={args.disk}",
-        f"direct_port_count>={args.min_direct_ports}",
-        f"inet_down>={args.min_inet_down}",
-        f"inet_up>={args.min_inet_up}",
-    ]
-    if profile.offer_gpu_filter.strip():
-        parts.insert(0, profile.offer_gpu_filter.strip())
-    if require_verified:
-        parts.append("verified=true")
-    if args.max_dph > 0:
-        parts.append(f"dph<={args.max_dph}")
-    return " ".join(parts)
+    profile_defaults = cloud_core.get_cloud_profile_defaults(profile.key)
+    return cloud_core.build_offer_search_query(
+        profile_defaults,
+        disk_gb=int(args.disk),
+        require_verified_hosts=require_verified,
+        max_dph=float(args.max_dph),
+        min_cuda=float(args.min_cuda),
+        min_reliability=float(args.min_reliability),
+        min_direct_ports=int(args.min_direct_ports),
+        min_inet_down=float(args.min_inet_down),
+        min_inet_up=float(args.min_inet_up),
+    )
 
 
 def run_offer_search(query: str, args: argparse.Namespace, api_key: str) -> List[Dict[str, Any]]:
@@ -325,95 +288,42 @@ def run_offer_search(query: str, args: argparse.Namespace, api_key: str) -> List
 
 
 def normalize_blacklist_payload(payload: Any) -> Dict[str, set]:
-    normalized = {
-        "blocked_offer_ids": set(),
-        "blocked_machine_ids": set(),
-        "blocked_host_ids": set(),
-    }
-    if not isinstance(payload, dict):
-        return normalized
-
-    key_aliases = {
-        "blocked_offer_ids": ("blocked_offer_ids", "offer_ids"),
-        "blocked_machine_ids": ("blocked_machine_ids", "machine_ids"),
-        "blocked_host_ids": ("blocked_host_ids", "host_ids"),
-    }
-    for out_key, aliases in key_aliases.items():
-        for key in aliases:
-            values = payload.get(key)
-            if isinstance(values, list):
-                for value in values:
-                    value_int = as_int(value, 0)
-                    if value_int > 0:
-                        normalized[out_key].add(value_int)
-    return normalized
+    return cloud_core.normalize_blacklist_data(payload if isinstance(payload, dict) else None)
 
 
 def load_blacklist_file(path_value: str) -> Dict[str, set]:
-    path = Path(path_value).expanduser().resolve()
-    if not path.exists():
-        return normalize_blacklist_payload(None)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log(f"Warning: failed to parse blacklist file {path}: {exc}")
-        return normalize_blacklist_payload(None)
-    return normalize_blacklist_payload(raw)
+    return cloud_core.load_blacklist_data(path_value)
 
 
 def offer_is_blacklisted(offer: Dict[str, Any], blacklist: Dict[str, set]) -> bool:
-    offer_id = as_int(offer.get("id"), 0)
-    machine_id = as_int(offer.get("machine_id"), 0)
-    host_id = as_int(offer.get("host_id"), 0)
-    return (
-        (offer_id > 0 and offer_id in blacklist.get("blocked_offer_ids", set()))
-        or (machine_id > 0 and machine_id in blacklist.get("blocked_machine_ids", set()))
-        or (host_id > 0 and host_id in blacklist.get("blocked_host_ids", set()))
-    )
+    return cloud_core.offer_is_blacklisted(offer, blacklist)
 
 
 def normalized_gpu_ram_gb(offer: Dict[str, Any]) -> float:
-    raw = as_float(offer.get("gpu_ram"), 0.0)
-    if raw <= 0:
-        return 0.0
-    # Vast responses often expose gpu_ram in MB-like units (e.g. 32607).
-    # Guard for either representation.
-    return raw / 1024.0 if raw > 1000.0 else raw
+    return cloud_core.normalized_gpu_ram_gb(offer)
 
 
 def offer_hourly_cost(offer: Dict[str, Any]) -> float:
-    for key in ("dph_total", "discounted_dph_total", "dph"):
-        if key in offer:
-            return as_float(offer.get(key), 0.0)
-    return 0.0
+    return cloud_core.offer_hourly_cost(offer)
 
 
 def offer_cost_per_tb(offer: Dict[str, Any], direction: str) -> float:
-    if direction == "up":
-        if "internet_up_cost_per_tb" in offer:
-            return as_float(offer.get("internet_up_cost_per_tb"), 0.0)
-        return as_float(offer.get("inet_up_cost"), 0.0) * 1024.0
-    if "internet_down_cost_per_tb" in offer:
-        return as_float(offer.get("internet_down_cost_per_tb"), 0.0)
-    return as_float(offer.get("inet_down_cost"), 0.0) * 1024.0
+    return cloud_core.offer_cost_per_tb(offer, direction)
 
 
 def annotate_offer(offer: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    hourly = offer_hourly_cost(offer)
-    up_cost_tb = offer_cost_per_tb(offer, "up")
-    down_cost_tb = offer_cost_per_tb(offer, "down")
-    transfer_cost = (
-        (args.expected_upload_gb / 1024.0) * up_cost_tb
-        + (args.expected_download_gb / 1024.0) * down_cost_tb
+    cost_data = cloud_core.estimate_offer_total_cost(
+        offer,
+        expected_runtime_hours=float(args.expected_runtime_hours),
+        expected_upload_gb=float(args.expected_upload_gb),
+        expected_download_gb=float(args.expected_download_gb),
     )
-    runtime_cost = hourly * args.expected_runtime_hours
-    total_est = runtime_cost + transfer_cost
 
     enriched = dict(offer)
-    enriched["_hourly_cost"] = hourly
-    enriched["_transfer_cost_est"] = transfer_cost
-    enriched["_runtime_cost_est"] = runtime_cost
-    enriched["_total_cost_est"] = total_est
+    enriched["_hourly_cost"] = float(cost_data["hourly"])
+    enriched["_transfer_cost_est"] = float(cost_data["transfer_cost"])
+    enriched["_runtime_cost_est"] = float(cost_data["runtime_cost"])
+    enriched["_total_cost_est"] = float(cost_data["total_cost"])
     return enriched
 
 
@@ -700,61 +610,15 @@ def resolve_vast_api_base_url() -> str:
 
 
 def extract_instance_row_from_payload(payload: Any, instance_id: int) -> Optional[Dict[str, Any]]:
-    target_id = int(instance_id)
-    rows: List[Dict[str, Any]] = []
-    if isinstance(payload, list):
-        rows = [row for row in payload if isinstance(row, dict)]
-    elif isinstance(payload, dict):
-        maybe_rows = payload.get("instances")
-        if isinstance(maybe_rows, list):
-            rows = [row for row in maybe_rows if isinstance(row, dict)]
-        elif isinstance(maybe_rows, dict):
-            rows = [maybe_rows]
-        else:
-            rows = [payload]
-
-    for row in rows:
-        row_id = as_int(row.get("id"), -1)
-        if row_id == target_id:
-            return row
-    return None
+    return cloud_core.extract_instance_row_from_payload(payload, instance_id)
 
 
 def extract_instance_status_from_row(row: Dict[str, Any]) -> str:
-    for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
-        value = str(row.get(key, "")).strip()
-        if value:
-            return value
-    return ""
+    return cloud_core.extract_instance_status_from_row(row)
 
 
 def extract_ssh_from_instance_row(row: Dict[str, Any]) -> Tuple[str, int]:
-    host = str(row.get("ssh_host", "") or "").strip()
-    port = as_int(row.get("ssh_port"), 0)
-
-    ports_data = row.get("ports", {})
-    used_22_map = False
-    if isinstance(ports_data, dict):
-        port_22_entries = ports_data.get("22/tcp")
-        if isinstance(port_22_entries, list) and port_22_entries:
-            first = port_22_entries[0]
-            if isinstance(first, dict):
-                mapped_port = as_int(first.get("HostPort"), 0)
-                if mapped_port > 0:
-                    public_host = str(row.get("public_ipaddr", "") or "").strip()
-                    if public_host:
-                        host = public_host
-                    port = mapped_port
-                    used_22_map = True
-
-    if not used_22_map and port > 0:
-        runtype = str(row.get("image_runtype", "") or "").lower()
-        if "jupyter" in runtype:
-            port += 1
-
-    if host and port > 0:
-        return host, port
-    return "", 0
+    return cloud_core.extract_ssh_from_instance_row(row)
 
 
 def fetch_instance_row_http(instance_id: int, api_key: str) -> Optional[Dict[str, Any]]:

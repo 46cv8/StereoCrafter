@@ -89,6 +89,10 @@ try:
     from cloud.envfile_to_vast_env import parse_env_file as _parse_cloud_env_file
 except Exception:
     _parse_cloud_env_file = None
+try:
+    from cloud import cloud_core
+except Exception:
+    cloud_core = None
 # --- Imports End ---
 
 GUI_VERSION = "25-11-01.0"
@@ -168,42 +172,46 @@ class DepthCrafterGUI:
     LAST_SETTINGS_DIR_CONFIG_KEY = "last_settings_dir"
     VIDEO_EXTENSIONS = ["*.mp4", "*.avi", "*.mov", "*.mkv", "*.webm", "*.flv", "*.gif"]
     IMAGE_EXTENSIONS = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.exr"]
-    DEFAULT_VAST_API_BASE_URL = "https://console.vast.ai"
+    DEFAULT_VAST_API_BASE_URL = cloud_core.DEFAULT_VAST_API_BASE_URL if cloud_core is not None else "https://console.vast.ai"
     CLOUD_BLACKLIST_PATH = os.path.join("cloud", "cloud_blacklist.json")
     CLOUD_PROVIDER_HISTORY_PATH = os.path.join("cloud", "cloud_provider_history.json")
-    CLOUD_GPU_RAM_TOLERANCE_GB = 0.25
-    CLOUD_PROFILE_DEFAULTS = {
-        "5090_32gb": {
-            "label": "RTX 5090 32GB",
-            "offer_gpu_filter": "gpu_name=RTX_5090",
-            "min_gpu_ram_gb": 30.0,
-            "target_width": 1664,
-            "target_height": 896,
-            "window_size": 75,
-            "overlap": 25,
-        },
-        "rtx_pro_6000_96gb": {
-            "label": "RTX PRO 6000 96GB",
-            "offer_gpu_filter": "gpu_name in [RTX_PRO_6000_WS,RTX_PRO_6000_S]",
-            "min_gpu_ram_gb": 92.0,
-            "target_width": 1920,
-            "target_height": 1040,
-            "window_size": 75,
-            "overlap": 25,
-        },
-        "nvidia_48gb_single": {
-            "label": "Any NVIDIA 48GB+ (Input Res)",
-            # Empty filter means "all offers", then CUDA/VRAM guards select NVIDIA-capable cards.
-            "offer_gpu_filter": "",
-            "min_gpu_ram_gb": 48.0,
-            "target_width": 1920,
-            "target_height": 1040,
-            "window_size": 75,
-            "overlap": 25,
-            # When no explicit cloud override is set, use each source clip's native resolution.
-            "use_source_resolution": True,
-        },
-    }
+    CLOUD_GPU_RAM_TOLERANCE_GB = cloud_core.GPU_RAM_TOLERANCE_GB if cloud_core is not None else 0.25
+    CLOUD_PROFILE_DEFAULTS = (
+        cloud_core.CLOUD_PROFILE_DEFAULTS
+        if cloud_core is not None
+        else {
+            "5090_32gb": {
+                "label": "RTX 5090 32GB",
+                "offer_gpu_filter": "gpu_name=RTX_5090",
+                "min_gpu_ram_gb": 30.0,
+                "target_width": 1664,
+                "target_height": 896,
+                "window_size": 75,
+                "overlap": 25,
+                "use_source_resolution": False,
+            },
+            "rtx_pro_6000_96gb": {
+                "label": "RTX PRO 6000 96GB",
+                "offer_gpu_filter": "gpu_name in [RTX_PRO_6000_WS,RTX_PRO_6000_S]",
+                "min_gpu_ram_gb": 92.0,
+                "target_width": 1920,
+                "target_height": 1040,
+                "window_size": 75,
+                "overlap": 25,
+                "use_source_resolution": False,
+            },
+            "nvidia_48gb_single": {
+                "label": "Any NVIDIA 48GB+ (Input Res)",
+                "offer_gpu_filter": "",
+                "min_gpu_ram_gb": 48.0,
+                "target_width": 1920,
+                "target_height": 1040,
+                "window_size": 75,
+                "overlap": 25,
+                "use_source_resolution": True,
+            },
+        }
+    )
 
     def __init__(self, root):
         self.root = root
@@ -3577,11 +3585,15 @@ class DepthCrafterGUI:
 
     def _get_cloud_profile_defaults(self, profile_key: Optional[str] = None) -> Dict[str, object]:
         key = (profile_key or self.cloud_profile_var.get().strip() or "5090_32gb").strip()
+        if cloud_core is not None:
+            return cloud_core.get_cloud_profile_defaults(key)
         defaults = self.CLOUD_PROFILE_DEFAULTS.get(key)
         if defaults is None:
             key = "5090_32gb"
             defaults = self.CLOUD_PROFILE_DEFAULTS[key]
-        return {"key": key, **defaults}
+        out = {"key": key, **defaults}
+        out.setdefault("use_source_resolution", False)
+        return out
 
     def _get_effective_cloud_processing_settings(self) -> Dict[str, object]:
         profile_defaults = self._get_cloud_profile_defaults()
@@ -3692,6 +3704,8 @@ class DepthCrafterGUI:
         return os.path.normpath(os.path.join(repo_root, self.CLOUD_PROVIDER_HISTORY_PATH))
 
     def _normalize_cloud_blacklist_data(self, raw_data: Optional[Dict[str, Any]]) -> Dict[str, set]:
+        if cloud_core is not None:
+            return cloud_core.normalize_blacklist_data(raw_data)
         normalized = {
             "blocked_offer_ids": set(),
             "blocked_machine_ids": set(),
@@ -3699,7 +3713,6 @@ class DepthCrafterGUI:
         }
         if not isinstance(raw_data, dict):
             return normalized
-
         key_aliases = {
             "blocked_offer_ids": ("blocked_offer_ids", "offer_ids"),
             "blocked_machine_ids": ("blocked_machine_ids", "machine_ids"),
@@ -3720,6 +3733,8 @@ class DepthCrafterGUI:
 
     def _load_cloud_blacklist_data(self) -> Dict[str, set]:
         blacklist_path = self._resolve_cloud_blacklist_path()
+        if cloud_core is not None:
+            return cloud_core.load_blacklist_data(blacklist_path)
         if not os.path.isfile(blacklist_path):
             return self._normalize_cloud_blacklist_data(None)
         try:
@@ -3732,6 +3747,13 @@ class DepthCrafterGUI:
 
     def _save_cloud_blacklist_data(self, blacklist_data: Dict[str, set]):
         blacklist_path = self._resolve_cloud_blacklist_path()
+        if cloud_core is not None:
+            cloud_core.save_blacklist_data(
+                blacklist_path,
+                blacklist_data,
+                updated_by="depthcrafter_gui_seg.py",
+            )
+            return
         os.makedirs(os.path.dirname(blacklist_path), exist_ok=True)
         serializable = {
             "blocked_offer_ids": sorted(int(x) for x in blacklist_data.get("blocked_offer_ids", set()) if int(x) > 0),
@@ -3753,6 +3775,9 @@ class DepthCrafterGUI:
         )
 
     def _normalize_cloud_provider_history_data(self, raw_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if cloud_core is not None:
+            return cloud_core.normalize_provider_history_data(raw_data)
+
         def _normalize_count_map(value: Any) -> Dict[str, int]:
             normalized_map: Dict[str, int] = {}
             if not isinstance(value, dict):
@@ -3792,6 +3817,8 @@ class DepthCrafterGUI:
 
     def _load_cloud_provider_history_data(self) -> Dict[str, Any]:
         history_path = self._resolve_cloud_provider_history_path()
+        if cloud_core is not None:
+            return cloud_core.load_provider_history_data(history_path)
         if not os.path.isfile(history_path):
             return self._normalize_cloud_provider_history_data(None)
         try:
@@ -3804,6 +3831,13 @@ class DepthCrafterGUI:
 
     def _save_cloud_provider_history_data(self, history_data: Dict[str, Any]):
         history_path = self._resolve_cloud_provider_history_path()
+        if cloud_core is not None:
+            cloud_core.save_provider_history_data(
+                history_path,
+                history_data,
+                updated_by="depthcrafter_gui_seg.py",
+            )
+            return
         os.makedirs(os.path.dirname(history_path), exist_ok=True)
 
         def _sort_map(source: Dict[str, Any]) -> Dict[str, int]:
@@ -3840,6 +3874,13 @@ class DepthCrafterGUI:
         host_id: int,
         host: str = "",
     ) -> str:
+        if cloud_core is not None:
+            return cloud_core.cloud_provider_key_from_ids(
+                offer_id=offer_id,
+                machine_id=machine_id,
+                host_id=host_id,
+                host=host,
+            )
         if host_id > 0:
             return f"host:{host_id}"
         if machine_id > 0:
@@ -3852,6 +3893,8 @@ class DepthCrafterGUI:
         return "unknown"
 
     def _cloud_provider_label_from_key(self, provider_key: str) -> str:
+        if cloud_core is not None:
+            return cloud_core.cloud_provider_label_from_key(provider_key)
         key = str(provider_key or "").strip()
         if key.startswith("host:"):
             return f"Host {key.split(':', 1)[1]}"
@@ -3864,6 +3907,8 @@ class DepthCrafterGUI:
         return "Unknown provider"
 
     def _cloud_provider_identity_for_offer(self, offer_entry: Dict[str, Any]) -> Dict[str, Any]:
+        if cloud_core is not None:
+            return cloud_core.cloud_provider_identity_for_offer(offer_entry)
         try:
             offer_id = int(offer_entry.get("id", 0) or 0)
         except Exception:
@@ -3966,6 +4011,9 @@ class DepthCrafterGUI:
         offer_entry: Dict[str, Any],
         blacklist_data: Optional[Dict[str, set]] = None,
     ) -> bool:
+        if cloud_core is not None:
+            data = blacklist_data if blacklist_data is not None else self._load_cloud_blacklist_data()
+            return cloud_core.offer_is_blacklisted(offer_entry, data)
         data = blacklist_data if blacklist_data is not None else self._load_cloud_blacklist_data()
         try:
             offer_id = int(offer_entry.get("id", 0) or 0)
@@ -4631,6 +4679,8 @@ class DepthCrafterGUI:
         return self.DEFAULT_VAST_API_BASE_URL
 
     def _extract_instance_row_from_payload(self, payload, instance_id: int) -> Optional[Dict[str, Any]]:
+        if cloud_core is not None:
+            return cloud_core.extract_instance_row_from_payload(payload, instance_id)
         target_id = int(instance_id)
         rows: List[Dict[str, Any]] = []
         if isinstance(payload, list):
@@ -4654,6 +4704,8 @@ class DepthCrafterGUI:
         return None
 
     def _extract_status_from_instance_row(self, row: Dict[str, Any]) -> str:
+        if cloud_core is not None:
+            return cloud_core.extract_instance_status_from_row(row)
         for key in ("actual_status", "status", "cur_state", "state", "status_msg", "intended_status"):
             value = str(row.get(key, "")).strip()
             if value:
@@ -4661,6 +4713,8 @@ class DepthCrafterGUI:
         return ""
 
     def _extract_ssh_from_instance_row(self, row: Dict[str, Any]) -> Tuple[str, int]:
+        if cloud_core is not None:
+            return cloud_core.extract_ssh_from_instance_row(row)
         host = str(row.get("ssh_host", "") or "").strip()
         port_value = row.get("ssh_port")
         port = 0
@@ -4740,6 +4794,8 @@ class DepthCrafterGUI:
         return cmd
 
     def _parse_json_like_payload(self, raw_text: str):
+        if cloud_core is not None:
+            return cloud_core.parse_json_like(raw_text)
         text = (raw_text or "").strip()
         if not text:
             return None
@@ -4799,6 +4855,8 @@ class DepthCrafterGUI:
         return "", "", 0
 
     def _normalized_gpu_ram_gb(self, offer: Dict[str, Any]) -> float:
+        if cloud_core is not None:
+            return cloud_core.normalized_gpu_ram_gb(offer)
         try:
             raw = float(offer.get("gpu_ram", 0.0) or 0.0)
         except Exception:
@@ -4808,6 +4866,8 @@ class DepthCrafterGUI:
         return raw / 1024.0 if raw > 1000.0 else raw
 
     def _offer_hourly_cost(self, offer: Dict[str, Any]) -> float:
+        if cloud_core is not None:
+            return cloud_core.offer_hourly_cost(offer)
         for key in ("dph_total", "discounted_dph_total", "dph"):
             if key in offer:
                 try:
@@ -4817,6 +4877,8 @@ class DepthCrafterGUI:
         return 0.0
 
     def _offer_cost_per_tb(self, offer: Dict[str, Any], direction: str) -> float:
+        if cloud_core is not None:
+            return cloud_core.offer_cost_per_tb(offer, direction)
         if direction == "up":
             if "internet_up_cost_per_tb" in offer:
                 try:
@@ -4841,6 +4903,19 @@ class DepthCrafterGUI:
         expected_runtime_hours = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_runtime_hours_var, 1.0))
         expected_upload_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_upload_gb_var, 0.0))
         expected_download_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_download_gb_var, 0.0))
+        if cloud_core is not None:
+            cost_data = cloud_core.estimate_offer_total_cost(
+                offer,
+                expected_runtime_hours=expected_runtime_hours,
+                expected_upload_gb=expected_upload_gb,
+                expected_download_gb=expected_download_gb,
+            )
+            return {
+                **cost_data,
+                "expected_runtime_hours": expected_runtime_hours,
+                "expected_upload_gb": expected_upload_gb,
+                "expected_download_gb": expected_download_gb,
+            }
         hourly = self._offer_hourly_cost(offer)
         up_tb = self._offer_cost_per_tb(offer, "up")
         down_tb = self._offer_cost_per_tb(offer, "down")
@@ -4866,8 +4941,6 @@ class DepthCrafterGUI:
         max_dph_override: Optional[float] = None,
     ) -> Tuple[str, Dict[str, object]]:
         profile_defaults = self._get_cloud_profile_defaults(profile_key)
-        offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "")).strip()
-        min_gpu_ram_gb = max(0.0, float(profile_defaults.get("min_gpu_ram_gb", 0.0)))
         if require_verified_override is None:
             require_verified_hosts = bool(self.cloud_require_verified_hosts_var.get())
         else:
@@ -4885,7 +4958,22 @@ class DepthCrafterGUI:
                 max_dph = max(0.0, float(max_dph_override))
             except Exception:
                 max_dph = 0.0
+        if cloud_core is not None:
+            query = cloud_core.build_offer_search_query(
+                profile_defaults,
+                disk_gb=disk_gb,
+                require_verified_hosts=require_verified_hosts,
+                max_dph=max_dph,
+                min_cuda=min_cuda,
+                min_reliability=min_reliability,
+                min_direct_ports=min_direct_ports,
+                min_inet_down=min_inet_down,
+                min_inet_up=min_inet_up,
+            )
+            return query, profile_defaults
 
+        offer_gpu_filter = str(profile_defaults.get("offer_gpu_filter", "")).strip()
+        min_gpu_ram_gb = max(0.0, float(profile_defaults.get("min_gpu_ram_gb", 0.0)))
         query_parts = [
             "rentable=true",
             "num_gpus=1",
@@ -4977,29 +5065,41 @@ class DepthCrafterGUI:
 
         blacklist_data = self._load_cloud_blacklist_data()
         min_gpu_ram_gb = float(profile_defaults.get("min_gpu_ram_gb", 0.0))
-        ranked_offers: List[Dict[str, Any]] = []
-        skipped_blacklist_count = 0
-        skipped_vram_count = 0
-        for entry in parsed_payload:
-            if self._is_cloud_offer_blacklisted(entry, blacklist_data):
-                skipped_blacklist_count += 1
-                continue
-            vram_gb = self._normalized_gpu_ram_gb(entry)
-            # Vast often reports 48GB-class cards at ~47.99 GiB (e.g. 49140 MB-like units).
-            # Keep a small tolerance so those cards are not wrongly filtered out.
-            if vram_gb + self.CLOUD_GPU_RAM_TOLERANCE_GB < min_gpu_ram_gb:
-                skipped_vram_count += 1
-                continue
-            cost_data = self._estimate_offer_total_cost(entry)
-            enriched = dict(entry)
-            enriched["_vram_gb"] = vram_gb
-            enriched["_hourly"] = cost_data["hourly"]
-            enriched["_up_tb"] = cost_data["up_tb"]
-            enriched["_down_tb"] = cost_data["down_tb"]
-            enriched["_runtime_cost"] = cost_data["runtime_cost"]
-            enriched["_transfer_cost"] = cost_data["transfer_cost"]
-            enriched["_total_cost"] = cost_data["total_cost"]
-            ranked_offers.append(enriched)
+        expected_runtime_hours = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_runtime_hours_var, 1.0))
+        expected_upload_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_upload_gb_var, 0.0))
+        expected_download_gb = max(0.0, self._safe_float_from_tk_var(self.cloud_expected_download_gb_var, 0.0))
+        if cloud_core is not None:
+            ranked_offers, skipped_blacklist_count, skipped_vram_count = cloud_core.rank_cloud_offers(
+                parsed_payload,
+                blacklist_data,
+                min_gpu_ram_gb=min_gpu_ram_gb,
+                expected_runtime_hours=expected_runtime_hours,
+                expected_upload_gb=expected_upload_gb,
+                expected_download_gb=expected_download_gb,
+                gpu_ram_tolerance_gb=self.CLOUD_GPU_RAM_TOLERANCE_GB,
+            )
+        else:
+            ranked_offers = []
+            skipped_blacklist_count = 0
+            skipped_vram_count = 0
+            for entry in parsed_payload:
+                if self._is_cloud_offer_blacklisted(entry, blacklist_data):
+                    skipped_blacklist_count += 1
+                    continue
+                vram_gb = self._normalized_gpu_ram_gb(entry)
+                if vram_gb + self.CLOUD_GPU_RAM_TOLERANCE_GB < min_gpu_ram_gb:
+                    skipped_vram_count += 1
+                    continue
+                cost_data = self._estimate_offer_total_cost(entry)
+                enriched = dict(entry)
+                enriched["_vram_gb"] = vram_gb
+                enriched["_hourly"] = cost_data["hourly"]
+                enriched["_up_tb"] = cost_data["up_tb"]
+                enriched["_down_tb"] = cost_data["down_tb"]
+                enriched["_runtime_cost"] = cost_data["runtime_cost"]
+                enriched["_transfer_cost"] = cost_data["transfer_cost"]
+                enriched["_total_cost"] = cost_data["total_cost"]
+                ranked_offers.append(enriched)
 
         if not ranked_offers:
             detail = (
@@ -5011,13 +5111,14 @@ class DepthCrafterGUI:
                 f"({detail})."
             )
 
-        ranked_offers.sort(
-            key=lambda offer: (
-                float(offer.get("_total_cost", 1e12)),
-                float(offer.get("_hourly", 1e12)),
-                -float(offer.get("reliability", 0.0) or 0.0),
+        if cloud_core is None:
+            ranked_offers.sort(
+                key=lambda offer: (
+                    float(offer.get("_total_cost", 1e12)),
+                    float(offer.get("_hourly", 1e12)),
+                    -float(offer.get("reliability", 0.0) or 0.0),
+                )
             )
-        )
         return ranked_offers
 
     def _format_cloud_offer_selection_entry(
