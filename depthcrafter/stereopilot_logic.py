@@ -523,6 +523,24 @@ class StereoPilotDemo:
         finally:
             writer.close()
 
+    def _write_sbs_video(self, left_frames: np.ndarray, right_frames: np.ndarray, output_path: str, fps: float) -> int:
+        count = min(int(left_frames.shape[0]), int(right_frames.shape[0]))
+        if count <= 0:
+            raise RuntimeError("StereoPilot SBS write failed: no frames available.")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        writer = imageio.get_writer(output_path, fps=float(fps), codec="libx264", quality=8)
+        try:
+            for idx in range(count):
+                left = np.asarray(left_frames[idx, ..., :3], dtype=np.uint8)
+                right = np.asarray(right_frames[idx, ..., :3], dtype=np.uint8)
+                if left.shape[0] != right.shape[0] or left.shape[1] != right.shape[1]:
+                    right = cv2.resize(right, (int(left.shape[1]), int(left.shape[0])), interpolation=cv2.INTER_LINEAR)
+                writer.append_data(np.concatenate([left, right], axis=1))
+        finally:
+            writer.close()
+        return count
+
     def _load_video_frames(self, video_path: str) -> np.ndarray:
         vr = VideoReader(video_path, ctx=cpu(0))
         frame_count = int(len(vr))
@@ -609,6 +627,8 @@ class StereoPilotDemo:
         prompt_source = "default"
         primary_output_path = right_output_path
         frame_count_written = 0
+        wrote_right = False
+        wrote_sbs = False
 
         try:
             self._emit_runtime_stage("demo_run_start", input=input_video_path, backend=self.model_backend)
@@ -896,30 +916,33 @@ class StereoPilotDemo:
             frame_count_written = int(right_frames.shape[0])
 
             self._emit_runtime_stage("logic_save_full_video_start")
-            self._emit_runtime_stage("pipe_write_right_video_start")
-            t_write_right_start = time.perf_counter()
-            self._write_video(right_frames, str(right_output_path), output_fps)
-            self._emit_runtime_stage(
-                "pipe_write_right_video_end",
-                elapsed_sec=round(time.perf_counter() - t_write_right_start, 3),
-                output_path=str(right_output_path),
-            )
-            if not right_output_path.is_file():
-                raise RuntimeError("StereoPilot failed to write opposite-eye output video.")
+            if self.stereopilot_output_mode in {"opposite_eye", "both"}:
+                self._emit_runtime_stage("pipe_write_right_video_start")
+                t_write_right_start = time.perf_counter()
+                self._write_video(right_frames, str(right_output_path), output_fps)
+                self._emit_runtime_stage(
+                    "pipe_write_right_video_end",
+                    elapsed_sec=round(time.perf_counter() - t_write_right_start, 3),
+                    output_path=str(right_output_path),
+                )
+                if not right_output_path.is_file():
+                    raise RuntimeError("StereoPilot failed to write opposite-eye output video.")
+                wrote_right = True
+                primary_output_path = right_output_path
+            else:
+                self._emit_runtime_stage("pipe_write_right_video_skipped", output_mode=self.stereopilot_output_mode)
 
             if self.stereopilot_output_mode in {"side_by_side", "both"}:
                 self._emit_runtime_stage("pipe_render_sbs_start")
-                sbs_frames = self._render_sbs(prepared_frames, right_frames)
-                self._write_video(sbs_frames, str(sbs_output_path), output_fps)
+                sbs_count = self._write_sbs_video(prepared_frames, right_frames, str(sbs_output_path), output_fps)
                 self._emit_runtime_stage(
                     "pipe_render_sbs_end",
-                    frames=int(sbs_frames.shape[0]),
+                    frames=int(sbs_count),
                     output_path=str(sbs_output_path),
                 )
-                frame_count_written = int(sbs_frames.shape[0])
+                frame_count_written = int(sbs_count)
+                wrote_sbs = True
                 primary_output_path = sbs_output_path
-            else:
-                primary_output_path = right_output_path
 
             self._emit_runtime_stage("logic_save_full_video_end", save_path=str(primary_output_path))
             self._emit_runtime_stage(
@@ -942,7 +965,8 @@ class StereoPilotDemo:
                 "output_video_filename": str(primary_output_path.name),
                 "output_video_format": "mp4",
                 "stereopilot_output_mode": self.stereopilot_output_mode,
-                "stereopilot_opposite_eye_path": str(right_output_path),
+                "stereopilot_opposite_eye_path": str(right_output_path) if wrote_right else "",
+                "stereopilot_opposite_eye_written": bool(wrote_right),
                 "stereopilot_window_count": int(len(windows)),
                 "stereopilot_window_size_used": int(effective_window),
                 "stereopilot_overlap_used": int(effective_overlap),
@@ -957,7 +981,7 @@ class StereoPilotDemo:
                 "domain_label": int(self.stereopilot_domain_label),
                 "_individual_metadata_path": None,
             }
-            if sbs_output_path.is_file():
+            if wrote_sbs and sbs_output_path.is_file():
                 metadata["stereopilot_sbs_path"] = str(sbs_output_path)
 
             if save_final_json_for_this_job_config:
@@ -975,6 +999,7 @@ class StereoPilotDemo:
                     "target_fps_setting": metadata["target_fps_setting"],
                     "stereopilot_output_mode": metadata["stereopilot_output_mode"],
                     "stereopilot_opposite_eye_path": metadata["stereopilot_opposite_eye_path"],
+                    "stereopilot_opposite_eye_written": metadata["stereopilot_opposite_eye_written"],
                     "stereopilot_sbs_path": metadata.get("stereopilot_sbs_path"),
                     "stereopilot_window_count": metadata["stereopilot_window_count"],
                     "stereopilot_window_size_used": metadata["stereopilot_window_size_used"],
