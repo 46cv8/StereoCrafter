@@ -446,26 +446,15 @@ class StereoPilotDemo:
         window = max(1, min(int(window_size), total))
         overlap_clamped = max(0, min(int(overlap), window - 1))
         step = max(1, window - overlap_clamped)
-        tail_start = max(0, total - window)
-        starts: List[int] = [0]
-
-        while True:
-            nxt = int(starts[-1] + step)
-            if nxt >= tail_start:
+        windows: List[Tuple[int, int]] = []
+        start = 0
+        while start < total:
+            end = min(start + window, total)
+            windows.append((int(start), int(end)))
+            if end >= total:
                 break
-            starts.append(nxt)
-
-        if tail_start > starts[-1]:
-            starts.append(int(tail_start))
-
-        # Avoid a tiny trailing window step that would create excessive triple overlap.
-        while len(starts) >= 3:
-            final_gap = int(starts[-1] - starts[-2])
-            if final_gap >= max(1, step // 2):
-                break
-            del starts[-2]
-
-        return [(s, min(s + window, total)) for s in starts]
+            start = int(start + step)
+        return windows
 
     @staticmethod
     def _ensure_frame_count(frames_rgb: np.ndarray, target_count: int) -> np.ndarray:
