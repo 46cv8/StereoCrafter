@@ -561,6 +561,7 @@ def add_model_job_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
     parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
     parser.add_argument("--stereopilot-shift", type=float, default=5.0)
+    parser.add_argument("--stereopilot-tail-pad-frames", type=int, default=5)
     parser.add_argument("--stereopilot-domain-label", type=int, choices=[0, 1], default=1)
     parser.add_argument(
         "--stereopilot-dtype",
@@ -840,6 +841,8 @@ def _build_remote_job_cmd(args: argparse.Namespace, remote_input_path: str, remo
         str(float(args.stereopilot_guide_scale)),
         "--stereopilot-shift",
         str(float(args.stereopilot_shift)),
+        "--stereopilot-tail-pad-frames",
+        str(max(0, int(args.stereopilot_tail_pad_frames))),
         "--stereopilot-domain-label",
         str(1 if int(args.stereopilot_domain_label) != 0 else 0),
         "--stereopilot-dtype",
@@ -938,6 +941,8 @@ def _build_remote_batch_session_cmd(args: argparse.Namespace, remote_manifest_pa
         str(float(args.stereopilot_guide_scale)),
         "--stereopilot-shift",
         str(float(args.stereopilot_shift)),
+        "--stereopilot-tail-pad-frames",
+        str(max(0, int(args.stereopilot_tail_pad_frames))),
         "--stereopilot-domain-label",
         str(1 if int(args.stereopilot_domain_label) != 0 else 0),
         "--stereopilot-dtype",
@@ -1071,6 +1076,8 @@ def _build_remote_queue_worker_cmd(args: argparse.Namespace, queue_root: str) ->
         str(float(args.stereopilot_guide_scale)),
         "--stereopilot-shift",
         str(float(args.stereopilot_shift)),
+        "--stereopilot-tail-pad-frames",
+        str(max(0, int(args.stereopilot_tail_pad_frames))),
         "--stereopilot-domain-label",
         str(1 if int(args.stereopilot_domain_label) != 0 else 0),
         "--stereopilot-dtype",

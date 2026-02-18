@@ -252,6 +252,7 @@ class DepthCrafterGUI:
         self.stereopilot_sampling_steps_var = tk.IntVar(value=30)
         self.stereopilot_guide_scale_var = tk.DoubleVar(value=5.0)
         self.stereopilot_shift_var = tk.DoubleVar(value=5.0)
+        self.stereopilot_tail_pad_frames_var = tk.IntVar(value=5)
         self.stereopilot_domain_label_var = tk.IntVar(value=1)
         self.stereopilot_dtype_var = tk.StringVar(value="bfloat16")
         self.stereopilot_transformer_dtype_var = tk.StringVar(value="float8")
@@ -403,6 +404,7 @@ class DepthCrafterGUI:
             "stereopilot_sampling_steps_var": self.stereopilot_sampling_steps_var,
             "stereopilot_guide_scale_var": self.stereopilot_guide_scale_var,
             "stereopilot_shift_var": self.stereopilot_shift_var,
+            "stereopilot_tail_pad_frames_var": self.stereopilot_tail_pad_frames_var,
             "stereopilot_domain_label_var": self.stereopilot_domain_label_var,
             "stereopilot_dtype_var": self.stereopilot_dtype_var,
             "stereopilot_transformer_dtype_var": self.stereopilot_transformer_dtype_var,
@@ -1221,6 +1223,7 @@ class DepthCrafterGUI:
                 "stereopilot_sampling_steps": self.stereopilot_sampling_steps_var.get(),
                 "stereopilot_guide_scale": self.stereopilot_guide_scale_var.get(),
                 "stereopilot_shift": self.stereopilot_shift_var.get(),
+                "stereopilot_tail_pad_frames": self.stereopilot_tail_pad_frames_var.get(),
                 "stereopilot_domain_label": self.stereopilot_domain_label_var.get(),
                 "stereopilot_dtype": self.stereopilot_dtype_var.get(),
                 "stereopilot_transformer_dtype": self.stereopilot_transformer_dtype_var.get(),
@@ -3186,6 +3189,7 @@ class DepthCrafterGUI:
                         stereopilot_sampling_steps=max(1, int(self.stereopilot_sampling_steps_var.get())),
                         stereopilot_guide_scale=float(self.stereopilot_guide_scale_var.get()),
                         stereopilot_shift=float(self.stereopilot_shift_var.get()),
+                        stereopilot_tail_pad_frames=max(0, int(self.stereopilot_tail_pad_frames_var.get())),
                         stereopilot_domain_label=1 if int(self.stereopilot_domain_label_var.get()) != 0 else 0,
                         stereopilot_dtype=self.stereopilot_dtype_var.get().strip() or "bfloat16",
                         stereopilot_transformer_dtype=self.stereopilot_transformer_dtype_var.get().strip() or "float8",
@@ -4120,9 +4124,15 @@ class DepthCrafterGUI:
         entry_sp_overlap = self._register_geometry_dialog_widget(
             ttk.Entry(stereo_window_frame, textvariable=self.stereopilot_overlap_var, width=7)
         )
-        entry_sp_overlap.grid(row=0, column=3, sticky="w")
+        entry_sp_overlap.grid(row=0, column=3, sticky="w", padx=(0, 8))
+        ttk.Label(stereo_window_frame, text="Tail Pad").grid(row=0, column=4, sticky="e", padx=(0, 2))
+        entry_sp_tail_pad = self._register_geometry_dialog_widget(
+            ttk.Entry(stereo_window_frame, textvariable=self.stereopilot_tail_pad_frames_var, width=7)
+        )
+        entry_sp_tail_pad.grid(row=0, column=5, sticky="w")
         _create_hover_tooltip(entry_sp_window, "stereopilot_window_size")
         _create_hover_tooltip(entry_sp_overlap, "stereopilot_overlap")
+        _create_hover_tooltip(entry_sp_tail_pad, "stereopilot_tail_pad_frames")
         row += 1
 
         stereo_numeric_frame_2 = self._register_geometry_dialog_widget(ttk.Frame(outer))
@@ -7052,6 +7062,7 @@ class DepthCrafterGUI:
         stereopilot_sampling_steps = max(1, int(self.stereopilot_sampling_steps_var.get()))
         stereopilot_guide_scale = float(self.stereopilot_guide_scale_var.get())
         stereopilot_shift = float(self.stereopilot_shift_var.get())
+        stereopilot_tail_pad_frames = max(0, int(self.stereopilot_tail_pad_frames_var.get()))
         stereopilot_domain_label = 1 if int(self.stereopilot_domain_label_var.get()) != 0 else 0
         stereopilot_dtype = str(self.stereopilot_dtype_var.get() or "bfloat16").strip().lower()
         stereopilot_transformer_dtype = str(self.stereopilot_transformer_dtype_var.get() or "float8").strip().lower()
@@ -7157,6 +7168,8 @@ class DepthCrafterGUI:
             str(stereopilot_guide_scale),
             "--stereopilot-shift",
             str(stereopilot_shift),
+            "--stereopilot-tail-pad-frames",
+            str(stereopilot_tail_pad_frames),
             "--stereopilot-domain-label",
             str(stereopilot_domain_label),
             "--stereopilot-dtype",
@@ -7256,6 +7269,7 @@ class DepthCrafterGUI:
         stereopilot_sampling_steps = max(1, int(self.stereopilot_sampling_steps_var.get()))
         stereopilot_guide_scale = float(self.stereopilot_guide_scale_var.get())
         stereopilot_shift = float(self.stereopilot_shift_var.get())
+        stereopilot_tail_pad_frames = max(0, int(self.stereopilot_tail_pad_frames_var.get()))
         stereopilot_domain_label = 1 if int(self.stereopilot_domain_label_var.get()) != 0 else 0
         stereopilot_dtype = str(self.stereopilot_dtype_var.get() or "bfloat16").strip().lower()
         stereopilot_transformer_dtype = str(self.stereopilot_transformer_dtype_var.get() or "float8").strip().lower()
@@ -7357,6 +7371,8 @@ class DepthCrafterGUI:
             str(stereopilot_guide_scale),
             "--stereopilot-shift",
             str(stereopilot_shift),
+            "--stereopilot-tail-pad-frames",
+            str(stereopilot_tail_pad_frames),
             "--stereopilot-domain-label",
             str(stereopilot_domain_label),
             "--stereopilot-dtype",

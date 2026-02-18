@@ -98,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
     parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
     parser.add_argument("--stereopilot-shift", type=float, default=5.0)
+    parser.add_argument("--stereopilot-tail-pad-frames", type=int, default=5)
     parser.add_argument("--stereopilot-domain-label", type=int, choices=[0, 1], default=1)
     parser.add_argument(
         "--stereopilot-dtype",
@@ -255,6 +256,7 @@ def _init_demo(
             stereopilot_sampling_steps=max(1, int(args.stereopilot_sampling_steps)),
             stereopilot_guide_scale=float(args.stereopilot_guide_scale),
             stereopilot_shift=float(args.stereopilot_shift),
+            stereopilot_tail_pad_frames=max(0, int(args.stereopilot_tail_pad_frames)),
             stereopilot_domain_label=1 if int(args.stereopilot_domain_label) != 0 else 0,
             stereopilot_dtype=args.stereopilot_dtype,
             stereopilot_transformer_dtype=args.stereopilot_transformer_dtype,
@@ -320,6 +322,7 @@ def _build_job_status(
             "stereopilot_sampling_steps": args.stereopilot_sampling_steps,
             "stereopilot_guide_scale": args.stereopilot_guide_scale,
             "stereopilot_shift": args.stereopilot_shift,
+            "stereopilot_tail_pad_frames": args.stereopilot_tail_pad_frames,
             "stereopilot_domain_label": args.stereopilot_domain_label,
             "stereopilot_dtype": args.stereopilot_dtype,
             "stereopilot_transformer_dtype": args.stereopilot_transformer_dtype,

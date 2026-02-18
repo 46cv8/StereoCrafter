@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stereopilot-sampling-steps", type=int, default=30)
     parser.add_argument("--stereopilot-guide-scale", type=float, default=5.0)
     parser.add_argument("--stereopilot-shift", type=float, default=5.0)
+    parser.add_argument("--stereopilot-tail-pad-frames", type=int, default=5)
     parser.add_argument("--stereopilot-domain-label", type=int, choices=[0, 1], default=1)
     parser.add_argument(
         "--stereopilot-dtype",

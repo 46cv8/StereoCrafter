@@ -47,6 +47,7 @@ class StereoPilotDemo:
         stereopilot_guide_scale: float = 5.0,
         stereopilot_shift: float = 5.0,
         stereopilot_domain_label: int = 1,
+        stereopilot_tail_pad_frames: int = 5,
         stereopilot_dtype: str = "bfloat16",
         stereopilot_transformer_dtype: str = "float8",
         **_: object,
@@ -91,6 +92,7 @@ class StereoPilotDemo:
         self.stereopilot_guide_scale = float(stereopilot_guide_scale)
         self.stereopilot_shift = float(stereopilot_shift)
         self.stereopilot_domain_label = 1 if int(stereopilot_domain_label) != 0 else 0
+        self.stereopilot_tail_pad_frames = max(0, int(stereopilot_tail_pad_frames))
 
         self.stereopilot_dtype = str(stereopilot_dtype or "bfloat16").strip().lower()
         self.stereopilot_transformer_dtype = str(stereopilot_transformer_dtype or "float8").strip().lower()
@@ -682,10 +684,11 @@ class StereoPilotDemo:
                 window_count=int(len(windows)),
                 window_size=int(effective_window),
                 overlap=int(effective_overlap),
+                tail_pad_frames=int(self.stereopilot_tail_pad_frames),
                 elapsed_sec=round(time.perf_counter() - t_load_start, 3),
             )
             _logger.info(
-                "StereoPilot load/prep complete | src=%sx%s %sfr -> proc=%sx%s %sfr @ %.2ffps | windows=%s size=%s overlap=%s | prompt_source=%s",
+                "StereoPilot load/prep complete | src=%sx%s %sfr -> proc=%sx%s %sfr @ %.2ffps | windows=%s size=%s overlap=%s tail_pad=%s | prompt_source=%s",
                 load_info.get("source_width", 0),
                 load_info.get("source_height", 0),
                 load_info.get("source_total_frames", 0),
@@ -696,6 +699,7 @@ class StereoPilotDemo:
                 len(windows),
                 int(effective_window),
                 int(effective_overlap),
+                int(self.stereopilot_tail_pad_frames),
                 prompt_source,
             )
 
@@ -709,6 +713,7 @@ class StereoPilotDemo:
                 window_count=int(len(windows)),
                 window_size=int(effective_window),
                 overlap=int(effective_overlap),
+                tail_pad_frames=int(self.stereopilot_tail_pad_frames),
             )
             result_h = int(prepared_frames.shape[1])
             result_w = int(prepared_frames.shape[2])
@@ -722,6 +727,13 @@ class StereoPilotDemo:
                     continue
 
                 window_frames = np.asarray(prepared_frames[start_idx:end_idx, ..., :3], dtype=np.uint8)
+                window_tail_pad = int(self.stereopilot_tail_pad_frames)
+                model_frame_count = int(window_len + window_tail_pad)
+                if window_tail_pad > 0:
+                    pad_block = np.repeat(window_frames[-1:, ...], window_tail_pad, axis=0)
+                    window_frames_for_model = np.concatenate([window_frames, pad_block], axis=0)
+                else:
+                    window_frames_for_model = window_frames
                 self._emit_runtime_stage(
                     "pipe_window_inference_start",
                     window_index=int(window_idx),
@@ -729,14 +741,18 @@ class StereoPilotDemo:
                     start_frame=int(start_idx),
                     end_frame=int(end_idx),
                     window_frames=int(window_len),
+                    model_frames=int(model_frame_count),
+                    tail_pad_frames=int(window_tail_pad),
                 )
                 _logger.info(
-                    "StereoPilot window %s/%s | frames %s:%s (%s)",
+                    "StereoPilot window %s/%s | frames %s:%s (%s) | model_frames=%s tail_pad=%s",
                     int(window_idx),
                     int(len(windows)),
                     int(start_idx),
                     int(end_idx),
                     int(window_len),
+                    int(model_frame_count),
+                    int(window_tail_pad),
                 )
 
                 self._emit_runtime_stage(
@@ -745,7 +761,7 @@ class StereoPilotDemo:
                     window_count=int(len(windows)),
                 )
                 t_encode_start = time.perf_counter()
-                latents_video_condition = self._encode_condition_latents(window_frames)
+                latents_video_condition = self._encode_condition_latents(window_frames_for_model)
                 self._emit_runtime_stage(
                     "pipe_encode_condition_end",
                     window_index=int(window_idx),
@@ -758,14 +774,14 @@ class StereoPilotDemo:
                     "pipe_sample_start",
                     window_index=int(window_idx),
                     window_count=int(len(windows)),
-                    frame_num=int(window_len),
+                    frame_num=int(model_frame_count),
                 )
                 t_sample_start = time.perf_counter()
                 output_video = self._pipe.sample(
                     prompt=prompt_text,
                     video_condition=latents_video_condition,
                     size=(int(result_w), int(result_h)),
-                    frame_num=int(window_len),
+                    frame_num=int(model_frame_count),
                     shift=float(self.stereopilot_shift),
                     sample_solver="unipc",
                     sampling_steps=int(self.stereopilot_sampling_steps),
@@ -792,7 +808,9 @@ class StereoPilotDemo:
                     window_count=int(len(windows)),
                 )
                 window_right_frames = self._decode_output_tensor_to_frames(output_video)
-                window_right_frames = self._ensure_frame_count(window_right_frames, window_len)
+                window_right_frames = self._ensure_frame_count(window_right_frames, model_frame_count)
+                if window_tail_pad > 0:
+                    window_right_frames = window_right_frames[:window_len]
                 if (
                     int(window_right_frames.shape[1]) != result_h
                     or int(window_right_frames.shape[2]) != result_w
@@ -813,6 +831,8 @@ class StereoPilotDemo:
                     window_index=int(window_idx),
                     window_count=int(len(windows)),
                     decoded_frames=int(window_right_frames.shape[0]),
+                    model_frames=int(model_frame_count),
+                    tail_pad_frames=int(window_tail_pad),
                 )
 
                 local_weights = np.ones((window_len,), dtype=np.float32)
@@ -864,6 +884,8 @@ class StereoPilotDemo:
                     window_count=int(len(windows)),
                     start_frame=int(start_idx),
                     end_frame=int(end_idx),
+                    model_frames=int(model_frame_count),
+                    tail_pad_frames=int(window_tail_pad),
                 )
 
             right_frames = np.clip(
@@ -924,6 +946,7 @@ class StereoPilotDemo:
                 "stereopilot_window_count": int(len(windows)),
                 "stereopilot_window_size_used": int(effective_window),
                 "stereopilot_overlap_used": int(effective_overlap),
+                "stereopilot_tail_pad_frames": int(self.stereopilot_tail_pad_frames),
                 "stereopilot_gui_window_size": int(gui_window_size),
                 "stereopilot_gui_overlap": int(gui_overlap),
                 "prompt_source": prompt_source,
@@ -956,6 +979,7 @@ class StereoPilotDemo:
                     "stereopilot_window_count": metadata["stereopilot_window_count"],
                     "stereopilot_window_size_used": metadata["stereopilot_window_size_used"],
                     "stereopilot_overlap_used": metadata["stereopilot_overlap_used"],
+                    "stereopilot_tail_pad_frames": metadata["stereopilot_tail_pad_frames"],
                     "prompt_source": metadata["prompt_source"],
                     "prompt_text": metadata["prompt_text"],
                     "sampling_steps": metadata["sampling_steps"],

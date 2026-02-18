@@ -619,6 +619,7 @@ def build_cloudctl_cmd(
     stereopilot_sampling_steps = max(1, as_int(cfg.get("stereopilot_sampling_steps_var"), 30))
     stereopilot_guide_scale = as_float(cfg.get("stereopilot_guide_scale_var"), 5.0)
     stereopilot_shift = as_float(cfg.get("stereopilot_shift_var"), 5.0)
+    stereopilot_tail_pad_frames = max(0, as_int(cfg.get("stereopilot_tail_pad_frames_var"), 5))
     stereopilot_domain_label = 1 if as_int(cfg.get("stereopilot_domain_label_var"), 1) != 0 else 0
     stereopilot_dtype = str(cfg.get("stereopilot_dtype_var", "bfloat16") or "bfloat16").strip().lower()
     stereopilot_transformer_dtype = str(cfg.get("stereopilot_transformer_dtype_var", "float8") or "float8").strip().lower()
@@ -678,6 +679,8 @@ def build_cloudctl_cmd(
         str(stereopilot_guide_scale),
         "--stereopilot-shift",
         str(stereopilot_shift),
+        "--stereopilot-tail-pad-frames",
+        str(stereopilot_tail_pad_frames),
         "--stereopilot-domain-label",
         str(stereopilot_domain_label),
         "--stereopilot-dtype",

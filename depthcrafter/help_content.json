@@ -108,6 +108,9 @@
   "stereopilot_shift": {
     "text": "StereoPilot shift parameter used by the sampler."
   },
+  "stereopilot_tail_pad_frames": {
+    "text": "Per-window tail padding for StereoPilot.\nDuplicates the last frame N times before sampling, then trims those padded frames off after inference.\nUseful for reducing end-of-window stale-motion artifacts."
+  },
   "stereopilot_domain_label": {
     "text": "StereoPilot domain label flag (0 or 1) passed to the model."
   },
